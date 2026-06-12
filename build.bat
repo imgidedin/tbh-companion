@@ -20,5 +20,8 @@ cl /nologo /std:c++17 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE "%SRC%" ^
   "%RC_OUT%" ^
   /Fe:"%OUT%\TBH_Companion.exe" ^
   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib winhttp.lib shell32.lib advapi32.lib bcrypt.lib
+if errorlevel 1 exit /b 1
+
+del "%RC_OUT%" >nul 2>nul
 
 endlocal
