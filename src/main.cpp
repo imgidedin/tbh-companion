@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 
 #include <string>
 #include <vector>
@@ -20,6 +21,10 @@ constexpr int IDC_SAVE = 1004;
 constexpr int IDC_TEST = 1005;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
+constexpr int IDC_READ_SAVE = 1008;
+
+constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
+constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -105,6 +110,139 @@ std::wstring Widen(const std::string& text) {
   std::wstring out(size > 0 ? size - 1 : 0, L'\0');
   if (size > 1) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), size);
   return out;
+}
+
+std::string NarrowAscii(const std::wstring& text) {
+  std::string out;
+  out.reserve(text.size());
+  for (wchar_t c : text) out.push_back(c < 128 ? static_cast<char>(c) : '?');
+  return out;
+}
+
+std::wstring DefaultSavePath() {
+  wchar_t profile[MAX_PATH]{};
+  DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+  std::wstring base = length ? std::wstring(profile, length) : L"";
+  return base + DEFAULT_SAVE_RELATIVE;
+}
+
+bool ReadAllBytes(const std::wstring& path, std::vector<unsigned char>& bytes) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(file, &size) || size.QuadPart <= 16 || size.QuadPart > 64LL * 1024LL * 1024LL) {
+    CloseHandle(file);
+    return false;
+  }
+  bytes.resize(static_cast<size_t>(size.QuadPart));
+  DWORD read = 0;
+  BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+  CloseHandle(file);
+  if (!ok || read != bytes.size()) return false;
+  return true;
+}
+
+bool Sha1(const std::string& input, unsigned char hash[20]) {
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  BCRYPT_HASH_HANDLE h = nullptr;
+  DWORD result = 0;
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
+  if (status < 0) return false;
+  status = BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0);
+  if (status >= 0) status = BCryptHashData(h, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())), static_cast<ULONG>(input.size()), 0);
+  if (status >= 0) status = BCryptFinishHash(h, hash, 20, 0);
+  if (h) BCryptDestroyHash(h);
+  if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+  return status >= 0;
+}
+
+std::vector<unsigned char> Es3AesKey(const std::string& password) {
+  unsigned char hash[20]{};
+  Sha1(password, hash);
+  return std::vector<unsigned char>(hash, hash + 16);
+}
+
+bool DecryptEs3AesCbc(const std::vector<unsigned char>& file_bytes, const std::string& password, std::string& plaintext) {
+  if (file_bytes.size() <= 16) return false;
+  std::vector<unsigned char> iv(file_bytes.begin(), file_bytes.begin() + 16);
+  std::vector<unsigned char> cipher(file_bytes.begin() + 16, file_bytes.end());
+  std::vector<unsigned char> key = Es3AesKey(password);
+
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  BCRYPT_KEY_HANDLE key_handle = nullptr;
+  DWORD object_length = 0;
+  DWORD data_length = 0;
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+  if (status < 0) return false;
+  status = BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
+                             static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_CBC) + 1) * sizeof(wchar_t)), 0);
+  if (status >= 0) {
+    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length), sizeof(object_length), &data_length, 0);
+  }
+  std::vector<unsigned char> key_object(object_length);
+  if (status >= 0) {
+    status = BCryptGenerateSymmetricKey(alg, &key_handle, key_object.data(), object_length, key.data(), static_cast<ULONG>(key.size()), 0);
+  }
+
+  DWORD plain_size = 0;
+  std::vector<unsigned char> iv_copy = iv;
+  if (status >= 0) {
+    status = BCryptDecrypt(key_handle, cipher.data(), static_cast<ULONG>(cipher.size()), nullptr, iv_copy.data(), static_cast<ULONG>(iv_copy.size()),
+                           nullptr, 0, &plain_size, BCRYPT_BLOCK_PADDING);
+  }
+  std::vector<unsigned char> plain(plain_size);
+  iv_copy = iv;
+  if (status >= 0) {
+    status = BCryptDecrypt(key_handle, cipher.data(), static_cast<ULONG>(cipher.size()), nullptr, iv_copy.data(), static_cast<ULONG>(iv_copy.size()),
+                           plain.data(), plain_size, &plain_size, BCRYPT_BLOCK_PADDING);
+  }
+  if (key_handle) BCryptDestroyKey(key_handle);
+  if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+  if (status < 0) return false;
+  plaintext.assign(reinterpret_cast<char*>(plain.data()), plain_size);
+  return true;
+}
+
+std::string ExtractJsonString(const std::string& json, const std::string& key, size_t start = 0) {
+  std::string needle = "\"" + key + "\"";
+  size_t pos = json.find(needle, start);
+  if (pos == std::string::npos) pos = json.find(key, start);
+  if (pos == std::string::npos) return {};
+  pos = json.find(':', pos + key.size());
+  if (pos == std::string::npos) return {};
+  pos = json.find('"', pos + 1);
+  if (pos == std::string::npos) return {};
+  std::string value;
+  bool escape = false;
+  for (size_t i = pos + 1; i < json.size(); ++i) {
+    char c = json[i];
+    if (escape) {
+      value.push_back(c);
+      escape = false;
+    } else if (c == '\\') {
+      escape = true;
+    } else if (c == '"') {
+      return value;
+    } else {
+      value.push_back(c);
+    }
+  }
+  return {};
+}
+
+std::wstring ReadSteamIdFromSave() {
+  std::vector<unsigned char> bytes;
+  std::wstring path = DefaultSavePath();
+  if (!ReadAllBytes(path, bytes)) return L"";
+
+  std::string json;
+  if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return L"";
+
+  size_t account_pos = json.find("\"AccountSaveData\"");
+  std::string steam = ExtractJsonString(json, "ownerSteamId", account_pos == std::string::npos ? 0 : account_pos);
+  if (steam.empty()) steam = ExtractJsonString(json, "playerId", account_pos == std::string::npos ? 0 : account_pos);
+  return Widen(steam);
 }
 
 std::string JsonEscape(const std::string& input) {
@@ -273,10 +411,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 220, 100, 34, font);
       AddButton(hwnd, IDC_TEST, L"Testar sync", 256, 220, 120, 34, font);
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 220, 100, 34, font);
+      AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 220, 86, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                24, 278, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
       SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+      if (config.steam_id.empty()) {
+        std::wstring steam_id = ReadSteamIdFromSave();
+        if (!steam_id.empty()) {
+          SetWindowTextW(g_steam, steam_id.c_str());
+          config.steam_id = steam_id;
+          SaveConfig(config);
+          SetStatus(L"SteamID lido automaticamente do save: " + steam_id);
+        }
+      }
       return 0;
     }
     case WM_COMMAND: {
@@ -295,6 +444,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SetStatus(L"Enviando teste...");
         std::wstring result = PostIngest(config);
         SetStatus(result);
+      } else if (id == IDC_READ_SAVE) {
+        SetStatus(L"Lendo save...");
+        std::wstring steam_id = ReadSteamIdFromSave();
+        if (steam_id.empty()) {
+          SetStatus(L"Não foi possível ler o SteamID do save padrão.");
+        } else {
+          SetWindowTextW(g_steam, steam_id.c_str());
+          Config config = ReadConfigFromUi();
+          SaveConfig(config);
+          SetStatus(L"SteamID lido do save: " + steam_id);
+        }
       }
       return 0;
     }
