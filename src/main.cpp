@@ -2,13 +2,18 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <map>
+#include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -58,6 +63,28 @@ struct SaveSummary {
   std::string pets_json = "[]";
   std::string runes_json = "[]";
   std::string summary_json;
+};
+
+struct MemoryEvent {
+  std::string type;
+  std::string label;
+  int seconds = 0;
+  std::string progress;
+  std::string item;
+  std::string hero;
+  std::string enemy;
+  std::string clock;
+  std::string raw;
+  std::string id;
+  int index = 0;
+};
+
+struct MemorySnapshot {
+  DWORD pid = 0;
+  std::vector<MemoryEvent> events;
+  std::string history_json = "null";
+  std::string clears_json = "null";
+  std::string watcher_json = "null";
 };
 
 std::wstring Trim(std::wstring value) {
@@ -447,6 +474,486 @@ std::string JsonSerialize(const JsonValue& value) {
 
 bool ParseJson(const std::string& text, JsonValue& out) {
   return JsonParser(text).Parse(out);
+}
+
+std::string LowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+std::wstring LowerWide(std::wstring value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+  return value;
+}
+
+std::wstring NormalizeMemoryText(const std::wstring& text) {
+  std::wstring out;
+  out.reserve(text.size());
+  bool spaced = false;
+  for (wchar_t c : text) {
+    bool is_private = c >= 0xE000 && c <= 0xF8FF;
+    bool is_control = (c >= 0 && c <= 0x08) || c == 0x0B || c == 0x0C || (c >= 0x0E && c <= 0x1F);
+    if (is_private || is_control || iswspace(c)) {
+      if (!spaced && !out.empty()) {
+        out.push_back(L' ');
+        spaced = true;
+      }
+      continue;
+    }
+    out.push_back(c);
+    spaced = false;
+  }
+  while (!out.empty() && out.back() == L' ') out.pop_back();
+  return out;
+}
+
+std::string CleanMarkupUtf8(const std::wstring& input) {
+  std::wstring out;
+  out.reserve(input.size());
+  bool in_tag = false;
+  for (wchar_t c : input) {
+    if (c == L'<') {
+      in_tag = true;
+      continue;
+    }
+    if (c == L'>') {
+      in_tag = false;
+      continue;
+    }
+    if (!in_tag) out.push_back(c);
+  }
+  return Utf8(NormalizeMemoryText(out));
+}
+
+std::string EventId(const MemoryEvent& event) {
+  if (event.type == "clear") return "clear|" + event.label + "|" + std::to_string(event.seconds) + "|" + event.clock + "|" + event.raw;
+  if (event.type == "failure") return "failure|" + event.label + "|" + event.progress + "|" + event.clock + "|" + event.raw;
+  if (event.type == "death") return "death|" + event.hero + "|" + event.enemy + "|" + event.clock + "|" + event.raw;
+  if (event.type == "drop") return "drop|" + event.item + "|" + event.clock + "|" + event.raw;
+  return event.type + "|" + event.raw;
+}
+
+bool ContainsAny(const std::vector<unsigned char>& data, const std::vector<std::vector<unsigned char>>& needles) {
+  for (const auto& needle : needles) {
+    if (needle.empty() || needle.size() > data.size()) continue;
+    if (std::search(data.begin(), data.end(), needle.begin(), needle.end()) != data.end()) return true;
+  }
+  return false;
+}
+
+std::vector<size_t> FindNeedleIndexes(const std::vector<unsigned char>& data, const std::vector<std::vector<unsigned char>>& needles) {
+  std::set<size_t> indexes;
+  for (const auto& needle : needles) {
+    auto it = data.begin();
+    while (it != data.end()) {
+      it = std::search(it, data.end(), needle.begin(), needle.end());
+      if (it == data.end()) break;
+      indexes.insert(static_cast<size_t>(std::distance(data.begin(), it)));
+      it += std::max<size_t>(needle.size(), 1);
+    }
+  }
+  return std::vector<size_t>(indexes.begin(), indexes.end());
+}
+
+std::vector<unsigned char> Utf16Needle(const wchar_t* text) {
+  std::vector<unsigned char> bytes;
+  for (const wchar_t* p = text; *p; ++p) {
+    wchar_t c = *p;
+    bytes.push_back(static_cast<unsigned char>(c & 0xFF));
+    bytes.push_back(static_cast<unsigned char>((c >> 8) & 0xFF));
+  }
+  return bytes;
+}
+
+std::wstring DecodeUtf16Le(const unsigned char* data, size_t size) {
+  std::wstring out;
+  out.reserve(size / 2);
+  for (size_t i = 0; i + 1 < size; i += 2) {
+    wchar_t c = static_cast<wchar_t>(data[i] | (data[i + 1] << 8));
+    out.push_back(c);
+  }
+  return out;
+}
+
+DWORD FindProcessIdByName(const wchar_t* process_name) {
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return 0;
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  DWORD found = 0;
+  std::wstring wanted = LowerWide(process_name);
+  if (Process32FirstW(snapshot, &entry)) {
+    do {
+      if (LowerWide(entry.szExeFile) == wanted) {
+        found = entry.th32ProcessID;
+        break;
+      }
+    } while (Process32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return found;
+}
+
+bool IsReadableRegion(const MEMORY_BASIC_INFORMATION& info) {
+  if (info.State != MEM_COMMIT) return false;
+  if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+  DWORD protect = info.Protect & 0xFF;
+  return protect == PAGE_READONLY || protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+         protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char* address, SIZE_T size) {
+  std::vector<unsigned char> bytes(size);
+  SIZE_T read = 0;
+  if (!ReadProcessMemory(process, address, bytes.data(), size, &read) || read == 0) return {};
+  bytes.resize(read);
+  return bytes;
+}
+
+void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& text) {
+  static const std::wregex clear_re(
+      LR"((?:<color=#[0-9A-Fa-f]+>)?Est[aá]gio\s+(\d+-\d+)(?:</color>)?\s+conclu[ií]do\.\s*\((\d+)s\)(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)",
+      std::regex_constants::icase);
+  static const std::wregex fail_re(
+      LR"(Falha ao concluir\s+(?:<color=#[0-9A-Fa-f]+>)?Est[aá]gio\s+(\d+-\d+)(?:</color>)?\.\s*\((\d+/\d+)\)(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)",
+      std::regex_constants::icase);
+  static const std::wregex death_re(
+      LR"((?:<color=#[0-9A-Fa-f]+>)?([^<>()]{2,40})(?:</color>)?\s+foi derrotado\.\s*\(([^)]+)\)(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)",
+      std::regex_constants::icase);
+  static const std::wregex drop_re(
+      LR"((?:(?:Resultado de fabricação:\s*(?:<color=#[0-9A-Fa-f]+>)?([^<.]{2,80})(?:</color>)?)|(?:<color=#[0-9A-Fa-f]+>)?([A-ZÁÉÍÓÚÃÕÂÊÔÇ][A-Za-zÁÉÍÓÚáéíóúÃÕãõÂÊÔâêôÇç0-9'’+ -]{1,80})(?:</color>)?\s+obtido)\.(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)");
+
+  auto add_matches = [&](const std::wregex& regex, const std::string& type) {
+    for (std::wsregex_iterator it(text.begin(), text.end(), regex), end; it != end; ++it) {
+      const std::wsmatch& match = *it;
+      MemoryEvent event;
+      event.type = type;
+      event.raw = Utf8(match.str(0));
+      if (type == "clear") {
+        event.label = Utf8(match.str(1));
+        event.seconds = _wtoi(match.str(2).c_str());
+        event.clock = match.size() > 3 ? Utf8(match.str(3)) : "";
+      } else if (type == "failure") {
+        event.label = Utf8(match.str(1));
+        event.progress = Utf8(match.str(2));
+        event.clock = match.size() > 3 ? Utf8(match.str(3)) : "";
+      } else if (type == "death") {
+        event.hero = CleanMarkupUtf8(match.str(1));
+        event.enemy = CleanMarkupUtf8(match.str(2));
+        event.clock = match.size() > 3 ? Utf8(match.str(3)) : "";
+      } else if (type == "drop") {
+        std::wstring item = match.str(1).empty() ? match.str(2) : match.str(1);
+        event.item = CleanMarkupUtf8(item);
+        event.clock = match.size() > 3 ? Utf8(match.str(3)) : "";
+        std::string lower = LowerAscii(event.item);
+        if (lower.rfind("falha ao concluir", 0) == 0 || lower.rfind("estágio", 0) == 0 || lower.rfind("estagio", 0) == 0) continue;
+        if (lower.find("certificado") != std::string::npos || lower.find("descritor") != std::string::npos ||
+            lower.find("monitor") != std::string::npos || lower.find("vers") != std::string::npos ||
+            lower.find("não pôde") != std::string::npos) {
+          continue;
+        }
+      }
+      event.id = EventId(event);
+      events.push_back(std::move(event));
+    }
+  };
+
+  add_matches(clear_re, "clear");
+  add_matches(fail_re, "failure");
+  add_matches(death_re, "death");
+  add_matches(drop_re, "drop");
+}
+
+std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
+  std::set<std::string> seen;
+  std::vector<MemoryEvent> output;
+  for (const auto& event : events) {
+    std::string id = event.id.empty() ? EventId(event) : event.id;
+    if (seen.count(id)) continue;
+    seen.insert(id);
+    MemoryEvent copy = event;
+    copy.id = id;
+    copy.index = static_cast<int>(output.size());
+    output.push_back(std::move(copy));
+  }
+  return output;
+}
+
+std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process, SIZE_T max_region = 64ULL * 1024ULL * 1024ULL, size_t context = 4096) {
+  static const std::vector<std::vector<unsigned char>> needles = {
+      Utf16Needle(L"concluído"),
+      Utf16Needle(L"concluido"),
+      Utf16Needle(L"Falha ao concluir"),
+      Utf16Needle(L"derrotado"),
+      Utf16Needle(L"obtido"),
+      Utf16Needle(L"Resultado de fabricação"),
+  };
+
+  std::vector<MemoryEvent> events;
+  unsigned char* address = nullptr;
+  MEMORY_BASIC_INFORMATION info{};
+  while (VirtualQueryEx(process, address, &info, sizeof(info)) == sizeof(info)) {
+    unsigned char* base = static_cast<unsigned char*>(info.BaseAddress);
+    SIZE_T size = info.RegionSize;
+    if (IsReadableRegion(info) && size > 0 && size <= max_region) {
+      std::vector<unsigned char> data = ReadProcessBytes(process, base, size);
+      if (!data.empty() && ContainsAny(data, needles)) {
+        for (size_t index : FindNeedleIndexes(data, needles)) {
+          size_t left = index > context ? index - context : 0;
+          size_t right = (std::min)(data.size(), index + context);
+          std::wstring text = NormalizeMemoryText(DecodeUtf16Le(data.data() + left, right - left));
+          AppendRegexEvents(events, text);
+        }
+      }
+    }
+    unsigned char* next = base + size;
+    if (next <= address) break;
+    address = next;
+  }
+  return UniqueEvents(events);
+}
+
+JsonValue EventJson(const MemoryEvent& event) {
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "type", JsonValue::String(event.type));
+  if (!event.label.empty()) ObjectSet(out, "label", JsonValue::String(event.label));
+  if (event.type == "clear") ObjectSet(out, "seconds", JsonValue::Number(static_cast<long long>(event.seconds)));
+  if (!event.progress.empty()) ObjectSet(out, "progress", JsonValue::String(event.progress));
+  if (!event.item.empty()) ObjectSet(out, "item", JsonValue::String(event.item));
+  if (!event.hero.empty()) ObjectSet(out, "hero", JsonValue::String(event.hero));
+  if (!event.enemy.empty()) ObjectSet(out, "enemy", JsonValue::String(event.enemy));
+  ObjectSet(out, "clock", JsonValue::String(event.clock));
+  ObjectSet(out, "raw", JsonValue::String(event.raw));
+  ObjectSet(out, "id", JsonValue::String(event.id));
+  ObjectSet(out, "index", JsonValue::Number(static_cast<long long>(event.index)));
+  return out;
+}
+
+std::vector<int> StageParts(const std::string& label) {
+  std::vector<int> parts;
+  size_t start = 0;
+  while (start < label.size()) {
+    size_t dash = label.find('-', start);
+    std::string part = label.substr(start, dash == std::string::npos ? std::string::npos : dash - start);
+    parts.push_back(part.empty() ? 0 : atoi(part.c_str()));
+    if (dash == std::string::npos) break;
+    start = dash + 1;
+  }
+  return parts;
+}
+
+bool StageLabelLess(const std::string& a, const std::string& b) {
+  return StageParts(a) < StageParts(b);
+}
+
+JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::string& difficulty) {
+  struct StageGroup {
+    std::vector<MemoryEvent> clears;
+    std::vector<MemoryEvent> failures;
+  };
+  struct DropGroup {
+    int count = 0;
+    std::string last_clock;
+    std::string item;
+  };
+  struct DeathGroup {
+    int count = 0;
+    std::string last_clock;
+    std::string hero;
+    std::string enemy;
+  };
+
+  std::map<std::string, StageGroup> by_stage;
+  std::map<std::string, DropGroup> drops;
+  std::map<std::string, DeathGroup> deaths;
+  int total_clears = 0;
+  int total_failures = 0;
+  int total_deaths = 0;
+  int total_drops = 0;
+  for (const auto& event : events) {
+    if (event.type == "clear") {
+      ++total_clears;
+      by_stage[event.label].clears.push_back(event);
+    } else if (event.type == "failure") {
+      ++total_failures;
+      by_stage[event.label].failures.push_back(event);
+    } else if (event.type == "death") {
+      ++total_deaths;
+      std::string key = event.hero + "|" + event.enemy;
+      deaths[key].count++;
+      deaths[key].last_clock = event.clock;
+      deaths[key].hero = event.hero;
+      deaths[key].enemy = event.enemy;
+    } else if (event.type == "drop") {
+      ++total_drops;
+      drops[event.item].count++;
+      drops[event.item].last_clock = event.clock;
+      drops[event.item].item = event.item;
+    }
+  }
+
+  std::vector<std::string> labels;
+  for (const auto& item : by_stage) labels.push_back(item.first);
+  std::sort(labels.begin(), labels.end(), StageLabelLess);
+
+  JsonValue stage_summaries = JsonValue::Array();
+  for (const std::string& label : labels) {
+    const StageGroup& group = by_stage[label];
+    std::vector<int> clear_seconds;
+    for (const auto& event : group.clears) clear_seconds.push_back(event.seconds);
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "label", JsonValue::String(label));
+    ObjectSet(row, "difficulty", JsonValue::String(difficulty));
+    ObjectSet(row, "clears", JsonValue::Number(static_cast<long long>(group.clears.size())));
+    ObjectSet(row, "failures", JsonValue::Number(static_cast<long long>(group.failures.size())));
+    ObjectSet(row, "attempts", JsonValue::Number(static_cast<long long>(group.clears.size() + group.failures.size())));
+    if (!clear_seconds.empty()) {
+      int sum = 0;
+      int best = clear_seconds[0];
+      int worst = clear_seconds[0];
+      for (int value : clear_seconds) {
+        sum += value;
+        best = (std::min)(best, value);
+        worst = (std::max)(worst, value);
+      }
+      size_t start = clear_seconds.size() > 10 ? clear_seconds.size() - 10 : 0;
+      int last_sum = 0;
+      JsonValue recent = JsonValue::Array();
+      for (size_t i = start; i < clear_seconds.size(); ++i) {
+        last_sum += clear_seconds[i];
+        recent.array.push_back(JsonValue::Number(static_cast<long long>(clear_seconds[i])));
+      }
+      ObjectSet(row, "average", JsonValue::Number(std::round((static_cast<double>(sum) / clear_seconds.size()) * 100.0) / 100.0));
+      ObjectSet(row, "last10Average", JsonValue::Number(std::round((static_cast<double>(last_sum) / (clear_seconds.size() - start)) * 100.0) / 100.0));
+      ObjectSet(row, "best", JsonValue::Number(static_cast<long long>(best)));
+      ObjectSet(row, "worst", JsonValue::Number(static_cast<long long>(worst)));
+      ObjectSet(row, "lastTime", JsonValue::Number(static_cast<long long>(clear_seconds.back())));
+      ObjectSet(row, "recentSamples", std::move(recent));
+    }
+    stage_summaries.array.push_back(std::move(row));
+  }
+
+  std::vector<DropGroup> drop_rows;
+  for (const auto& item : drops) drop_rows.push_back(item.second);
+  std::sort(drop_rows.begin(), drop_rows.end(), [](const DropGroup& a, const DropGroup& b) {
+    if (a.count != b.count) return a.count > b.count;
+    return LowerAscii(a.item) < LowerAscii(b.item);
+  });
+  JsonValue drop_json = JsonValue::Array();
+  for (const auto& drop : drop_rows) {
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "count", JsonValue::Number(static_cast<long long>(drop.count)));
+    ObjectSet(row, "lastClock", JsonValue::String(drop.last_clock));
+    ObjectSet(row, "item", JsonValue::String(drop.item));
+    drop_json.array.push_back(std::move(row));
+  }
+
+  std::vector<DeathGroup> death_rows;
+  for (const auto& item : deaths) death_rows.push_back(item.second);
+  std::sort(death_rows.begin(), death_rows.end(), [](const DeathGroup& a, const DeathGroup& b) {
+    if (a.count != b.count) return a.count > b.count;
+    if (LowerAscii(a.hero) != LowerAscii(b.hero)) return LowerAscii(a.hero) < LowerAscii(b.hero);
+    return LowerAscii(a.enemy) < LowerAscii(b.enemy);
+  });
+  JsonValue death_json = JsonValue::Array();
+  for (const auto& death : death_rows) {
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "count", JsonValue::Number(static_cast<long long>(death.count)));
+    ObjectSet(row, "lastClock", JsonValue::String(death.last_clock));
+    ObjectSet(row, "hero", JsonValue::String(death.hero));
+    ObjectSet(row, "enemy", JsonValue::String(death.enemy));
+    death_json.array.push_back(std::move(row));
+  }
+
+  JsonValue event_json = JsonValue::Array();
+  for (const auto& event : events) event_json.array.push_back(EventJson(event));
+
+  JsonValue totals = JsonValue::Object();
+  ObjectSet(totals, "clears", JsonValue::Number(static_cast<long long>(total_clears)));
+  ObjectSet(totals, "failures", JsonValue::Number(static_cast<long long>(total_failures)));
+  ObjectSet(totals, "deaths", JsonValue::Number(static_cast<long long>(total_deaths)));
+  ObjectSet(totals, "drops", JsonValue::Number(static_cast<long long>(total_drops)));
+
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "source", JsonValue::String("memory"));
+  ObjectSet(out, "kind", JsonValue::String("log-history"));
+  ObjectSet(out, "difficulty", JsonValue::String(difficulty));
+  ObjectSet(out, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
+  ObjectSet(out, "lastEvent", events.empty() ? JsonValue::Null() : EventJson(events.back()));
+  ObjectSet(out, "total", JsonValue::Number(static_cast<long long>(events.size())));
+  ObjectSet(out, "totals", std::move(totals));
+  ObjectSet(out, "stageSummaries", std::move(stage_summaries));
+  ObjectSet(out, "drops", std::move(drop_json));
+  ObjectSet(out, "deaths", std::move(death_json));
+  ObjectSet(out, "events", std::move(event_json));
+  return out;
+}
+
+JsonValue BuildClearsJson(const std::vector<MemoryEvent>& events, const std::string& difficulty) {
+  std::map<std::string, std::vector<int>> by_stage;
+  const MemoryEvent* last_clear = nullptr;
+  for (const auto& event : events) {
+    if (event.type != "clear") continue;
+    by_stage[event.label].push_back(event.seconds);
+    last_clear = &event;
+  }
+  std::vector<std::string> labels;
+  for (const auto& item : by_stage) labels.push_back(item.first);
+  std::sort(labels.begin(), labels.end(), StageLabelLess);
+
+  JsonValue averages = JsonValue::Array();
+  for (const auto& label : labels) {
+    const std::vector<int>& values = by_stage[label];
+    if (values.empty()) continue;
+    size_t start = values.size() > 10 ? values.size() - 10 : 0;
+    int sum = 0;
+    JsonValue recent = JsonValue::Array();
+    for (size_t i = start; i < values.size(); ++i) {
+      sum += values[i];
+      recent.array.push_back(JsonValue::Number(static_cast<long long>(values[i])));
+    }
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "label", JsonValue::String(label));
+    ObjectSet(row, "difficulty", JsonValue::String(difficulty));
+    ObjectSet(row, "average", JsonValue::Number(static_cast<double>(sum) / (values.size() - start)));
+    ObjectSet(row, "samples", JsonValue::Number(static_cast<long long>(values.size() - start)));
+    ObjectSet(row, "lastTime", JsonValue::Number(static_cast<long long>(values.back())));
+    ObjectSet(row, "recentSamples", std::move(recent));
+    averages.array.push_back(std::move(row));
+  }
+
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "source", JsonValue::String("memory"));
+  ObjectSet(out, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
+  ObjectSet(out, "lastEvent", last_clear ? EventJson(*last_clear) : JsonValue::Null());
+  ObjectSet(out, "averages", std::move(averages));
+  return out;
+}
+
+MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL") {
+  MemorySnapshot snapshot;
+  snapshot.pid = FindProcessIdByName(L"TaskBarHero.exe");
+  JsonValue watcher = JsonValue::Object();
+  ObjectSet(watcher, "source", JsonValue::String("memory"));
+  ObjectSet(watcher, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
+  if (!snapshot.pid) {
+    ObjectSet(watcher, "message", JsonValue::String("TaskBarHero.exe not found"));
+    snapshot.watcher_json = JsonSerialize(watcher);
+    return snapshot;
+  }
+  HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, snapshot.pid);
+  if (!process) {
+    ObjectSet(watcher, "message", JsonValue::String("failed to open TaskBarHero.exe"));
+    snapshot.watcher_json = JsonSerialize(watcher);
+    return snapshot;
+  }
+  snapshot.events = ScanMemoryEvents(process);
+  CloseHandle(process);
+  ObjectSet(watcher, "message", JsonValue::String("memory snapshot pid=" + std::to_string(snapshot.pid) + "; events=" + std::to_string(snapshot.events.size())));
+  snapshot.watcher_json = JsonSerialize(watcher);
+  snapshot.history_json = JsonSerialize(BuildHistoryJson(snapshot.events, difficulty));
+  snapshot.clears_json = JsonSerialize(BuildClearsJson(snapshot.events, difficulty));
+  return snapshot;
 }
 
 std::string NarrowAscii(const std::wstring& text) {
@@ -1126,6 +1633,7 @@ std::string JsonEscape(const std::string& input) {
 std::string SavePayload(const Config& config) {
   SaveSummary summary;
   bool has_save = ReadSaveSummary(summary);
+  MemorySnapshot memory = ReadMemorySnapshot("NORMAL");
   std::string steam_raw = config.steam_id.empty() ? (summary.steam_id.empty() ? "default" : summary.steam_id) : Utf8(config.steam_id);
   std::string steam = JsonEscape(steam_raw);
   std::string save = "null";
@@ -1133,7 +1641,9 @@ std::string SavePayload(const Config& config) {
     save = summary.summary_json;
   }
   return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
-         ",\"clears\":null,\"history\":null,\"watcher\":{\"agent\":\"cpp-save-mvp\"}}";
+         ",\"clears\":" + memory.clears_json +
+         ",\"history\":" + memory.history_json +
+         ",\"watcher\":" + memory.watcher_json + "}";
 }
 
 bool CompareField(const std::string& name, const std::string& cpp_value, const std::string& py_value, std::wstring& error) {
@@ -1410,6 +1920,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
         return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--memory-scan") == 0) {
+        MemorySnapshot snapshot = ReadMemorySnapshot("NORMAL");
+        JsonValue out = JsonValue::Object();
+        ObjectSet(out, "pid", JsonValue::Number(static_cast<long long>(snapshot.pid)));
+        ObjectSet(out, "events", JsonValue::Number(static_cast<long long>(snapshot.events.size())));
+        JsonValue history;
+        JsonValue clears;
+        JsonValue watcher;
+        ParseJson(snapshot.history_json, history);
+        ParseJson(snapshot.clears_json, clears);
+        ParseJson(snapshot.watcher_json, watcher);
+        ObjectSet(out, "history", history);
+        ObjectSet(out, "clears", clears);
+        ObjectSet(out, "watcher", watcher);
+        WriteTextFile(TempComparePath(), Widen(JsonSerialize(out)));
+        LocalFree(argv);
+        return snapshot.pid ? 0 : 2;
       }
     }
     LocalFree(argv);
