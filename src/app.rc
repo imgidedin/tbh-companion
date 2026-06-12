@@ -1,3 +1,4 @@
 #include "resource.h"
 
 IDI_APPICON ICON "..\\res\\app.ico"
+IDR_ITEMS_ZIP RCDATA "..\\res\\items.zip"

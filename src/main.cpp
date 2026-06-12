@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "generated_items.h"
 #include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -164,6 +165,15 @@ std::wstring ConfigPath() {
   dir += L"\\TBH Companion";
   CreateDirectoryW(dir.c_str(), nullptr);
   return dir + L"\\config.ini";
+}
+
+std::wstring CompanionDir() {
+  wchar_t local_app_data[MAX_PATH]{};
+  DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+  std::wstring dir = length ? std::wstring(local_app_data, length) : L".";
+  dir += L"\\TBH Companion";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  return dir;
 }
 
 std::wstring AutoStartCommand() {
@@ -1121,6 +1131,15 @@ bool ReadAllBytes(const std::wstring& path, std::vector<unsigned char>& bytes) {
   return true;
 }
 
+bool WriteAllBytes(const std::wstring& path, const void* data, size_t size) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  BOOL ok = WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr);
+  CloseHandle(file);
+  return ok && written == size;
+}
+
 bool ReadTextFile(const std::wstring& path, std::string& text) {
   std::vector<unsigned char> bytes;
   if (!ReadAllBytes(path, bytes)) return false;
@@ -1175,21 +1194,62 @@ std::wstring PythonSummaryPath() {
 }
 
 std::wstring ItemsJsonPath() {
+  static std::wstring resolved;
+  if (!resolved.empty()) return resolved;
+
+  std::wstring items_root = CompanionDir() + L"\\items";
+  CreateDirectoryW(items_root.c_str(), nullptr);
+  std::wstring cache_dir = items_root + L"\\" + EMBEDDED_ITEMS_SHA1;
+  CreateDirectoryW(cache_dir.c_str(), nullptr);
+  std::wstring cached_json = cache_dir + L"\\items.json";
+  DWORD attrs = GetFileAttributesW(cached_json.c_str());
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    resolved = cached_json;
+    return resolved;
+  }
+
+  HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_ITEMS_ZIP), RT_RCDATA);
+  HGLOBAL loaded = resource ? LoadResource(nullptr, resource) : nullptr;
+  void* data = loaded ? LockResource(loaded) : nullptr;
+  DWORD size = resource ? SizeofResource(nullptr, resource) : 0;
+  std::wstring zip_path = cache_dir + L"\\items.zip";
+  if (data && size && WriteAllBytes(zip_path, data, size)) {
+    auto quote_ps = [](std::wstring value) {
+      std::wstring out = L"'";
+      for (wchar_t c : value) {
+        if (c == L'\'') out += L"''";
+        else out.push_back(c);
+      }
+      out += L"'";
+      return out;
+    };
+    std::wstring command = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath " +
+                           quote_ps(zip_path) + L" -DestinationPath " + quote_ps(cache_dir) + L" -Force\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+    if (CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+      WaitForSingleObject(process.hProcess, 60000);
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    attrs = GetFileAttributesW(cached_json.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      resolved = cached_json;
+      return resolved;
+    }
+  }
+
   std::wstring build_dir = ParentDir(ExePath());
   std::wstring agent_dir = ParentDir(build_dir);
-  std::wstring candidate = agent_dir + L"\\runtime\\items.json";
-  DWORD attrs = GetFileAttributesW(candidate.c_str());
-  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return candidate;
-
-  std::wstring outros_dir = ParentDir(agent_dir);
-  std::wstring sibling = outros_dir + L"\\tbh-farm-local\\runtime\\items.json";
+  std::wstring sibling = ParentDir(agent_dir) + L"\\tbh-farm-local\\runtime\\items.json";
   attrs = GetFileAttributesW(sibling.c_str());
-  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return sibling;
-
-  wchar_t profile[MAX_PATH]{};
-  DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
-  std::wstring user = length ? std::wstring(profile, length) : L"";
-  return user + L"\\OneDrive\\Documentos\\Outros\\tbh-farm-local\\runtime\\items.json";
+  resolved = (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) ? sibling : cached_json;
+  return resolved;
 }
 
 bool Es3AesKey(const std::string& password, const std::vector<unsigned char>& salt, std::vector<unsigned char>& key) {

@@ -27,6 +27,7 @@ Atual:
 - GUI nativa Win32.
 - Salva automaticamente URL do servidor, token, SteamID e inicializacao com Windows.
 - Le o save ES3 padrao e monta o mesmo resumo gerado pelo worker Python.
+- Embute `items.json` como `items.zip` no exe e extrai para cache por SHA1 quando necessario.
 - Abre o jogo pelo Steam se `TaskBarHero.exe` nao estiver rodando.
 - Monitora o save por timestamp e so relê quando o arquivo muda.
 - Monitora logs da memoria do `TaskBarHero.exe`, mantendo cache das regioes candidatas para reduzir custo.
