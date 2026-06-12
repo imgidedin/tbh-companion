@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "resource.h"
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
@@ -813,6 +815,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   wc.hInstance = instance;
   wc.lpszClassName = class_name;
   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APPICON));
   wc.hbrBackground = CreateSolidBrush(RGB(23, 26, 29));
   RegisterClassW(&wc);
 
@@ -821,6 +824,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                               CW_USEDEFAULT, CW_USEDEFAULT, 620, 400,
                               nullptr, nullptr, instance, nullptr);
   if (!hwnd) return 1;
+
+  HICON small_icon = reinterpret_cast<HICON>(
+      LoadImageW(instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+  HICON big_icon = reinterpret_cast<HICON>(
+      LoadImageW(instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
+  if (small_icon) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
+  if (big_icon) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
 
   ShowWindow(hwnd, show);
   UpdateWindow(hwnd);
