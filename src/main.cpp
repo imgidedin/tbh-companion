@@ -157,6 +157,59 @@ bool ReadAllBytes(const std::wstring& path, std::vector<unsigned char>& bytes) {
   return true;
 }
 
+bool ReadTextFile(const std::wstring& path, std::string& text) {
+  std::vector<unsigned char> bytes;
+  if (!ReadAllBytes(path, bytes)) return false;
+  text.assign(reinterpret_cast<char*>(bytes.data()), bytes.size());
+  return true;
+}
+
+bool WriteTextFile(const std::wstring& path, const std::wstring& text) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  std::string utf8 = Utf8(text);
+  DWORD written = 0;
+  BOOL ok = WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+  CloseHandle(file);
+  return ok && written == utf8.size();
+}
+
+std::wstring TempComparePath() {
+  wchar_t temp[MAX_PATH]{};
+  DWORD length = GetTempPathW(MAX_PATH, temp);
+  std::wstring dir = length ? std::wstring(temp, length) : L".\\";
+  return dir + L"tbh-agent-compare.txt";
+}
+
+std::wstring ParentDir(std::wstring path) {
+  size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? L"" : path.substr(0, slash);
+}
+
+std::wstring ExePath() {
+  std::vector<wchar_t> path(MAX_PATH);
+  DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+  while (length == path.size()) {
+    path.resize(path.size() * 2);
+    length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+  }
+  return std::wstring(path.data(), length);
+}
+
+std::wstring PythonSummaryPath() {
+  std::wstring build_dir = ParentDir(ExePath());
+  std::wstring agent_dir = ParentDir(build_dir);
+  std::wstring outros_dir = ParentDir(agent_dir);
+  std::wstring sibling = outros_dir + L"\\tbh-farm-local\\runtime\\save-summary.json";
+  DWORD attrs = GetFileAttributesW(sibling.c_str());
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return sibling;
+
+  wchar_t profile[MAX_PATH]{};
+  DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+  std::wstring user = length ? std::wstring(profile, length) : L"";
+  return user + L"\\OneDrive\\Documentos\\Outros\\tbh-farm-local\\runtime\\save-summary.json";
+}
+
 bool Es3AesKey(const std::string& password, const std::vector<unsigned char>& salt, std::vector<unsigned char>& key) {
   key.assign(16, 0);
   BCRYPT_ALG_HANDLE alg = nullptr;
@@ -228,10 +281,14 @@ std::string ExtractJsonString(const std::string& json, const std::string& key, s
   if (pos == std::string::npos) return {};
   pos = json.find('"', pos + 1);
   if (pos == std::string::npos) return {};
+  bool escaped_json_string = pos > 0 && json[pos - 1] == '\\';
   std::string value;
   bool escape = false;
   for (size_t i = pos + 1; i < json.size(); ++i) {
     char c = json[i];
+    if (escaped_json_string && c == '\\' && i + 1 < json.size() && json[i + 1] == '"') {
+      return value;
+    }
     if (escape) {
       value.push_back(c);
       escape = false;
@@ -268,6 +325,13 @@ long long ExtractJsonInt(const std::string& json, const std::string& key, size_t
     ++pos;
   }
   return any ? (negative ? -value : value) : fallback;
+}
+
+long long ExtractLastJsonInt(const std::string& json, const std::string& key, long long fallback = 0) {
+  std::string needle = "\"" + key + "\"";
+  size_t pos = json.rfind(needle);
+  if (pos == std::string::npos) return fallback;
+  return ExtractJsonInt(json, key, pos, fallback);
 }
 
 std::string ExtractSection(const std::string& json, const std::string& key) {
@@ -315,11 +379,32 @@ std::string ExtractArraySection(const std::string& json, const std::string& key)
   return section.empty() ? "[]" : section;
 }
 
+size_t FindKey(const std::string& text, const std::string& key, size_t start) {
+  size_t quoted = text.find("\"" + key + "\"", start);
+  size_t escaped = text.find("\\\"" + key + "\\\"", start);
+  size_t plain = text.find(key, start);
+  size_t best = std::string::npos;
+  for (size_t pos : {quoted, escaped, plain}) {
+    if (pos != std::string::npos && (best == std::string::npos || pos < best)) best = pos;
+  }
+  return best;
+}
+
+int CountKey(const std::string& text, const std::string& key) {
+  int count = 0;
+  size_t pos = 0;
+  while ((pos = FindKey(text, key, pos)) != std::string::npos) {
+    ++count;
+    pos += key.size();
+  }
+  return count;
+}
+
 std::string BuildPetsSummaryJson(const std::string& pets_section) {
   std::string output = "[";
   size_t pos = 0;
   bool first = true;
-  while ((pos = pets_section.find("\"PetKey\"", pos)) != std::string::npos) {
+  while ((pos = FindKey(pets_section, "PetKey", pos)) != std::string::npos) {
     long long key = ExtractJsonInt(pets_section, "PetKey", pos);
     long long unlocked = ExtractJsonString(pets_section, "IsUnlock", pos) == "true" ? 1 : ExtractJsonInt(pets_section, "IsUnlock", pos, -1);
     long long viewed = ExtractJsonString(pets_section, "IsViewed", pos) == "true" ? 1 : ExtractJsonInt(pets_section, "IsViewed", pos, -1);
@@ -343,7 +428,7 @@ std::string BuildRunesSummaryJson(const std::string& runes_section) {
   std::string output = "[";
   size_t pos = 0;
   bool first = true;
-  while ((pos = runes_section.find("\"RuneKey\"", pos)) != std::string::npos) {
+  while ((pos = FindKey(runes_section, "RuneKey", pos)) != std::string::npos) {
     long long key = ExtractJsonInt(runes_section, "RuneKey", pos);
     long long level = ExtractJsonInt(runes_section, "Level", pos);
     if (!first) output += ",";
@@ -436,6 +521,47 @@ std::string SavePayload(const Config& config) {
          ",\"clears\":null,\"history\":null,\"watcher\":{\"agent\":\"cpp-save-mvp\"}}";
 }
 
+bool CompareField(const std::string& name, const std::string& cpp_value, const std::string& py_value, std::wstring& error) {
+  if (cpp_value == py_value) return true;
+  error = L"Divergência em " + Widen(name) + L": C++='" + Widen(cpp_value) + L"' Python='" + Widen(py_value) + L"'";
+  return false;
+}
+
+bool CompareField(const std::string& name, long long cpp_value, long long py_value, std::wstring& error) {
+  if (cpp_value == py_value) return true;
+  error = L"Divergência em " + Widen(name) + L": C++=" + std::to_wstring(cpp_value) + L" Python=" + std::to_wstring(py_value);
+  return false;
+}
+
+bool CompareWithPythonSummary(const SaveSummary& summary, std::wstring& error) {
+  std::string py;
+  std::wstring path = PythonSummaryPath();
+  if (!ReadTextFile(path, py)) {
+    error = L"Não encontrei o save-summary do Python para comparar: " + path;
+    return false;
+  }
+
+  if (!CompareField("steamId", summary.steam_id, ExtractJsonString(py, "steamId"), error)) return false;
+  if (!CompareField("ownerSteamId", summary.owner_steam_id, ExtractJsonString(py, "ownerSteamId"), error)) return false;
+  if (!CompareField("playerId", summary.player_id, ExtractJsonString(py, "playerId"), error)) return false;
+  if (!CompareField("version", summary.version, ExtractJsonString(py, "version"), error)) return false;
+  if (!CompareField("currentStageKey", summary.current_stage_key, ExtractJsonInt(py, "currentStageKey"), error)) return false;
+  if (!CompareField("currentStageWave", summary.current_stage_wave, ExtractJsonInt(py, "currentStageWave"), error)) return false;
+  if (!CompareField("maxCompletedStage", summary.max_completed_stage, ExtractJsonInt(py, "maxCompletedStage"), error)) return false;
+  if (!CompareField("arrangedPetKey", summary.arranged_pet_key, ExtractJsonInt(py, "arrangedPetKey"), error)) return false;
+  if (!CompareField("gold", summary.gold, ExtractLastJsonInt(py, "gold"), error)) return false;
+
+  int cpp_pets = CountKey(summary.pets_json, "petKey");
+  int py_pets = CountKey(py, "petKey");
+  if (!CompareField("pets.count", cpp_pets, py_pets, error)) return false;
+
+  int cpp_runes = CountKey(summary.runes_json, "runeKey");
+  int py_runes = CountKey(py, "runeKey");
+  if (!CompareField("runes.count", cpp_runes, py_runes, error)) return false;
+
+  return true;
+}
+
 bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar_t>& host, std::vector<wchar_t>& path) {
   host.assign(256, L'\0');
   path.assign(2048, L'\0');
@@ -453,6 +579,14 @@ bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar
 std::wstring PostIngest(const Config& config) {
   if (config.server.empty()) return L"Configure a URL do servidor.";
   if (config.token.empty()) return L"Configure o token de ingest.";
+
+  SaveSummary summary;
+  if (!ReadSaveSummary(summary)) return L"Não foi possível ler o save C++.";
+  std::wstring compare_error;
+  if (!CompareWithPythonSummary(summary, compare_error)) {
+    return L"Sync bloqueado. " + compare_error;
+  }
+  return L"Comparação parcial OK. Envio bloqueado até o resumo C++ ficar idêntico ao Python. Faltam heróis, equipamentos, atributos e bônus.";
 
   std::wstring endpoint = config.server;
   while (!endpoint.empty() && endpoint.back() == L'/') endpoint.pop_back();
@@ -578,7 +712,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_steam = AddEdit(hwnd, IDC_STEAM, config.steam_id, 144, 172, 430, 28, font);
 
       AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 220, 100, 34, font);
-      AddButton(hwnd, IDC_TEST, L"Sync save", 256, 220, 120, 34, font);
+      AddButton(hwnd, IDC_TEST, L"Comparar", 256, 220, 120, 34, font);
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 220, 100, 34, font);
       AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 220, 86, 34, font);
 
@@ -610,7 +744,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       } else if (id == IDC_TEST) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
-        SetStatus(L"Lendo save e enviando sync...");
+        SetStatus(L"Comparando C++ com Python...");
         std::wstring result = PostIngest(config);
         SetStatus(result);
       } else if (id == IDC_READ_SAVE) {
@@ -646,6 +780,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   g_instance = instance;
+
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argv) {
+    for (int i = 1; i < argc; ++i) {
+      if (wcscmp(argv[i], L"--compare") == 0) {
+        SaveSummary summary;
+        std::wstring result;
+        if (!ReadSaveSummary(summary)) {
+          result = L"FAIL: não foi possível ler o save C++";
+        } else {
+          std::wstring error;
+          result = CompareWithPythonSummary(summary, error) ? L"OK: resumo C++ bate com Python nos campos portados" : L"FAIL: " + error;
+        }
+        WriteTextFile(TempComparePath(), result);
+        LocalFree(argv);
+        return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+    }
+    LocalFree(argv);
+  }
 
   INITCOMMONCONTROLSEX controls{};
   controls.dwSize = sizeof(controls);
