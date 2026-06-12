@@ -38,6 +38,20 @@ struct Config {
   std::wstring steam_id;
 };
 
+struct SaveSummary {
+  std::string steam_id;
+  std::string owner_steam_id;
+  std::string player_id;
+  std::string version;
+  long long current_stage_key = 0;
+  long long current_stage_wave = 0;
+  long long max_completed_stage = 0;
+  long long arranged_pet_key = 0;
+  long long gold = 0;
+  std::string pets_json = "[]";
+  std::string runes_json = "[]";
+};
+
 std::wstring Trim(std::wstring value) {
   while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
   while (!value.empty() && iswspace(value.back())) value.pop_back();
@@ -232,6 +246,115 @@ std::string ExtractJsonString(const std::string& json, const std::string& key, s
   return {};
 }
 
+long long ExtractJsonInt(const std::string& json, const std::string& key, size_t start = 0, long long fallback = 0) {
+  std::string needle = "\"" + key + "\"";
+  size_t pos = json.find(needle, start);
+  if (pos == std::string::npos) pos = json.find(key, start);
+  if (pos == std::string::npos) return fallback;
+  pos = json.find(':', pos + key.size());
+  if (pos == std::string::npos) return fallback;
+  ++pos;
+  while (pos < json.size() && isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  bool negative = false;
+  if (pos < json.size() && json[pos] == '-') {
+    negative = true;
+    ++pos;
+  }
+  long long value = 0;
+  bool any = false;
+  while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+    any = true;
+    value = value * 10 + (json[pos] - '0');
+    ++pos;
+  }
+  return any ? (negative ? -value : value) : fallback;
+}
+
+std::string ExtractSection(const std::string& json, const std::string& key) {
+  std::string needle = "\"" + key + "\"";
+  size_t pos = json.find(needle);
+  if (pos == std::string::npos) pos = json.find(key);
+  if (pos == std::string::npos) return {};
+  pos = json.find(':', pos + key.size());
+  if (pos == std::string::npos) return {};
+  ++pos;
+  while (pos < json.size() && isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size()) return {};
+  char open = json[pos];
+  char close = open == '{' ? '}' : open == '[' ? ']' : '\0';
+  if (!close) return {};
+  int depth = 0;
+  bool in_string = false;
+  bool escape = false;
+  for (size_t i = pos; i < json.size(); ++i) {
+    char c = json[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c == '\\') {
+      escape = true;
+      continue;
+    }
+    if (c == '"') {
+      in_string = !in_string;
+      continue;
+    }
+    if (in_string) continue;
+    if (c == open) ++depth;
+    if (c == close) {
+      --depth;
+      if (depth == 0) return json.substr(pos, i - pos + 1);
+    }
+  }
+  return {};
+}
+
+std::string ExtractArraySection(const std::string& json, const std::string& key) {
+  std::string section = ExtractSection(json, key);
+  return section.empty() ? "[]" : section;
+}
+
+std::string BuildPetsSummaryJson(const std::string& pets_section) {
+  std::string output = "[";
+  size_t pos = 0;
+  bool first = true;
+  while ((pos = pets_section.find("\"PetKey\"", pos)) != std::string::npos) {
+    long long key = ExtractJsonInt(pets_section, "PetKey", pos);
+    long long unlocked = ExtractJsonString(pets_section, "IsUnlock", pos) == "true" ? 1 : ExtractJsonInt(pets_section, "IsUnlock", pos, -1);
+    long long viewed = ExtractJsonString(pets_section, "IsViewed", pos) == "true" ? 1 : ExtractJsonInt(pets_section, "IsViewed", pos, -1);
+
+    size_t object_end = pets_section.find('}', pos);
+    std::string object = object_end == std::string::npos ? pets_section.substr(pos) : pets_section.substr(pos, object_end - pos);
+    bool is_unlocked = object.find("\"IsUnlock\":true") != std::string::npos || object.find("\\\"IsUnlock\\\":true") != std::string::npos || unlocked == 1;
+    bool is_viewed = object.find("\"IsViewed\":true") != std::string::npos || object.find("\\\"IsViewed\\\":true") != std::string::npos || viewed == 1;
+
+    if (!first) output += ",";
+    first = false;
+    output += "{\"petKey\":" + std::to_string(key) + ",\"unlocked\":" + (is_unlocked ? "true" : "false") +
+              ",\"viewed\":" + (is_viewed ? "true" : "false") + "}";
+    pos += 8;
+  }
+  output += "]";
+  return output;
+}
+
+std::string BuildRunesSummaryJson(const std::string& runes_section) {
+  std::string output = "[";
+  size_t pos = 0;
+  bool first = true;
+  while ((pos = runes_section.find("\"RuneKey\"", pos)) != std::string::npos) {
+    long long key = ExtractJsonInt(runes_section, "RuneKey", pos);
+    long long level = ExtractJsonInt(runes_section, "Level", pos);
+    if (!first) output += ",";
+    first = false;
+    output += "{\"runeKey\":" + std::to_string(key) + ",\"level\":" + std::to_string(level) + "}";
+    pos += 9;
+  }
+  output += "]";
+  return output;
+}
+
 std::string LeadingDigits(const std::string& value) {
   std::string digits;
   for (char c : value) {
@@ -241,19 +364,38 @@ std::string LeadingDigits(const std::string& value) {
   return digits;
 }
 
-std::wstring ReadSteamIdFromSave() {
+bool ReadSaveSummary(SaveSummary& summary) {
   std::vector<unsigned char> bytes;
   std::wstring path = DefaultSavePath();
-  if (!ReadAllBytes(path, bytes)) return L"";
+  if (!ReadAllBytes(path, bytes)) return false;
 
   std::string json;
-  if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return L"";
+  if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return false;
 
   size_t account_pos = json.find("\"AccountSaveData\"");
-  std::string steam = ExtractJsonString(json, "ownerSteamId", account_pos == std::string::npos ? 0 : account_pos);
-  steam = LeadingDigits(steam);
-  if (steam.empty()) steam = ExtractJsonString(json, "playerId", account_pos == std::string::npos ? 0 : account_pos);
-  return Widen(steam);
+  summary.owner_steam_id = LeadingDigits(ExtractJsonString(json, "ownerSteamId", account_pos == std::string::npos ? 0 : account_pos));
+  summary.player_id = ExtractJsonString(json, "playerId", account_pos == std::string::npos ? 0 : account_pos);
+  summary.steam_id = summary.owner_steam_id.empty() ? summary.player_id : summary.owner_steam_id;
+
+  size_t common_pos = json.find("\"commonSaveData\"");
+  summary.version = ExtractJsonString(json, "version", common_pos == std::string::npos ? 0 : common_pos);
+  summary.current_stage_key = ExtractJsonInt(json, "currentStageKey", common_pos == std::string::npos ? 0 : common_pos);
+  summary.current_stage_wave = ExtractJsonInt(json, "currentStageWave", common_pos == std::string::npos ? 0 : common_pos);
+  summary.max_completed_stage = ExtractJsonInt(json, "maxCompletedStage", common_pos == std::string::npos ? 0 : common_pos);
+  summary.arranged_pet_key = ExtractJsonInt(json, "ArrangedPetKey", common_pos == std::string::npos ? 0 : common_pos);
+
+  std::string currencies = ExtractArraySection(json, "currenySaveDatas");
+  size_t gold_pos = currencies.find("\"Key\":100001");
+  if (gold_pos == std::string::npos) gold_pos = currencies.find("\\\"Key\\\":100001");
+  summary.gold = ExtractJsonInt(currencies, "Quantity", gold_pos == std::string::npos ? 0 : gold_pos);
+  summary.pets_json = BuildPetsSummaryJson(ExtractArraySection(json, "PetSaveData"));
+  summary.runes_json = BuildRunesSummaryJson(ExtractArraySection(json, "RuneSaveData"));
+  return !summary.steam_id.empty();
+}
+
+std::wstring ReadSteamIdFromSave() {
+  SaveSummary summary;
+  return ReadSaveSummary(summary) ? Widen(summary.steam_id) : L"";
 }
 
 std::string JsonEscape(const std::string& input) {
@@ -272,10 +414,26 @@ std::string JsonEscape(const std::string& input) {
   return output;
 }
 
-std::string TestPayload(const Config& config) {
-  std::string steam = JsonEscape(Utf8(config.steam_id.empty() ? L"default" : config.steam_id));
-  return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam +
-         "\",\"save\":{\"steamId\":\"" + steam + "\",\"agent\":\"cpp-mvp\"},\"clears\":null,\"history\":null,\"watcher\":{\"agent\":\"cpp-mvp\"}}";
+std::string SavePayload(const Config& config) {
+  SaveSummary summary;
+  bool has_save = ReadSaveSummary(summary);
+  std::string steam_raw = config.steam_id.empty() ? (summary.steam_id.empty() ? "default" : summary.steam_id) : Utf8(config.steam_id);
+  std::string steam = JsonEscape(steam_raw);
+  std::string save = "null";
+  if (has_save) {
+    save = "{\"steamId\":\"" + JsonEscape(summary.steam_id) + "\",\"ownerSteamId\":\"" + JsonEscape(summary.owner_steam_id) +
+           "\",\"playerId\":\"" + JsonEscape(summary.player_id) + "\",\"version\":\"" + JsonEscape(summary.version) +
+           "\",\"currentStageKey\":" + std::to_string(summary.current_stage_key) +
+           ",\"currentStageWave\":" + std::to_string(summary.current_stage_wave) +
+           ",\"maxCompletedStage\":" + std::to_string(summary.max_completed_stage) +
+           ",\"arrangedPetKey\":" + std::to_string(summary.arranged_pet_key) +
+           ",\"gold\":" + std::to_string(summary.gold) +
+           ",\"pets\":" + summary.pets_json +
+           ",\"runes\":" + summary.runes_json +
+           ",\"agent\":\"cpp-save-mvp\"}";
+  }
+  return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
+         ",\"clears\":null,\"history\":null,\"watcher\":{\"agent\":\"cpp-save-mvp\"}}";
 }
 
 bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar_t>& host, std::vector<wchar_t>& path) {
@@ -328,7 +486,7 @@ std::wstring PostIngest(const Config& config) {
     return L"Falha ao criar request.";
   }
 
-  std::string payload = TestPayload(config);
+  std::string payload = SavePayload(config);
   std::wstring headers = L"Content-Type: application/json\r\nAuthorization: Bearer " + config.token + L"\r\n";
 
   BOOL ok = WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
@@ -420,7 +578,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_steam = AddEdit(hwnd, IDC_STEAM, config.steam_id, 144, 172, 430, 28, font);
 
       AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 220, 100, 34, font);
-      AddButton(hwnd, IDC_TEST, L"Testar sync", 256, 220, 120, 34, font);
+      AddButton(hwnd, IDC_TEST, L"Sync save", 256, 220, 120, 34, font);
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 220, 100, 34, font);
       AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 220, 86, 34, font);
 
@@ -452,7 +610,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       } else if (id == IDC_TEST) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
-        SetStatus(L"Enviando teste...");
+        SetStatus(L"Lendo save e enviando sync...");
         std::wstring result = PostIngest(config);
         SetStatus(result);
       } else if (id == IDC_READ_SAVE) {

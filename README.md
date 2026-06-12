@@ -26,11 +26,11 @@ MVP atual:
 
 - GUI nativa Win32.
 - Salva URL do servidor, token e SteamID.
-- Faz POST de teste para `/api/ingest`.
+- Le o save ES3 padrao e extrai SteamID, gold, stage atual/max, pet ativo, pets e runas.
+- Faz POST parcial para `/api/ingest` com o resumo real do save.
 - Abre a UI web do SteamID configurado.
 
 Proximas etapas:
 
-- Ler SteamID diretamente do save.
-- Portar decrypt do save.
 - Portar watcher de memoria/logs.
+- Expandir o resumo do save para herois/equipamentos quando substituirmos o worker Python.
