@@ -22,15 +22,12 @@ O app salva configuracao em:
 %LOCALAPPDATA%\TBH Companion\config.ini
 ```
 
-MVP atual:
+Atual:
 
 - GUI nativa Win32.
 - Salva URL do servidor, token e SteamID.
-- Le o save ES3 padrao e extrai SteamID, gold, stage atual/max, pet ativo, pets e runas.
-- Faz POST parcial para `/api/ingest` com o resumo real do save.
+- Le o save ES3 padrao e monta o mesmo resumo gerado pelo worker Python.
+- Monitora o save por timestamp e so relê quando o arquivo muda.
+- Monitora logs da memoria do `TaskBarHero.exe`, mantendo cache das regioes candidatas para reduzir custo.
+- Faz POST para `/api/ingest` apenas quando o payload muda.
 - Abre a UI web do SteamID configurado.
-
-Proximas etapas:
-
-- Portar watcher de memoria/logs.
-- Expandir o resumo do save para herois/equipamentos quando substituirmos o worker Python.

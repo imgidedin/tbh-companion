@@ -34,6 +34,7 @@ constexpr int IDC_TEST = 1005;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_READ_SAVE = 1008;
+constexpr UINT WM_APP_STATUS = WM_APP + 1;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
@@ -43,6 +44,9 @@ HWND g_server = nullptr;
 HWND g_token = nullptr;
 HWND g_steam = nullptr;
 HWND g_status = nullptr;
+HWND g_main_window = nullptr;
+HANDLE g_worker_stop = nullptr;
+HANDLE g_worker_thread = nullptr;
 
 struct Config {
   std::wstring server = L"https://tbh.gided.in";
@@ -87,6 +91,23 @@ struct MemorySnapshot {
   std::string watcher_json = "null";
 };
 
+struct MemoryRegion {
+  unsigned char* base = nullptr;
+  SIZE_T size = 0;
+};
+
+struct WorkerState {
+  SaveSummary save;
+  bool has_save = false;
+  FILETIME save_mtime{};
+  MemorySnapshot memory;
+  std::vector<MemoryRegion> memory_regions;
+  DWORD memory_pid = 0;
+  DWORD last_memory_scan = 0;
+  DWORD last_region_discovery = 0;
+  std::string last_payload_hash;
+};
+
 std::wstring Trim(std::wstring value) {
   while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
   while (!value.empty() && iswspace(value.back())) value.pop_back();
@@ -102,6 +123,34 @@ std::wstring GetWindowTextString(HWND hwnd) {
 
 void SetStatus(const std::wstring& text) {
   SetWindowTextW(g_status, text.c_str());
+}
+
+void PostStatus(const std::wstring& text) {
+  if (!g_main_window) return;
+  auto* copy = new std::wstring(text);
+  PostMessageW(g_main_window, WM_APP_STATUS, 0, reinterpret_cast<LPARAM>(copy));
+}
+
+bool SameFileTime(const FILETIME& a, const FILETIME& b) {
+  return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime;
+}
+
+bool FileMTime(const std::wstring& path, FILETIME& out) {
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+  out = data.ftLastWriteTime;
+  return true;
+}
+
+std::string Fnv1aHash(const std::string& text) {
+  unsigned long long hash = 1469598103934665603ULL;
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  char buffer[32]{};
+  sprintf_s(buffer, "%016llx", hash);
+  return buffer;
 }
 
 std::wstring ConfigPath() {
@@ -679,7 +728,11 @@ std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
   return output;
 }
 
-std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process, SIZE_T max_region = 64ULL * 1024ULL * 1024ULL, size_t context = 4096) {
+std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
+                                          std::vector<MemoryRegion>* cached_regions = nullptr,
+                                          bool discover_regions = true,
+                                          SIZE_T max_region = 64ULL * 1024ULL * 1024ULL,
+                                          size_t context = 4096) {
   static const std::vector<std::vector<unsigned char>> needles = {
       Utf16Needle(L"concluído"),
       Utf16Needle(L"concluido"),
@@ -690,21 +743,38 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process, SIZE_T max_region = 64
   };
 
   std::vector<MemoryEvent> events;
+  auto scan_region = [&](unsigned char* base, SIZE_T size, bool remember) {
+    if (!base || size == 0 || size > max_region) return;
+    std::vector<unsigned char> data = ReadProcessBytes(process, base, size);
+    if (data.empty() || !ContainsAny(data, needles)) return;
+    if (remember && cached_regions) cached_regions->push_back({base, size});
+    for (size_t index : FindNeedleIndexes(data, needles)) {
+      size_t left = index > context ? index - context : 0;
+      size_t right = (std::min)(data.size(), index + context);
+      std::wstring text = NormalizeMemoryText(DecodeUtf16Le(data.data() + left, right - left));
+      AppendRegexEvents(events, text);
+    }
+  };
+
+  if (cached_regions && !cached_regions->empty() && !discover_regions) {
+    std::vector<MemoryRegion> still_valid;
+    for (const auto& region : *cached_regions) {
+      size_t before = events.size();
+      scan_region(region.base, region.size, false);
+      if (events.size() != before) still_valid.push_back(region);
+    }
+    if (!still_valid.empty()) *cached_regions = std::move(still_valid);
+    return UniqueEvents(events);
+  }
+
+  if (cached_regions && discover_regions) cached_regions->clear();
   unsigned char* address = nullptr;
   MEMORY_BASIC_INFORMATION info{};
   while (VirtualQueryEx(process, address, &info, sizeof(info)) == sizeof(info)) {
     unsigned char* base = static_cast<unsigned char*>(info.BaseAddress);
     SIZE_T size = info.RegionSize;
     if (IsReadableRegion(info) && size > 0 && size <= max_region) {
-      std::vector<unsigned char> data = ReadProcessBytes(process, base, size);
-      if (!data.empty() && ContainsAny(data, needles)) {
-        for (size_t index : FindNeedleIndexes(data, needles)) {
-          size_t left = index > context ? index - context : 0;
-          size_t right = (std::min)(data.size(), index + context);
-          std::wstring text = NormalizeMemoryText(DecodeUtf16Le(data.data() + left, right - left));
-          AppendRegexEvents(events, text);
-        }
-      }
+      scan_region(base, size, true);
     }
     unsigned char* next = base + size;
     if (next <= address) break;
@@ -930,7 +1000,9 @@ JsonValue BuildClearsJson(const std::vector<MemoryEvent>& events, const std::str
   return out;
 }
 
-MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL") {
+MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL",
+                                  std::vector<MemoryRegion>* cached_regions = nullptr,
+                                  bool discover_regions = true) {
   MemorySnapshot snapshot;
   snapshot.pid = FindProcessIdByName(L"TaskBarHero.exe");
   JsonValue watcher = JsonValue::Object();
@@ -947,9 +1019,11 @@ MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL") {
     snapshot.watcher_json = JsonSerialize(watcher);
     return snapshot;
   }
-  snapshot.events = ScanMemoryEvents(process);
+  snapshot.events = ScanMemoryEvents(process, cached_regions, discover_regions);
   CloseHandle(process);
-  ObjectSet(watcher, "message", JsonValue::String("memory snapshot pid=" + std::to_string(snapshot.pid) + "; events=" + std::to_string(snapshot.events.size())));
+  ObjectSet(watcher, "message", JsonValue::String("memory snapshot pid=" + std::to_string(snapshot.pid) + "; events=" +
+                                                  std::to_string(snapshot.events.size()) + "; regions=" +
+                                                  std::to_string(cached_regions ? cached_regions->size() : 0)));
   snapshot.watcher_json = JsonSerialize(watcher);
   snapshot.history_json = JsonSerialize(BuildHistoryJson(snapshot.events, difficulty));
   snapshot.clears_json = JsonSerialize(BuildClearsJson(snapshot.events, difficulty));
@@ -1646,6 +1720,18 @@ std::string SavePayload(const Config& config) {
          ",\"watcher\":" + memory.watcher_json + "}";
 }
 
+std::string CachedPayload(const Config& config, const WorkerState& state) {
+  std::string steam_raw = Utf8(config.steam_id);
+  if (steam_raw.empty() && !state.save.steam_id.empty()) steam_raw = state.save.steam_id;
+  if (steam_raw.empty()) steam_raw = "default";
+  std::string steam = JsonEscape(steam_raw);
+  std::string save = state.has_save ? state.save.summary_json : "null";
+  return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
+         ",\"clears\":" + state.memory.clears_json +
+         ",\"history\":" + state.memory.history_json +
+         ",\"watcher\":" + state.memory.watcher_json + "}";
+}
+
 bool CompareField(const std::string& name, const std::string& cpp_value, const std::string& py_value, std::wstring& error) {
   if (cpp_value == py_value) return true;
   error = L"Divergência em " + Widen(name) + L": C++='" + Widen(cpp_value) + L"' Python='" + Widen(py_value) + L"'";
@@ -1700,16 +1786,9 @@ bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar
   return WinHttpCrackUrl(url.c_str(), 0, 0, &parts) == TRUE;
 }
 
-std::wstring PostIngest(const Config& config) {
+std::wstring PostJsonPayload(const Config& config, const std::string& payload) {
   if (config.server.empty()) return L"Configure a URL do servidor.";
   if (config.token.empty()) return L"Configure o token de ingest.";
-
-  SaveSummary summary;
-  if (!ReadSaveSummary(summary)) return L"Não foi possível ler o save C++.";
-  std::wstring compare_error;
-  if (!CompareWithPythonSummary(summary, compare_error)) {
-    return L"Sync bloqueado. " + compare_error;
-  }
 
   std::wstring endpoint = config.server;
   while (!endpoint.empty() && endpoint.back() == L'/') endpoint.pop_back();
@@ -1743,11 +1822,10 @@ std::wstring PostIngest(const Config& config) {
     return L"Falha ao criar request.";
   }
 
-  std::string payload = SavePayload(config);
   std::wstring headers = L"Content-Type: application/json\r\nAuthorization: Bearer " + config.token + L"\r\n";
 
   BOOL ok = WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
-                               payload.data(), static_cast<DWORD>(payload.size()),
+                               const_cast<char*>(payload.data()), static_cast<DWORD>(payload.size()),
                                static_cast<DWORD>(payload.size()), 0);
   if (ok) ok = WinHttpReceiveResponse(request, nullptr);
 
@@ -1774,6 +1852,114 @@ std::wstring PostIngest(const Config& config) {
 
   if (!ok) return L"POST falhou.";
   return L"HTTP " + std::to_wstring(status) + L" " + Widen(body);
+}
+
+std::wstring PostIngest(const Config& config) {
+  SaveSummary summary;
+  if (!ReadSaveSummary(summary)) return L"Não foi possível ler o save C++.";
+  std::wstring compare_error;
+  if (!CompareWithPythonSummary(summary, compare_error)) {
+    return L"Sync bloqueado. " + compare_error;
+  }
+  return PostJsonPayload(config, SavePayload(config));
+}
+
+bool RefreshSaveCache(WorkerState& state) {
+  FILETIME mtime{};
+  std::wstring path = DefaultSavePath();
+  if (!FileMTime(path, mtime)) return false;
+  if (state.has_save && SameFileTime(state.save_mtime, mtime)) return false;
+  SaveSummary summary;
+  if (!ReadSaveSummary(summary)) return false;
+  state.save = std::move(summary);
+  state.save_mtime = mtime;
+  state.has_save = true;
+  return true;
+}
+
+bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
+  DWORD now = GetTickCount();
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  bool process_changed = pid != state.memory_pid;
+  bool rediscover = force_discover || process_changed || state.memory_regions.empty() || now - state.last_region_discovery > 120000;
+  bool due = force_discover || rediscover || now - state.last_memory_scan > 5000;
+  if (!due) return false;
+
+  if (process_changed) {
+    state.memory_regions.clear();
+    state.memory_pid = pid;
+  }
+
+  state.memory = ReadMemorySnapshot("NORMAL", &state.memory_regions, rediscover);
+  state.last_memory_scan = now;
+  if (rediscover) state.last_region_discovery = now;
+  return true;
+}
+
+DWORD WINAPI WorkerProc(LPVOID) {
+  WorkerState state;
+  PostStatus(L"Worker iniciado. Monitorando save e memoria.");
+  RefreshSaveCache(state);
+  RefreshMemoryCache(state, true);
+
+  while (WaitForSingleObject(g_worker_stop, 1000) == WAIT_TIMEOUT) {
+    Config config = LoadConfig();
+    bool changed = false;
+    changed = RefreshSaveCache(state) || changed;
+    changed = RefreshMemoryCache(state) || changed;
+
+    if (!state.has_save) {
+      PostStatus(L"Aguardando save valido.");
+      continue;
+    }
+    if (config.steam_id.empty() && !state.save.steam_id.empty()) {
+      config.steam_id = Widen(state.save.steam_id);
+      SaveConfig(config);
+    }
+
+    std::string payload = CachedPayload(config, state);
+    std::string hash = Fnv1aHash(payload);
+    if (!changed && hash == state.last_payload_hash) continue;
+    if (hash == state.last_payload_hash) continue;
+
+    if (config.server.empty() || config.token.empty()) {
+      state.last_payload_hash = hash;
+      PostStatus(L"Dados atualizados localmente. Configure servidor/token para sync.");
+      continue;
+    }
+
+    std::wstring result = PostJsonPayload(config, payload);
+    if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
+      state.last_payload_hash = hash;
+      PostStatus(L"Sync OK. Save + memoria enviados.");
+    } else {
+      PostStatus(L"Sync falhou: " + result);
+    }
+  }
+  PostStatus(L"Worker parado.");
+  return 0;
+}
+
+void StartWorker() {
+  if (g_worker_thread) return;
+  g_worker_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_worker_stop) return;
+  g_worker_thread = CreateThread(nullptr, 0, WorkerProc, nullptr, 0, nullptr);
+}
+
+void StopWorker() {
+  if (g_worker_stop) SetEvent(g_worker_stop);
+  if (g_worker_thread) {
+    DWORD wait = WaitForSingleObject(g_worker_thread, 5000);
+    if (wait == WAIT_OBJECT_0) {
+      CloseHandle(g_worker_thread);
+      g_worker_thread = nullptr;
+    }
+  }
+  if (!g_worker_thread && g_worker_stop) {
+    CloseHandle(g_worker_stop);
+    g_worker_stop = nullptr;
+  }
 }
 
 HFONT CreateUiFont(int size, int weight = FW_NORMAL) {
@@ -1818,6 +2004,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
 
   switch (message) {
     case WM_CREATE: {
+      g_main_window = hwnd;
       font = CreateUiFont(18);
       title_font = CreateUiFont(26, FW_BOLD);
       Config config = LoadConfig();
@@ -1852,6 +2039,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
           SetStatus(L"SteamID lido automaticamente do save: " + steam_id);
         }
       }
+      StartWorker();
       return 0;
     }
     case WM_COMMAND: {
@@ -1884,6 +2072,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       }
       return 0;
     }
+    case WM_APP_STATUS: {
+      auto* text = reinterpret_cast<std::wstring*>(lparam);
+      if (text) {
+        SetStatus(*text);
+        delete text;
+      }
+      return 0;
+    }
     case WM_CTLCOLORSTATIC: {
       HDC dc = reinterpret_cast<HDC>(wparam);
       SetTextColor(dc, RGB(225, 232, 228));
@@ -1891,8 +2087,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
     }
     case WM_DESTROY:
+      StopWorker();
       if (font) DeleteObject(font);
       if (title_font) DeleteObject(title_font);
+      g_main_window = nullptr;
       PostQuitMessage(0);
       return 0;
   }
