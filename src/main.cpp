@@ -143,31 +143,32 @@ bool ReadAllBytes(const std::wstring& path, std::vector<unsigned char>& bytes) {
   return true;
 }
 
-bool Sha1(const std::string& input, unsigned char hash[20]) {
+bool Es3AesKey(const std::string& password, const std::vector<unsigned char>& salt, std::vector<unsigned char>& key) {
+  key.assign(16, 0);
   BCRYPT_ALG_HANDLE alg = nullptr;
-  BCRYPT_HASH_HANDLE h = nullptr;
-  DWORD result = 0;
-  NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
-  if (status < 0) return false;
-  status = BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0);
-  if (status >= 0) status = BCryptHashData(h, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())), static_cast<ULONG>(input.size()), 0);
-  if (status >= 0) status = BCryptFinishHash(h, hash, 20, 0);
-  if (h) BCryptDestroyHash(h);
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+  if (status >= 0) {
+    status = BCryptDeriveKeyPBKDF2(
+        alg,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(password.data())),
+        static_cast<ULONG>(password.size()),
+        const_cast<PUCHAR>(salt.data()),
+        static_cast<ULONG>(salt.size()),
+        100,
+        key.data(),
+        static_cast<ULONG>(key.size()),
+        0);
+  }
   if (alg) BCryptCloseAlgorithmProvider(alg, 0);
   return status >= 0;
-}
-
-std::vector<unsigned char> Es3AesKey(const std::string& password) {
-  unsigned char hash[20]{};
-  Sha1(password, hash);
-  return std::vector<unsigned char>(hash, hash + 16);
 }
 
 bool DecryptEs3AesCbc(const std::vector<unsigned char>& file_bytes, const std::string& password, std::string& plaintext) {
   if (file_bytes.size() <= 16) return false;
   std::vector<unsigned char> iv(file_bytes.begin(), file_bytes.begin() + 16);
   std::vector<unsigned char> cipher(file_bytes.begin() + 16, file_bytes.end());
-  std::vector<unsigned char> key = Es3AesKey(password);
+  std::vector<unsigned char> key;
+  if (!Es3AesKey(password, iv, key)) return false;
 
   BCRYPT_ALG_HANDLE alg = nullptr;
   BCRYPT_KEY_HANDLE key_handle = nullptr;
@@ -231,6 +232,15 @@ std::string ExtractJsonString(const std::string& json, const std::string& key, s
   return {};
 }
 
+std::string LeadingDigits(const std::string& value) {
+  std::string digits;
+  for (char c : value) {
+    if (c < '0' || c > '9') break;
+    digits.push_back(c);
+  }
+  return digits;
+}
+
 std::wstring ReadSteamIdFromSave() {
   std::vector<unsigned char> bytes;
   std::wstring path = DefaultSavePath();
@@ -241,6 +251,7 @@ std::wstring ReadSteamIdFromSave() {
 
   size_t account_pos = json.find("\"AccountSaveData\"");
   std::string steam = ExtractJsonString(json, "ownerSteamId", account_pos == std::string::npos ? 0 : account_pos);
+  steam = LeadingDigits(steam);
   if (steam.empty()) steam = ExtractJsonString(json, "playerId", account_pos == std::string::npos ? 0 : account_pos);
   return Widen(steam);
 }
