@@ -5,6 +5,11 @@
 #include <winhttp.h>
 #include <bcrypt.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -52,6 +57,7 @@ struct SaveSummary {
   long long gold = 0;
   std::string pets_json = "[]";
   std::string runes_json = "[]";
+  std::string summary_json;
 };
 
 std::wstring Trim(std::wstring value) {
@@ -126,6 +132,321 @@ std::wstring Widen(const std::string& text) {
   std::wstring out(size > 0 ? size - 1 : 0, L'\0');
   if (size > 1) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), size);
   return out;
+}
+
+struct JsonValue {
+  enum class Type { Null, Bool, Number, String, Array, Object };
+  Type type = Type::Null;
+  bool boolean = false;
+  std::string number;
+  std::string string;
+  std::vector<JsonValue> array;
+  std::vector<std::pair<std::string, JsonValue>> object;
+
+  static JsonValue Null() { return {}; }
+  static JsonValue Bool(bool value) {
+    JsonValue out;
+    out.type = Type::Bool;
+    out.boolean = value;
+    return out;
+  }
+  static JsonValue Number(std::string value) {
+    JsonValue out;
+    out.type = Type::Number;
+    out.number = value.empty() ? "0" : std::move(value);
+    return out;
+  }
+  static JsonValue Number(long long value) { return Number(std::to_string(value)); }
+  static JsonValue Number(double value) {
+    if (std::fabs(value - std::round(value)) < 0.000000001) return Number(static_cast<long long>(std::llround(value)));
+    std::ostringstream stream;
+    stream.precision(15);
+    stream << value;
+    return Number(stream.str());
+  }
+  static JsonValue String(std::string value) {
+    JsonValue out;
+    out.type = Type::String;
+    out.string = std::move(value);
+    return out;
+  }
+  static JsonValue Array() {
+    JsonValue out;
+    out.type = Type::Array;
+    return out;
+  }
+  static JsonValue Object() {
+    JsonValue out;
+    out.type = Type::Object;
+    return out;
+  }
+};
+
+void ObjectSet(JsonValue& object, const std::string& key, JsonValue value) {
+  object.object.push_back({key, std::move(value)});
+}
+
+const JsonValue* ObjectGet(const JsonValue& object, const std::string& key) {
+  if (object.type != JsonValue::Type::Object) return nullptr;
+  for (const auto& item : object.object) {
+    if (item.first == key) return &item.second;
+  }
+  return nullptr;
+}
+
+JsonValue* ObjectGet(JsonValue& object, const std::string& key) {
+  if (object.type != JsonValue::Type::Object) return nullptr;
+  for (auto& item : object.object) {
+    if (item.first == key) return &item.second;
+  }
+  return nullptr;
+}
+
+bool JsonBool(const JsonValue* value, bool fallback = false) {
+  if (!value) return fallback;
+  if (value->type == JsonValue::Type::Bool) return value->boolean;
+  if (value->type == JsonValue::Type::Number) return value->number != "0";
+  return fallback;
+}
+
+std::string JsonStringValue(const JsonValue* value) {
+  if (!value) return {};
+  if (value->type == JsonValue::Type::String) return value->string;
+  if (value->type == JsonValue::Type::Number) return value->number;
+  return {};
+}
+
+std::string JsonNumberKey(const JsonValue* value) {
+  std::string text = JsonStringValue(value);
+  size_t dot = text.find('.');
+  if (dot != std::string::npos) text.resize(dot);
+  return text;
+}
+
+double JsonNumberDouble(const JsonValue* value, double fallback = 0) {
+  if (!value || value->type != JsonValue::Type::Number) return fallback;
+  try {
+    return std::stod(value->number);
+  } catch (...) {
+    return fallback;
+  }
+}
+
+bool IsZeroNumber(const JsonValue* value) {
+  return value && value->type == JsonValue::Type::Number && JsonNumberDouble(value) == 0;
+}
+
+class JsonParser {
+ public:
+  explicit JsonParser(const std::string& text) : text_(text) {}
+
+  bool Parse(JsonValue& out) {
+    pos_ = 0;
+    if (!ParseValue(out)) return false;
+    SkipWs();
+    return pos_ == text_.size();
+  }
+
+ private:
+  void SkipWs() {
+    while (pos_ < text_.size() && isspace(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+  }
+
+  bool Consume(char expected) {
+    SkipWs();
+    if (pos_ >= text_.size() || text_[pos_] != expected) return false;
+    ++pos_;
+    return true;
+  }
+
+  bool ParseValue(JsonValue& out) {
+    SkipWs();
+    if (pos_ >= text_.size()) return false;
+    char c = text_[pos_];
+    if (c == '{') return ParseObject(out);
+    if (c == '[') return ParseArray(out);
+    if (c == '"') {
+      std::string value;
+      if (!ParseString(value)) return false;
+      out = JsonValue::String(value);
+      return true;
+    }
+    if (c == 't' && Match("true")) {
+      out = JsonValue::Bool(true);
+      return true;
+    }
+    if (c == 'f' && Match("false")) {
+      out = JsonValue::Bool(false);
+      return true;
+    }
+    if (c == 'n' && Match("null")) {
+      out = JsonValue::Null();
+      return true;
+    }
+    return ParseNumber(out);
+  }
+
+  bool Match(const char* literal) {
+    size_t length = strlen(literal);
+    if (text_.compare(pos_, length, literal) != 0) return false;
+    pos_ += length;
+    return true;
+  }
+
+  bool ParseString(std::string& out) {
+    if (!Consume('"')) return false;
+    out.clear();
+    while (pos_ < text_.size()) {
+      char c = text_[pos_++];
+      if (c == '"') return true;
+      if (c != '\\') {
+        out.push_back(c);
+        continue;
+      }
+      if (pos_ >= text_.size()) return false;
+      char escaped = text_[pos_++];
+      switch (escaped) {
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '/': out.push_back('/'); break;
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        case 'u': {
+          if (pos_ + 4 > text_.size()) return false;
+          unsigned int code = 0;
+          for (int i = 0; i < 4; ++i) {
+            char h = text_[pos_++];
+            code <<= 4;
+            if (h >= '0' && h <= '9') code += h - '0';
+            else if (h >= 'a' && h <= 'f') code += h - 'a' + 10;
+            else if (h >= 'A' && h <= 'F') code += h - 'A' + 10;
+            else return false;
+          }
+          if (code <= 0x7F) {
+            out.push_back(static_cast<char>(code));
+          } else if (code <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | (code >> 6)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+          } else {
+            out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+          }
+          break;
+        }
+        default: return false;
+      }
+    }
+    return false;
+  }
+
+  bool ParseNumber(JsonValue& out) {
+    SkipWs();
+    size_t start = pos_;
+    if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
+    while (pos_ < text_.size() && isdigit(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+    if (pos_ < text_.size() && text_[pos_] == '.') {
+      ++pos_;
+      while (pos_ < text_.size() && isdigit(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+    }
+    if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+      while (pos_ < text_.size() && isdigit(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+    }
+    if (start == pos_) return false;
+    out = JsonValue::Number(text_.substr(start, pos_ - start));
+    return true;
+  }
+
+  bool ParseArray(JsonValue& out) {
+    if (!Consume('[')) return false;
+    out = JsonValue::Array();
+    SkipWs();
+    if (pos_ < text_.size() && text_[pos_] == ']') {
+      ++pos_;
+      return true;
+    }
+    while (true) {
+      JsonValue value;
+      if (!ParseValue(value)) return false;
+      out.array.push_back(std::move(value));
+      SkipWs();
+      if (pos_ < text_.size() && text_[pos_] == ']') {
+        ++pos_;
+        return true;
+      }
+      if (!Consume(',')) return false;
+    }
+  }
+
+  bool ParseObject(JsonValue& out) {
+    if (!Consume('{')) return false;
+    out = JsonValue::Object();
+    SkipWs();
+    if (pos_ < text_.size() && text_[pos_] == '}') {
+      ++pos_;
+      return true;
+    }
+    while (true) {
+      std::string key;
+      if (!ParseString(key)) return false;
+      if (!Consume(':')) return false;
+      JsonValue value;
+      if (!ParseValue(value)) return false;
+      out.object.push_back({std::move(key), std::move(value)});
+      SkipWs();
+      if (pos_ < text_.size() && text_[pos_] == '}') {
+        ++pos_;
+        return true;
+      }
+      if (!Consume(',')) return false;
+    }
+  }
+
+  const std::string& text_;
+  size_t pos_ = 0;
+};
+
+std::string JsonEscape(const std::string& input);
+
+std::string JsonSerialize(const JsonValue& value) {
+  switch (value.type) {
+    case JsonValue::Type::Null:
+      return "null";
+    case JsonValue::Type::Bool:
+      return value.boolean ? "true" : "false";
+    case JsonValue::Type::Number:
+      return value.number.empty() ? "0" : value.number;
+    case JsonValue::Type::String:
+      return "\"" + JsonEscape(value.string) + "\"";
+    case JsonValue::Type::Array: {
+      std::string out = "[";
+      for (size_t i = 0; i < value.array.size(); ++i) {
+        if (i) out += ",";
+        out += JsonSerialize(value.array[i]);
+      }
+      out += "]";
+      return out;
+    }
+    case JsonValue::Type::Object: {
+      std::string out = "{";
+      for (size_t i = 0; i < value.object.size(); ++i) {
+        if (i) out += ",";
+        out += "\"" + JsonEscape(value.object[i].first) + "\":" + JsonSerialize(value.object[i].second);
+      }
+      out += "}";
+      return out;
+    }
+  }
+  return "null";
+}
+
+bool ParseJson(const std::string& text, JsonValue& out) {
+  return JsonParser(text).Parse(out);
 }
 
 std::string NarrowAscii(const std::wstring& text) {
@@ -210,6 +531,24 @@ std::wstring PythonSummaryPath() {
   DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
   std::wstring user = length ? std::wstring(profile, length) : L"";
   return user + L"\\OneDrive\\Documentos\\Outros\\tbh-farm-local\\runtime\\save-summary.json";
+}
+
+std::wstring ItemsJsonPath() {
+  std::wstring build_dir = ParentDir(ExePath());
+  std::wstring agent_dir = ParentDir(build_dir);
+  std::wstring candidate = agent_dir + L"\\runtime\\items.json";
+  DWORD attrs = GetFileAttributesW(candidate.c_str());
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return candidate;
+
+  std::wstring outros_dir = ParentDir(agent_dir);
+  std::wstring sibling = outros_dir + L"\\tbh-farm-local\\runtime\\items.json";
+  attrs = GetFileAttributesW(sibling.c_str());
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return sibling;
+
+  wchar_t profile[MAX_PATH]{};
+  DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+  std::wstring user = length ? std::wstring(profile, length) : L"";
+  return user + L"\\OneDrive\\Documentos\\Outros\\tbh-farm-local\\runtime\\items.json";
 }
 
 bool Es3AesKey(const std::string& password, const std::vector<unsigned char>& salt, std::vector<unsigned char>& key) {
@@ -442,6 +781,286 @@ std::string BuildRunesSummaryJson(const std::string& runes_section) {
   return output;
 }
 
+const JsonValue* FindByNumberKey(const JsonValue* array, const std::string& field, const std::string& wanted) {
+  if (!array || array->type != JsonValue::Type::Array) return nullptr;
+  for (const auto& item : array->array) {
+    if (JsonNumberKey(ObjectGet(item, field)) == wanted) return &item;
+  }
+  return nullptr;
+}
+
+std::map<std::string, const JsonValue*> IndexArrayByNumberKey(const JsonValue* array, const std::string& field) {
+  std::map<std::string, const JsonValue*> index;
+  if (!array || array->type != JsonValue::Type::Array) return index;
+  for (const auto& item : array->array) {
+    std::string key = JsonNumberKey(ObjectGet(item, field));
+    if (!key.empty()) index[key] = &item;
+  }
+  return index;
+}
+
+JsonValue CopyOrNull(const JsonValue* value) {
+  return value ? *value : JsonValue::Null();
+}
+
+JsonValue CopyOrEmptyArray(const JsonValue* value) {
+  if (value && value->type == JsonValue::Type::Array) return *value;
+  return JsonValue::Array();
+}
+
+JsonValue BuildStatSummary(const JsonValue& stat, const std::string& section) {
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "stat", CopyOrNull(ObjectGet(stat, "stat")));
+  ObjectSet(out, "mod", CopyOrNull(ObjectGet(stat, "mod")));
+  ObjectSet(out, "value", CopyOrNull(ObjectGet(stat, "value")));
+  ObjectSet(out, "display", CopyOrNull(ObjectGet(stat, "disp")));
+  ObjectSet(out, "section", JsonValue::String(section));
+  return out;
+}
+
+std::string BonusType(const JsonValue& stat) {
+  std::string name = JsonStringValue(ObjectGet(stat, "stat"));
+  if (name == "IncreaseExpAmount") return "exp";
+  if (name == "IncreaseGoldAmount") return "gold";
+  return {};
+}
+
+JsonValue BuildBonusStatSummary(const JsonValue& stat, const std::string& section, const std::string& type, double percent) {
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "type", JsonValue::String(type));
+  ObjectSet(out, "stat", CopyOrNull(ObjectGet(stat, "stat")));
+  ObjectSet(out, "percent", JsonValue::Number(percent));
+  ObjectSet(out, "display", CopyOrNull(ObjectGet(stat, "disp")));
+  ObjectSet(out, "section", JsonValue::String(section));
+  return out;
+}
+
+JsonValue BuildBonusSource(const JsonValue& hero, const JsonValue* item, const JsonValue* item_key, const std::string& type, double percent, const JsonValue& stat) {
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "heroKey", CopyOrNull(ObjectGet(hero, "heroKey")));
+  ObjectSet(out, "itemKey", CopyOrNull(item_key));
+  ObjectSet(out, "name", item ? CopyOrNull(ObjectGet(*item, "name")) : JsonValue::Null());
+  ObjectSet(out, "type", JsonValue::String(type));
+  ObjectSet(out, "percent", JsonValue::Number(percent));
+  ObjectSet(out, "display", CopyOrNull(ObjectGet(stat, "disp")));
+  return out;
+}
+
+JsonValue BuildEquippedItems(const JsonValue& hero,
+                             const std::map<std::string, const JsonValue*>& item_by_uid,
+                             const std::map<std::string, const JsonValue*>& items_by_key,
+                             double& exp_bonus,
+                             double& gold_bonus,
+                             JsonValue& bonus_sources) {
+  JsonValue equipped = JsonValue::Array();
+  const JsonValue* equipped_ids = ObjectGet(hero, "equippedItemIds");
+  if (!equipped_ids || equipped_ids->type != JsonValue::Type::Array) return equipped;
+
+  for (const auto& unique_id : equipped_ids->array) {
+    if (IsZeroNumber(&unique_id)) continue;
+    auto saved_it = item_by_uid.find(JsonNumberKey(&unique_id));
+    if (saved_it == item_by_uid.end()) continue;
+    const JsonValue* saved_item = saved_it->second;
+    const JsonValue* item_key = ObjectGet(*saved_item, "ItemKey");
+    auto item_it = items_by_key.find(JsonNumberKey(item_key));
+    if (item_it == items_by_key.end()) continue;
+    const JsonValue* item = item_it->second;
+
+    JsonValue all_stats = JsonValue::Array();
+    JsonValue bonus_stats = JsonValue::Array();
+    const JsonValue* stats = ObjectGet(*item, "stats");
+    for (const std::string section_name : {"base", "inherent"}) {
+      const JsonValue* section = stats ? ObjectGet(*stats, section_name) : nullptr;
+      if (!section || section->type != JsonValue::Type::Array) continue;
+      for (const auto& stat : section->array) {
+        all_stats.array.push_back(BuildStatSummary(stat, section_name));
+        std::string type = BonusType(stat);
+        double value = JsonNumberDouble(ObjectGet(stat, "value"));
+        double percent = value / 10.0;
+        if (!type.empty() && std::fabs(percent) > 0.000000001) {
+          bonus_stats.array.push_back(BuildBonusStatSummary(stat, section_name, type, percent));
+          if (type == "exp") exp_bonus += percent;
+          if (type == "gold") gold_bonus += percent;
+          bonus_sources.array.push_back(BuildBonusSource(hero, item, item_key, type, percent, stat));
+        }
+      }
+    }
+
+    JsonValue out = JsonValue::Object();
+    ObjectSet(out, "uniqueId", unique_id);
+    ObjectSet(out, "itemKey", CopyOrNull(item_key));
+    ObjectSet(out, "name", CopyOrNull(ObjectGet(*item, "name")));
+    ObjectSet(out, "grade", CopyOrNull(ObjectGet(*item, "grade")));
+    ObjectSet(out, "part", CopyOrNull(ObjectGet(*item, "parts")));
+    ObjectSet(out, "icon", CopyOrNull(ObjectGet(*item, "icon")));
+    ObjectSet(out, "level", CopyOrNull(ObjectGet(*item, "level")));
+    ObjectSet(out, "variant", CopyOrNull(ObjectGet(*item, "variant")));
+    ObjectSet(out, "stats", std::move(all_stats));
+    ObjectSet(out, "bonusStats", std::move(bonus_stats));
+    equipped.array.push_back(std::move(out));
+  }
+  return equipped;
+}
+
+JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
+                           const std::map<std::string, const JsonValue*>& item_by_uid,
+                           const std::map<std::string, const JsonValue*>& items_by_key,
+                           double& exp_bonus,
+                           double& gold_bonus,
+                           JsonValue& bonus_sources) {
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "heroKey", CopyOrNull(ObjectGet(hero, "heroKey")));
+  ObjectSet(out, "level", CopyOrNull(ObjectGet(hero, "HeroLevel")));
+  ObjectSet(out, "exp", CopyOrNull(ObjectGet(hero, "HeroExp")));
+  ObjectSet(out, "abilityPoint", CopyOrNull(ObjectGet(hero, "AbilityPoint")));
+  ObjectSet(out, "allocatedAbilityPoint", CopyOrNull(ObjectGet(hero, "AllocatedHeroAbilityPoint")));
+  ObjectSet(out, "equippedSkillKey", CopyOrEmptyArray(ObjectGet(hero, "equippedSKillKey")));
+  if (include_equipment) {
+    ObjectSet(out, "equippedItemIds", CopyOrEmptyArray(ObjectGet(hero, "equippedItemIds")));
+    ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+  }
+  return out;
+}
+
+bool LoadItemsByKey(std::map<std::string, const JsonValue*>& items_by_key, JsonValue& items_root) {
+  std::string text;
+  if (!ReadTextFile(ItemsJsonPath(), text)) return false;
+  if (!ParseJson(text, items_root) || items_root.type != JsonValue::Type::Array) return false;
+  items_by_key = IndexArrayByNumberKey(&items_root, "key");
+  return true;
+}
+
+bool LoadSaveRoot(const std::string& json, JsonValue& save) {
+  JsonValue outer;
+  if (!ParseJson(json, outer) || outer.type != JsonValue::Type::Object) return false;
+  save = JsonValue::Object();
+  for (const auto& item : outer.object) {
+    const JsonValue* value = ObjectGet(item.second, "value");
+    if (!value) value = &item.second;
+    if (value->type == JsonValue::Type::String && !value->string.empty() && value->string.front() == '{') {
+      JsonValue inner;
+      if (ParseJson(value->string, inner)) {
+        ObjectSet(save, item.first, std::move(inner));
+      } else {
+        ObjectSet(save, item.first, *value);
+      }
+    } else {
+      ObjectSet(save, item.first, *value);
+    }
+  }
+  return true;
+}
+
+JsonValue BuildLevelMap(const JsonValue* array, const std::string& key_field, const std::string& level_field) {
+  JsonValue out = JsonValue::Object();
+  if (!array || array->type != JsonValue::Type::Array) return out;
+  for (const auto& item : array->array) {
+    std::string key = JsonNumberKey(ObjectGet(item, key_field));
+    if (!key.empty()) ObjectSet(out, key, CopyOrNull(ObjectGet(item, level_field)));
+  }
+  return out;
+}
+
+JsonValue BuildPetsSummary(const JsonValue* pets) {
+  JsonValue out = JsonValue::Array();
+  if (!pets || pets->type != JsonValue::Type::Array) return out;
+  for (const auto& pet : pets->array) {
+    JsonValue item = JsonValue::Object();
+    ObjectSet(item, "petKey", CopyOrNull(ObjectGet(pet, "PetKey")));
+    ObjectSet(item, "unlocked", CopyOrNull(ObjectGet(pet, "IsUnlock")));
+    ObjectSet(item, "viewed", CopyOrNull(ObjectGet(pet, "IsViewed")));
+    out.array.push_back(std::move(item));
+  }
+  return out;
+}
+
+JsonValue BuildRunesSummary(const JsonValue* runes) {
+  JsonValue out = JsonValue::Array();
+  if (!runes || runes->type != JsonValue::Type::Array) return out;
+  for (const auto& rune : runes->array) {
+    JsonValue item = JsonValue::Object();
+    ObjectSet(item, "runeKey", CopyOrNull(ObjectGet(rune, "RuneKey")));
+    const JsonValue* level = ObjectGet(rune, "Level");
+    ObjectSet(item, "level", level ? *level : JsonValue::Number(0LL));
+    out.array.push_back(std::move(item));
+  }
+  return out;
+}
+
+JsonValue GoldQuantity(const JsonValue* currencies) {
+  const JsonValue* gold = FindByNumberKey(currencies, "Key", "100001");
+  return CopyOrNull(gold ? ObjectGet(*gold, "Quantity") : nullptr);
+}
+
+JsonValue BuildSaveSummaryJson(const JsonValue& save) {
+  const JsonValue* player = ObjectGet(save, "PlayerSaveData");
+  const JsonValue* account = ObjectGet(save, "AccountSaveData");
+  const JsonValue* common = player ? ObjectGet(*player, "commonSaveData") : nullptr;
+  const JsonValue* heroes = player ? ObjectGet(*player, "heroSaveDatas") : nullptr;
+  const JsonValue* arranged = common ? ObjectGet(*common, "arrangedHeroKey") : nullptr;
+  const JsonValue* pets = player ? ObjectGet(*player, "PetSaveData") : nullptr;
+  const JsonValue* runes = player ? ObjectGet(*player, "RuneSaveData") : nullptr;
+  const JsonValue* attributes = player ? ObjectGet(*player, "attributeSaveDatas") : nullptr;
+  const JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
+
+  JsonValue items_root;
+  std::map<std::string, const JsonValue*> items_by_key;
+  LoadItemsByKey(items_by_key, items_root);
+  auto hero_by_key = IndexArrayByNumberKey(heroes, "heroKey");
+  auto item_by_uid = IndexArrayByNumberKey(item_saves, "UniqueId");
+
+  double exp_bonus = 0;
+  double gold_bonus = 0;
+  JsonValue bonus_sources = JsonValue::Array();
+
+  JsonValue party = JsonValue::Array();
+  if (arranged && arranged->type == JsonValue::Type::Array) {
+    for (const auto& hero_key : arranged->array) {
+      auto it = hero_by_key.find(JsonNumberKey(&hero_key));
+      if (it != hero_by_key.end()) {
+        party.array.push_back(BuildHeroSummary(*it->second, true, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+      }
+    }
+  }
+
+  JsonValue unlocked = JsonValue::Array();
+  if (heroes && heroes->type == JsonValue::Type::Array) {
+    for (const auto& hero : heroes->array) {
+      if (JsonBool(ObjectGet(hero, "IsUnLock"))) {
+        unlocked.array.push_back(BuildHeroSummary(hero, false, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+      }
+    }
+  }
+
+  JsonValue equipment_bonuses = JsonValue::Object();
+  ObjectSet(equipment_bonuses, "exp", JsonValue::Number(exp_bonus));
+  ObjectSet(equipment_bonuses, "gold", JsonValue::Number(gold_bonus));
+  ObjectSet(equipment_bonuses, "sources", std::move(bonus_sources));
+
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "version", CopyOrNull((common && ObjectGet(*common, "version")) ? ObjectGet(*common, "version") : (account ? ObjectGet(*account, "version") : nullptr)));
+  const JsonValue* owner = account ? ObjectGet(*account, "ownerSteamId") : nullptr;
+  const JsonValue* player_id = account ? ObjectGet(*account, "playerId") : nullptr;
+  ObjectSet(out, "steamId", owner && !JsonStringValue(owner).empty() ? *owner : CopyOrNull(player_id));
+  ObjectSet(out, "ownerSteamId", CopyOrNull(owner));
+  ObjectSet(out, "playerId", CopyOrNull(player_id));
+  ObjectSet(out, "currentStageKey", CopyOrNull(common ? ObjectGet(*common, "currentStageKey") : nullptr));
+  ObjectSet(out, "currentStageWave", CopyOrNull(common ? ObjectGet(*common, "currentStageWave") : nullptr));
+  ObjectSet(out, "maxCompletedStage", CopyOrNull(common ? ObjectGet(*common, "maxCompletedStage") : nullptr));
+  ObjectSet(out, "playTime", CopyOrNull(common ? ObjectGet(*common, "playTime") : nullptr));
+  ObjectSet(out, "arrangedHeroKey", CopyOrEmptyArray(arranged));
+  ObjectSet(out, "arrangedPetKey", CopyOrNull(common ? ObjectGet(*common, "ArrangedPetKey") : nullptr));
+  ObjectSet(out, "partyHeroLevels", std::move(party));
+  ObjectSet(out, "unlockedHeroes", std::move(unlocked));
+  ObjectSet(out, "pets", BuildPetsSummary(pets));
+  ObjectSet(out, "attributeLevels", BuildLevelMap(attributes, "Key", "Level"));
+  ObjectSet(out, "runeLevels", BuildLevelMap(runes, "RuneKey", "Level"));
+  ObjectSet(out, "runes", BuildRunesSummary(runes));
+  ObjectSet(out, "equipmentBonuses", std::move(equipment_bonuses));
+  ObjectSet(out, "gold", GoldQuantity(player ? ObjectGet(*player, "currenySaveDatas") : nullptr));
+  return out;
+}
+
 std::string LeadingDigits(const std::string& value) {
   std::string digits;
   for (char c : value) {
@@ -459,24 +1078,27 @@ bool ReadSaveSummary(SaveSummary& summary) {
   std::string json;
   if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return false;
 
-  size_t account_pos = json.find("\"AccountSaveData\"");
-  summary.owner_steam_id = LeadingDigits(ExtractJsonString(json, "ownerSteamId", account_pos == std::string::npos ? 0 : account_pos));
-  summary.player_id = ExtractJsonString(json, "playerId", account_pos == std::string::npos ? 0 : account_pos);
+  JsonValue save;
+  if (!LoadSaveRoot(json, save)) return false;
+  JsonValue full_summary = BuildSaveSummaryJson(save);
+  summary.summary_json = JsonSerialize(full_summary);
+
+  const JsonValue* account = ObjectGet(save, "AccountSaveData");
+  const JsonValue* player = ObjectGet(save, "PlayerSaveData");
+  const JsonValue* common = player ? ObjectGet(*player, "commonSaveData") : nullptr;
+
+  summary.owner_steam_id = LeadingDigits(JsonStringValue(account ? ObjectGet(*account, "ownerSteamId") : nullptr));
+  summary.player_id = JsonStringValue(account ? ObjectGet(*account, "playerId") : nullptr);
   summary.steam_id = summary.owner_steam_id.empty() ? summary.player_id : summary.owner_steam_id;
-
-  size_t common_pos = json.find("\"commonSaveData\"");
-  summary.version = ExtractJsonString(json, "version", common_pos == std::string::npos ? 0 : common_pos);
-  summary.current_stage_key = ExtractJsonInt(json, "currentStageKey", common_pos == std::string::npos ? 0 : common_pos);
-  summary.current_stage_wave = ExtractJsonInt(json, "currentStageWave", common_pos == std::string::npos ? 0 : common_pos);
-  summary.max_completed_stage = ExtractJsonInt(json, "maxCompletedStage", common_pos == std::string::npos ? 0 : common_pos);
-  summary.arranged_pet_key = ExtractJsonInt(json, "ArrangedPetKey", common_pos == std::string::npos ? 0 : common_pos);
-
-  std::string currencies = ExtractArraySection(json, "currenySaveDatas");
-  size_t gold_pos = currencies.find("\"Key\":100001");
-  if (gold_pos == std::string::npos) gold_pos = currencies.find("\\\"Key\\\":100001");
-  summary.gold = ExtractJsonInt(currencies, "Quantity", gold_pos == std::string::npos ? 0 : gold_pos);
-  summary.pets_json = BuildPetsSummaryJson(ExtractArraySection(json, "PetSaveData"));
-  summary.runes_json = BuildRunesSummaryJson(ExtractArraySection(json, "RuneSaveData"));
+  summary.version = JsonStringValue(common ? ObjectGet(*common, "version") : nullptr);
+  summary.current_stage_key = static_cast<long long>(JsonNumberDouble(common ? ObjectGet(*common, "currentStageKey") : nullptr));
+  summary.current_stage_wave = static_cast<long long>(JsonNumberDouble(common ? ObjectGet(*common, "currentStageWave") : nullptr));
+  summary.max_completed_stage = static_cast<long long>(JsonNumberDouble(common ? ObjectGet(*common, "maxCompletedStage") : nullptr));
+  summary.arranged_pet_key = static_cast<long long>(JsonNumberDouble(common ? ObjectGet(*common, "ArrangedPetKey") : nullptr));
+  const JsonValue* gold = ObjectGet(full_summary, "gold");
+  summary.gold = static_cast<long long>(JsonNumberDouble(gold));
+  summary.pets_json = JsonSerialize(CopyOrEmptyArray(ObjectGet(full_summary, "pets")));
+  summary.runes_json = JsonSerialize(CopyOrEmptyArray(ObjectGet(full_summary, "runes")));
   return !summary.steam_id.empty();
 }
 
@@ -508,16 +1130,7 @@ std::string SavePayload(const Config& config) {
   std::string steam = JsonEscape(steam_raw);
   std::string save = "null";
   if (has_save) {
-    save = "{\"steamId\":\"" + JsonEscape(summary.steam_id) + "\",\"ownerSteamId\":\"" + JsonEscape(summary.owner_steam_id) +
-           "\",\"playerId\":\"" + JsonEscape(summary.player_id) + "\",\"version\":\"" + JsonEscape(summary.version) +
-           "\",\"currentStageKey\":" + std::to_string(summary.current_stage_key) +
-           ",\"currentStageWave\":" + std::to_string(summary.current_stage_wave) +
-           ",\"maxCompletedStage\":" + std::to_string(summary.max_completed_stage) +
-           ",\"arrangedPetKey\":" + std::to_string(summary.arranged_pet_key) +
-           ",\"gold\":" + std::to_string(summary.gold) +
-           ",\"pets\":" + summary.pets_json +
-           ",\"runes\":" + summary.runes_json +
-           ",\"agent\":\"cpp-save-mvp\"}";
+    save = summary.summary_json;
   }
   return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
          ",\"clears\":null,\"history\":null,\"watcher\":{\"agent\":\"cpp-save-mvp\"}}";
@@ -543,25 +1156,24 @@ bool CompareWithPythonSummary(const SaveSummary& summary, std::wstring& error) {
     return false;
   }
 
-  if (!CompareField("steamId", summary.steam_id, ExtractJsonString(py, "steamId"), error)) return false;
-  if (!CompareField("ownerSteamId", summary.owner_steam_id, ExtractJsonString(py, "ownerSteamId"), error)) return false;
-  if (!CompareField("playerId", summary.player_id, ExtractJsonString(py, "playerId"), error)) return false;
-  if (!CompareField("version", summary.version, ExtractJsonString(py, "version"), error)) return false;
-  if (!CompareField("currentStageKey", summary.current_stage_key, ExtractJsonInt(py, "currentStageKey"), error)) return false;
-  if (!CompareField("currentStageWave", summary.current_stage_wave, ExtractJsonInt(py, "currentStageWave"), error)) return false;
-  if (!CompareField("maxCompletedStage", summary.max_completed_stage, ExtractJsonInt(py, "maxCompletedStage"), error)) return false;
-  if (!CompareField("arrangedPetKey", summary.arranged_pet_key, ExtractJsonInt(py, "arrangedPetKey"), error)) return false;
-  if (!CompareField("gold", summary.gold, ExtractLastJsonInt(py, "gold"), error)) return false;
+  JsonValue py_json;
+  JsonValue cpp_json;
+  if (!ParseJson(py, py_json)) {
+    error = L"save-summary do Python não é JSON válido.";
+    return false;
+  }
+  if (!ParseJson(summary.summary_json, cpp_json)) {
+    error = L"Resumo C++ não é JSON válido.";
+    return false;
+  }
 
-  int cpp_pets = CountKey(summary.pets_json, "petKey");
-  int py_pets = CountKey(py, "petKey");
-  if (!CompareField("pets.count", cpp_pets, py_pets, error)) return false;
+  std::string py_normalized = JsonSerialize(py_json);
+  std::string cpp_normalized = JsonSerialize(cpp_json);
+  if (py_normalized == cpp_normalized) return true;
 
-  int cpp_runes = CountKey(summary.runes_json, "runeKey");
-  int py_runes = CountKey(py, "runeKey");
-  if (!CompareField("runes.count", cpp_runes, py_runes, error)) return false;
-
-  return true;
+  error = L"Resumo C++ ainda difere do Python. C++=" + std::to_wstring(cpp_normalized.size()) +
+          L" bytes, Python=" + std::to_wstring(py_normalized.size()) + L" bytes.";
+  return false;
 }
 
 bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar_t>& host, std::vector<wchar_t>& path) {
@@ -588,7 +1200,6 @@ std::wstring PostIngest(const Config& config) {
   if (!CompareWithPythonSummary(summary, compare_error)) {
     return L"Sync bloqueado. " + compare_error;
   }
-  return L"Comparação parcial OK. Envio bloqueado até o resumo C++ ficar idêntico ao Python. Faltam heróis, equipamentos, atributos e bônus.";
 
   std::wstring endpoint = config.server;
   while (!endpoint.empty() && endpoint.back() == L'/') endpoint.pop_back();
@@ -794,7 +1405,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
           result = L"FAIL: não foi possível ler o save C++";
         } else {
           std::wstring error;
-          result = CompareWithPythonSummary(summary, error) ? L"OK: resumo C++ bate com Python nos campos portados" : L"FAIL: " + error;
+          result = CompareWithPythonSummary(summary, error) ? L"OK: resumo C++ completo bate com Python" : L"FAIL: " + error;
         }
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
