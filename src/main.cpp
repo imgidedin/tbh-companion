@@ -89,6 +89,18 @@ struct MemoryEvent {
   int index = 0;
 };
 
+int EventClockKey(const MemoryEvent& event) {
+  if (event.clock.size() >= 4) {
+    size_t colon = event.clock.find(':');
+    if (colon != std::string::npos) {
+      int hour = atoi(event.clock.substr(0, colon).c_str());
+      int minute = atoi(event.clock.substr(colon + 1).c_str());
+      return hour * 60 + minute;
+    }
+  }
+  return -1;
+}
+
 struct MemorySnapshot {
   DWORD pid = 0;
   std::vector<MemoryEvent> events;
@@ -657,28 +669,6 @@ std::string EventId(const MemoryEvent& event) {
   return event.type + "|" + event.raw;
 }
 
-bool ContainsAny(const std::vector<unsigned char>& data, const std::vector<std::vector<unsigned char>>& needles) {
-  for (const auto& needle : needles) {
-    if (needle.empty() || needle.size() > data.size()) continue;
-    if (std::search(data.begin(), data.end(), needle.begin(), needle.end()) != data.end()) return true;
-  }
-  return false;
-}
-
-std::vector<size_t> FindNeedleIndexes(const std::vector<unsigned char>& data, const std::vector<std::vector<unsigned char>>& needles) {
-  std::set<size_t> indexes;
-  for (const auto& needle : needles) {
-    auto it = data.begin();
-    while (it != data.end()) {
-      it = std::search(it, data.end(), needle.begin(), needle.end());
-      if (it == data.end()) break;
-      indexes.insert(static_cast<size_t>(std::distance(data.begin(), it)));
-      it += std::max<size_t>(needle.size(), 1);
-    }
-  }
-  return std::vector<size_t>(indexes.begin(), indexes.end());
-}
-
 std::vector<unsigned char> Utf16Needle(const wchar_t* text) {
   std::vector<unsigned char> bytes;
   for (const wchar_t* p = text; *p; ++p) {
@@ -697,6 +687,60 @@ std::wstring DecodeUtf16Le(const unsigned char* data, size_t size) {
     out.push_back(c);
   }
   return out;
+}
+
+constexpr unsigned kEventClear = 1u;
+constexpr unsigned kEventFailure = 2u;
+constexpr unsigned kEventDeath = 4u;
+constexpr unsigned kEventDrop = 8u;
+constexpr unsigned kEventAll = kEventClear | kEventFailure | kEventDeath | kEventDrop;
+
+struct LogNeedle {
+  std::vector<unsigned char> bytes;
+  unsigned mask;
+};
+
+const std::vector<LogNeedle>& LogNeedles() {
+  static const std::vector<LogNeedle> needles = {
+      {Utf16Needle(L"concluído"), kEventClear},
+      {Utf16Needle(L"concluido"), kEventClear},
+      {Utf16Needle(L"Falha ao concluir"), kEventFailure},
+      {Utf16Needle(L"derrotado"), kEventDeath},
+      {Utf16Needle(L"obtido"), kEventDrop},
+      {Utf16Needle(L"Resultado de fabricação"), kEventDrop},
+  };
+  return needles;
+}
+
+struct NeedleHit {
+  size_t index;
+  unsigned mask;
+};
+
+// Single-purpose fast multi-pattern search: memchr (SIMD na CRT) localiza o
+// primeiro byte e memcmp confirma a needle completa. Muito mais rapido que
+// std::search byte a byte.
+void FindNeedleHits(const unsigned char* data, size_t size, std::vector<NeedleHit>& hits) {
+  hits.clear();
+  for (const auto& needle : LogNeedles()) {
+    const size_t n = needle.bytes.size();
+    if (n == 0 || n > size) continue;
+    const unsigned char first = needle.bytes[0];
+    const size_t last_start = size - n;
+    size_t pos = 0;
+    while (pos <= last_start) {
+      const void* found = memchr(data + pos, first, last_start - pos + 1);
+      if (!found) break;
+      size_t index = static_cast<size_t>(static_cast<const unsigned char*>(found) - data);
+      if (memcmp(data + index, needle.bytes.data(), n) == 0) {
+        hits.push_back({index, needle.mask});
+        pos = index + n;
+      } else {
+        pos = index + 1;
+      }
+    }
+  }
+  std::sort(hits.begin(), hits.end(), [](const NeedleHit& a, const NeedleHit& b) { return a.index < b.index; });
 }
 
 DWORD FindProcessIdByName(const wchar_t* process_name) {
@@ -734,7 +778,7 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
   return bytes;
 }
 
-void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& text) {
+void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& text, unsigned mask = kEventAll) {
   static const std::wregex clear_re(
       LR"((?:<color=#[0-9A-Fa-f]+>)?Est[aá]gio\s+(\d+-\d+)(?:</color>)?\s+conclu[ií]do\.\s*\((\d+)s\)(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)",
       std::regex_constants::icase);
@@ -782,10 +826,10 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
     }
   };
 
-  add_matches(clear_re, "clear");
-  add_matches(fail_re, "failure");
-  add_matches(death_re, "death");
-  add_matches(drop_re, "drop");
+  if (mask & kEventClear) add_matches(clear_re, "clear");
+  if (mask & kEventFailure) add_matches(fail_re, "failure");
+  if (mask & kEventDeath) add_matches(death_re, "death");
+  if (mask & kEventDrop) add_matches(drop_re, "drop");
 }
 
 std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
@@ -807,53 +851,133 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
                                           std::vector<MemoryRegion>* cached_regions = nullptr,
                                           bool discover_regions = true,
                                           SIZE_T max_region = 64ULL * 1024ULL * 1024ULL,
-                                          size_t context = 4096) {
-  static const std::vector<std::vector<unsigned char>> needles = {
-      Utf16Needle(L"concluído"),
-      Utf16Needle(L"concluido"),
-      Utf16Needle(L"Falha ao concluir"),
-      Utf16Needle(L"derrotado"),
-      Utf16Needle(L"obtido"),
-      Utf16Needle(L"Resultado de fabricação"),
-  };
-
+                                          size_t context = 4096,
+                                          size_t cached_region_limit = 0) {
   std::vector<MemoryEvent> events;
+  std::set<std::string> remembered_event_ids;
+  struct RegionCandidate {
+    MemoryRegion region;
+    int clock_key = -1;
+    size_t order = 0;
+  };
+  std::vector<RegionCandidate> region_candidates;
+  std::vector<NeedleHit> hits;
   auto scan_region = [&](unsigned char* base, SIZE_T size, bool remember) {
     if (!base || size == 0 || size > max_region) return;
     std::vector<unsigned char> data = ReadProcessBytes(process, base, size);
-    if (data.empty() || !ContainsAny(data, needles)) return;
-    if (remember && cached_regions) cached_regions->push_back({base, size});
-    for (size_t index : FindNeedleIndexes(data, needles)) {
-      size_t left = index > context ? index - context : 0;
-      size_t right = (std::min)(data.size(), index + context);
+    if (data.empty()) return;
+    FindNeedleHits(data.data(), data.size(), hits);
+    if (hits.empty()) return;
+    // Mescla janelas sobrepostas para decodificar e rodar regex uma unica vez
+    // por trecho, em vez de uma vez por ocorrencia.
+    size_t i = 0;
+    while (i < hits.size()) {
+      size_t left = hits[i].index > context ? hits[i].index - context : 0;
+      size_t right = (std::min)(data.size(), hits[i].index + context);
+      unsigned mask = hits[i].mask;
+      size_t j = i + 1;
+      while (j < hits.size() && hits[j].index <= right + context) {
+        right = (std::max)(right, (std::min)(data.size(), hits[j].index + context));
+        mask |= hits[j].mask;
+        ++j;
+      }
+      std::vector<MemoryEvent> found;
       std::wstring text = NormalizeMemoryText(DecodeUtf16Le(data.data() + left, right - left));
-      AppendRegexEvents(events, text);
+      AppendRegexEvents(found, text, mask);
+      bool has_new_event = false;
+      for (const auto& event : found) {
+        std::string id = event.id.empty() ? EventId(event) : event.id;
+        if (remembered_event_ids.insert(id).second) has_new_event = true;
+      }
+      if (remember && cached_regions && has_new_event) {
+        int best_clock = -1;
+        for (const auto& event : found) best_clock = (std::max)(best_clock, EventClockKey(event));
+        region_candidates.push_back(
+            {{base + left, static_cast<SIZE_T>(right - left)}, best_clock, region_candidates.size()});
+      }
+      events.insert(events.end(), found.begin(), found.end());
+      i = j;
     }
   };
 
   if (cached_regions && !cached_regions->empty() && !discover_regions) {
     std::vector<MemoryRegion> still_valid;
-    for (const auto& region : *cached_regions) {
+    DWORD cached_start = GetTickCount();
+    size_t scanned = 0;
+    size_t limit = cached_region_limit ? (std::min)(cached_region_limit, cached_regions->size()) : cached_regions->size();
+    std::set<std::string> kept_event_ids;
+    for (size_t region_index = 0; region_index < limit; ++region_index) {
+      const auto& region = (*cached_regions)[region_index];
       size_t before = events.size();
       scan_region(region.base, region.size, false);
-      if (events.size() != before) still_valid.push_back(region);
+      bool has_new_event = false;
+      for (size_t i = before; i < events.size(); ++i) {
+        std::string id = events[i].id.empty() ? EventId(events[i]) : events[i].id;
+        if (kept_event_ids.insert(id).second) has_new_event = true;
+      }
+      if (has_new_event || cached_region_limit) still_valid.push_back(region);
+      ++scanned;
+      if (scanned % 50 == 0) {
+        PostStatus(L"Cache memoria: " + std::to_wstring(scanned) + L"/" +
+                   std::to_wstring(limit) + L" regioes em " +
+                   std::to_wstring(GetTickCount() - cached_start) + L"ms.");
+      }
     }
-    if (!still_valid.empty()) *cached_regions = std::move(still_valid);
+    if (!cached_region_limit) {
+      *cached_regions = std::move(still_valid);
+    }
     return UniqueEvents(events);
   }
 
   if (cached_regions && discover_regions) cached_regions->clear();
-  unsigned char* address = nullptr;
-  MEMORY_BASIC_INFORMATION info{};
-  while (VirtualQueryEx(process, address, &info, sizeof(info)) == sizeof(info)) {
-    unsigned char* base = static_cast<unsigned char*>(info.BaseAddress);
-    SIZE_T size = info.RegionSize;
-    if (IsReadableRegion(info) && size > 0 && size <= max_region) {
-      scan_region(base, size, true);
+  auto is_private_writable = [](const MEMORY_BASIC_INFORMATION& info) {
+    if (info.Type != MEM_PRIVATE) return false;
+    DWORD protect = info.Protect & 0xFF;
+    return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+           protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+  };
+  auto walk_regions = [&](bool private_writable_only) {
+    unsigned char* address = nullptr;
+    MEMORY_BASIC_INFORMATION info{};
+    DWORD walk_start = GetTickCount();
+    DWORD last_status = walk_start;
+    unsigned long long scanned_bytes = 0;
+    while (VirtualQueryEx(process, address, &info, sizeof(info)) == sizeof(info)) {
+      unsigned char* base = static_cast<unsigned char*>(info.BaseAddress);
+      SIZE_T size = info.RegionSize;
+      if (IsReadableRegion(info) && size > 0 && size <= max_region &&
+          is_private_writable(info) == private_writable_only) {
+        scan_region(base, size, true);
+        scanned_bytes += size;
+        DWORD now = GetTickCount();
+        if (now - last_status >= 1000) {
+          PostStatus(L"Lendo memoria do jogo: " + std::to_wstring(scanned_bytes / (1024ULL * 1024ULL)) +
+                     L" MB lidos, " + std::to_wstring(events.size()) + L" eventos.");
+          last_status = now;
+        }
+      }
+      unsigned char* next = base + size;
+      if (next <= address) break;
+      address = next;
     }
-    unsigned char* next = base + size;
-    if (next <= address) break;
-    address = next;
+  };
+  // Passe rapido: as strings de log do jogo (heap gerenciado) vivem em memoria
+  // privada gravavel. So varre o resto do processo se nada for encontrado.
+  walk_regions(true);
+  if (events.empty()) walk_regions(false);
+  if (cached_regions && discover_regions && !region_candidates.empty()) {
+    std::sort(region_candidates.begin(), region_candidates.end(), [](const RegionCandidate& a, const RegionCandidate& b) {
+      if (a.clock_key != b.clock_key) return a.clock_key > b.clock_key;
+      return a.order > b.order;
+    });
+    std::set<std::string> seen_regions;
+    cached_regions->clear();
+    for (const auto& candidate : region_candidates) {
+      std::string key = std::to_string(reinterpret_cast<unsigned long long>(candidate.region.base)) + ":" +
+                        std::to_string(static_cast<unsigned long long>(candidate.region.size));
+      if (!seen_regions.insert(key).second) continue;
+      cached_regions->push_back(candidate.region);
+    }
   }
   return UniqueEvents(events);
 }
@@ -1083,9 +1207,34 @@ JsonValue BuildClearsJson(const std::vector<MemoryEvent>& events, const std::str
   return out;
 }
 
+std::vector<MemoryEvent> MergeMemoryEvents(const std::vector<MemoryEvent>& old_events,
+                                           const std::vector<MemoryEvent>& new_events) {
+  std::vector<MemoryEvent> merged;
+  std::set<std::string> seen;
+  auto append = [&](const std::vector<MemoryEvent>& events) {
+    for (const auto& event : events) {
+      std::string id = event.id.empty() ? EventId(event) : event.id;
+      if (!seen.insert(id).second) continue;
+      MemoryEvent copy = event;
+      copy.id = id;
+      copy.index = static_cast<int>(merged.size());
+      merged.push_back(std::move(copy));
+    }
+  };
+  append(old_events);
+  append(new_events);
+  return merged;
+}
+
+void RebuildMemorySnapshotJson(MemorySnapshot& snapshot, const std::string& difficulty) {
+  snapshot.history_json = JsonSerialize(BuildHistoryJson(snapshot.events, difficulty));
+  snapshot.clears_json = JsonSerialize(BuildClearsJson(snapshot.events, difficulty));
+}
+
 MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL",
                                   std::vector<MemoryRegion>* cached_regions = nullptr,
-                                  bool discover_regions = true) {
+                                  bool discover_regions = true,
+                                  size_t cached_region_limit = 0) {
   MemorySnapshot snapshot;
   snapshot.pid = FindProcessIdByName(L"TaskBarHero.exe");
   JsonValue watcher = JsonValue::Object();
@@ -1102,14 +1251,14 @@ MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL",
     snapshot.watcher_json = JsonSerialize(watcher);
     return snapshot;
   }
-  snapshot.events = ScanMemoryEvents(process, cached_regions, discover_regions);
+  snapshot.events = ScanMemoryEvents(process, cached_regions, discover_regions, 64ULL * 1024ULL * 1024ULL, 4096,
+                                     cached_region_limit);
   CloseHandle(process);
   ObjectSet(watcher, "message", JsonValue::String("memory snapshot pid=" + std::to_string(snapshot.pid) + "; events=" +
                                                   std::to_string(snapshot.events.size()) + "; regions=" +
                                                   std::to_string(cached_regions ? cached_regions->size() : 0)));
   snapshot.watcher_json = JsonSerialize(watcher);
-  snapshot.history_json = JsonSerialize(BuildHistoryJson(snapshot.events, difficulty));
-  snapshot.clears_json = JsonSerialize(BuildClearsJson(snapshot.events, difficulty));
+  RebuildMemorySnapshotJson(snapshot, difficulty);
   return snapshot;
 }
 
@@ -1168,6 +1317,106 @@ bool WriteTextFile(const std::wstring& path, const std::wstring& text) {
   BOOL ok = WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
   CloseHandle(file);
   return ok && written == utf8.size();
+}
+
+std::wstring MemoryRegionsPath() {
+  return CompanionDir() + L"\\memory-regions.json";
+}
+
+std::string HexAddress(unsigned long long value) {
+  char buffer[32]{};
+  sprintf_s(buffer, "0x%llx", value);
+  return buffer;
+}
+
+unsigned long long ParseHexAddress(const std::string& value) {
+  const char* text = value.c_str();
+  int base = 10;
+  if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0) {
+    text += 2;
+    base = 16;
+  }
+  return _strtoui64(text, nullptr, base);
+}
+
+bool LoadMemoryRegionCache(DWORD pid, std::vector<MemoryRegion>& regions) {
+  std::string text;
+  if (!ReadTextFile(MemoryRegionsPath(), text)) return false;
+  JsonValue root;
+  if (!ParseJson(text, root)) return false;
+  if (static_cast<DWORD>(JsonNumberDouble(ObjectGet(root, "pid"))) != pid) return false;
+  const JsonValue* rows = ObjectGet(root, "regions");
+  if (!rows || rows->type != JsonValue::Type::Array) return false;
+  std::vector<MemoryRegion> loaded;
+  for (const auto& row : rows->array) {
+    unsigned long long base = ParseHexAddress(JsonStringValue(ObjectGet(row, "base")));
+    unsigned long long size = ParseHexAddress(JsonStringValue(ObjectGet(row, "size")));
+    if (base && size) loaded.push_back({reinterpret_cast<unsigned char*>(static_cast<uintptr_t>(base)), static_cast<SIZE_T>(size)});
+  }
+  if (loaded.empty()) return false;
+  regions = std::move(loaded);
+  return true;
+}
+
+void SaveMemoryRegionCache(DWORD pid, const std::vector<MemoryRegion>& regions) {
+  if (!pid || regions.empty()) return;
+  JsonValue root = JsonValue::Object();
+  ObjectSet(root, "pid", JsonValue::Number(static_cast<long long>(pid)));
+  ObjectSet(root, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
+  JsonValue rows = JsonValue::Array();
+  for (const auto& region : regions) {
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "base", JsonValue::String(HexAddress(reinterpret_cast<uintptr_t>(region.base))));
+    ObjectSet(row, "size", JsonValue::String(HexAddress(static_cast<unsigned long long>(region.size))));
+    rows.array.push_back(std::move(row));
+  }
+  ObjectSet(root, "regions", std::move(rows));
+  WriteTextFile(MemoryRegionsPath(), Widen(JsonSerialize(root)));
+}
+
+std::wstring MemoryHistoryPath() {
+  return CompanionDir() + L"\\memory-history.json";
+}
+
+bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
+  if (value.type != JsonValue::Type::Object) return false;
+  event.type = JsonStringValue(ObjectGet(value, "type"));
+  if (event.type.empty()) return false;
+  event.label = JsonStringValue(ObjectGet(value, "label"));
+  event.seconds = static_cast<int>(JsonNumberDouble(ObjectGet(value, "seconds")));
+  event.progress = JsonStringValue(ObjectGet(value, "progress"));
+  event.item = JsonStringValue(ObjectGet(value, "item"));
+  event.hero = JsonStringValue(ObjectGet(value, "hero"));
+  event.enemy = JsonStringValue(ObjectGet(value, "enemy"));
+  event.clock = JsonStringValue(ObjectGet(value, "clock"));
+  event.raw = JsonStringValue(ObjectGet(value, "raw"));
+  event.id = JsonStringValue(ObjectGet(value, "id"));
+  if (event.id.empty()) event.id = EventId(event);
+  event.index = static_cast<int>(JsonNumberDouble(ObjectGet(value, "index")));
+  return true;
+}
+
+bool LoadMemoryHistoryCache(MemorySnapshot& snapshot, const std::string& difficulty) {
+  std::string text;
+  if (!ReadTextFile(MemoryHistoryPath(), text)) return false;
+  JsonValue root;
+  if (!ParseJson(text, root)) return false;
+  const JsonValue* events = ObjectGet(root, "events");
+  if (!events || events->type != JsonValue::Type::Array) return false;
+  std::vector<MemoryEvent> loaded;
+  for (const auto& item : events->array) {
+    MemoryEvent event;
+    if (MemoryEventFromJson(item, event)) loaded.push_back(std::move(event));
+  }
+  if (loaded.empty()) return false;
+  snapshot.events = UniqueEvents(loaded);
+  RebuildMemorySnapshotJson(snapshot, difficulty);
+  return true;
+}
+
+void SaveMemoryHistoryCache(const MemorySnapshot& snapshot) {
+  if (snapshot.history_json.empty() || snapshot.history_json == "null") return;
+  WriteTextFile(MemoryHistoryPath(), Widen(snapshot.history_json));
 }
 
 std::wstring TempComparePath() {
@@ -2044,20 +2293,53 @@ bool RefreshSaveCache(WorkerState& state) {
 bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   DWORD now = GetTickCount();
   DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
   bool process_changed = pid != state.memory_pid;
-  bool rediscover = force_discover || process_changed || state.memory_regions.empty() || now - state.last_region_discovery > 120000;
-  bool due = force_discover || rediscover || now - state.last_memory_scan > 5000;
-  if (!due) return false;
-
   if (process_changed) {
     state.memory_regions.clear();
     state.memory_pid = pid;
+    if (pid && LoadMemoryRegionCache(pid, state.memory_regions)) {
+      state.last_region_discovery = now;
+      PostStatus(L"Cache de memoria carregado (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
+      if (LoadMemoryHistoryCache(state.memory, difficulty)) {
+        PostStatus(L"Historico de memoria local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
+      }
+    }
   }
 
-  std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
-  state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, rediscover);
+  bool rediscover = force_discover || state.memory_regions.empty();
+  bool due = force_discover || rediscover || now - state.last_memory_scan > 5000;
+  if (!due) return false;
+
+  DWORD scan_start = GetTickCount();
+  size_t region_count_before = state.memory_regions.size();
+  PostStatus(rediscover ? L"Lendo memoria com calibracao completa..." : L"Lendo memoria pelo cache...");
+  MemorySnapshot previous_memory = state.memory;
+  state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, rediscover, rediscover ? 0 : 24);
+  if (!rediscover && state.memory.events.empty()) {
+    PostStatus(L"Cache de memoria invalido. Recalibrando...");
+    scan_start = GetTickCount();
+    state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, true);
+    rediscover = true;
+  } else if (!rediscover) {
+    state.memory.events = MergeMemoryEvents(previous_memory.events, state.memory.events);
+    RebuildMemorySnapshotJson(state.memory, difficulty);
+  }
+  DWORD scan_ms = GetTickCount() - scan_start;
   state.last_memory_scan = now;
-  if (rediscover) state.last_region_discovery = now;
+  PostStatus(L"Memoria lida em " + std::to_wstring(scan_ms) + L"ms (" +
+             std::to_wstring(state.memory.events.size()) + L" eventos, " +
+             std::to_wstring(state.memory_regions.size()) + L" regioes).");
+  if (rediscover) {
+    state.last_region_discovery = now;
+    SaveMemoryRegionCache(state.memory_pid, state.memory_regions);
+    PostStatus(L"Cache de memoria salvo (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
+  } else if (state.memory_regions.size() != region_count_before) {
+    SaveMemoryRegionCache(state.memory_pid, state.memory_regions);
+    PostStatus(L"Cache de memoria compactado (" + std::to_wstring(region_count_before) + L" -> " +
+               std::to_wstring(state.memory_regions.size()) + L" regioes).");
+  }
+  SaveMemoryHistoryCache(state.memory);
   return true;
 }
 

@@ -31,6 +31,7 @@ Atual:
 - Abre o jogo pelo Steam se `TaskBarHero.exe` nao estiver rodando.
 - Monitora o save por timestamp e so relê quando o arquivo muda.
 - Monitora logs da memoria do `TaskBarHero.exe`, mantendo cache das regioes candidatas para reduzir custo.
+- Scan de memoria otimizado: busca multi-padrao via `memchr`, janelas de contexto mescladas (regex roda uma vez por trecho) e passe rapido apenas em memoria privada gravavel (heap gerenciado), com fallback para scan completo.
 - Faz POST para `/api/ingest` apenas quando o payload muda.
 - Pode ser configurado para iniciar automaticamente com o Windows.
 - Abre a UI web do SteamID configurado.
