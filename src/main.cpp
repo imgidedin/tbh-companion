@@ -34,15 +34,19 @@ constexpr int IDC_TEST = 1005;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_READ_SAVE = 1008;
+constexpr int IDC_AUTOSTART = 1009;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
+constexpr wchar_t STEAM_GAME_URI[] = L"steam://rungameid/3678970";
+constexpr wchar_t AUTOSTART_VALUE_NAME[] = L"TBH Companion";
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
 HWND g_token = nullptr;
 HWND g_steam = nullptr;
+HWND g_autostart = nullptr;
 HWND g_status = nullptr;
 HWND g_main_window = nullptr;
 HANDLE g_worker_stop = nullptr;
@@ -52,6 +56,7 @@ struct Config {
   std::wstring server = L"https://tbh.gided.in";
   std::wstring token;
   std::wstring steam_id;
+  bool auto_start = false;
 };
 
 struct SaveSummary {
@@ -153,6 +158,8 @@ std::string Fnv1aHash(const std::string& text) {
   return buffer;
 }
 
+std::wstring ExePath();
+
 std::wstring ConfigPath() {
   wchar_t local_app_data[MAX_PATH]{};
   DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
@@ -160,6 +167,41 @@ std::wstring ConfigPath() {
   dir += L"\\TBH Companion";
   CreateDirectoryW(dir.c_str(), nullptr);
   return dir + L"\\config.ini";
+}
+
+std::wstring AutoStartCommand() {
+  return L"\"" + ExePath() + L"\"";
+}
+
+bool IsAutoStartEnabled() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &key) != ERROR_SUCCESS) {
+    return false;
+  }
+  wchar_t value[MAX_PATH * 2]{};
+  DWORD type = 0;
+  DWORD size = sizeof(value);
+  LONG result = RegQueryValueExW(key, AUTOSTART_VALUE_NAME, nullptr, &type, reinterpret_cast<LPBYTE>(value), &size);
+  RegCloseKey(key);
+  if (result != ERROR_SUCCESS || type != REG_SZ) return false;
+  return Trim(value) == AutoStartCommand();
+}
+
+bool SetAutoStart(bool enabled) {
+  HKEY key = nullptr;
+  LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0,
+                                KEY_SET_VALUE, nullptr, &key, nullptr);
+  if (result != ERROR_SUCCESS) return false;
+  if (enabled) {
+    std::wstring command = AutoStartCommand();
+    result = RegSetValueExW(key, AUTOSTART_VALUE_NAME, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+  } else {
+    result = RegDeleteValueW(key, AUTOSTART_VALUE_NAME);
+    if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+  }
+  RegCloseKey(key);
+  return result == ERROR_SUCCESS;
 }
 
 Config LoadConfig() {
@@ -175,6 +217,7 @@ Config LoadConfig() {
 
   GetPrivateProfileStringW(L"player", L"steam_id", L"", buffer, 4096, path.c_str());
   config.steam_id = Trim(buffer);
+  config.auto_start = IsAutoStartEnabled();
 
   return config;
 }
@@ -184,6 +227,8 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"server", L"url", config.server.c_str(), path.c_str());
   WritePrivateProfileStringW(L"server", L"token", config.token.c_str(), path.c_str());
   WritePrivateProfileStringW(L"player", L"steam_id", config.steam_id.c_str(), path.c_str());
+  WritePrivateProfileStringW(L"app", L"auto_start", config.auto_start ? L"1" : L"0", path.c_str());
+  SetAutoStart(config.auto_start);
 }
 
 Config ReadConfigFromUi() {
@@ -191,6 +236,7 @@ Config ReadConfigFromUi() {
   config.server = GetWindowTextString(g_server);
   config.token = GetWindowTextString(g_token);
   config.steam_id = GetWindowTextString(g_steam);
+  config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
   return config;
 }
 
@@ -1906,16 +1952,61 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   return true;
 }
 
+bool EnsureGameRunning() {
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  if (pid) return true;
+
+  PostStatus(L"Jogo não encontrado. Abrindo pelo Steam...");
+  HINSTANCE result = ShellExecuteW(nullptr, L"open", STEAM_GAME_URI, nullptr, nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(result) <= 32) {
+    PostStatus(L"Não foi possível abrir o jogo pelo Steam.");
+    return false;
+  }
+
+  const DWORD started = GetTickCount();
+  while (WaitForSingleObject(g_worker_stop, 2000) == WAIT_TIMEOUT) {
+    pid = FindProcessIdByName(L"TaskBarHero.exe");
+    if (pid) {
+      PostStatus(L"Jogo aberto. Iniciando monitoramento.");
+      return true;
+    }
+    if (GetTickCount() - started > 120000) {
+      PostStatus(L"Steam chamado, mas o jogo não iniciou em 120s.");
+      return false;
+    }
+    PostStatus(L"Aguardando o jogo iniciar...");
+  }
+  return false;
+}
+
 DWORD WINAPI WorkerProc(LPVOID) {
   WorkerState state;
   PostStatus(L"Worker iniciado. Monitorando save e memoria.");
   RefreshSaveCache(state);
-  RefreshMemoryCache(state, true);
+  bool game_ready = EnsureGameRunning();
+  if (game_ready) RefreshMemoryCache(state, true);
 
   while (WaitForSingleObject(g_worker_stop, 1000) == WAIT_TIMEOUT) {
     Config config = LoadConfig();
     bool changed = false;
     changed = RefreshSaveCache(state) || changed;
+
+    if (!game_ready) {
+      game_ready = EnsureGameRunning();
+      if (!game_ready) {
+        WaitForSingleObject(g_worker_stop, 10000);
+        continue;
+      }
+    }
+
+    if (!FindProcessIdByName(L"TaskBarHero.exe")) {
+      game_ready = false;
+      state.memory_regions.clear();
+      state.memory_pid = 0;
+      PostStatus(L"Jogo fechado. Aguardando reabrir.");
+      continue;
+    }
+
     changed = RefreshMemoryCache(state) || changed;
 
     if (!state.has_save) {
@@ -1999,6 +2090,14 @@ HWND AddButton(HWND parent, int id, const wchar_t* text, int x, int y, int w, in
   return button;
 }
 
+HWND AddCheckbox(HWND parent, int id, const wchar_t* text, bool checked, int x, int y, int w, int h, HFONT font) {
+  HWND checkbox = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+  SendMessageW(checkbox, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+  SendMessageW(checkbox, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+  return checkbox;
+}
+
 void OpenWebUi(const Config& config) {
   std::wstring url = config.server.empty() ? L"https://tbh.gided.in" : config.server;
   if (!config.steam_id.empty()) {
@@ -2031,13 +2130,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       AddLabel(hwnd, L"SteamID", 24, 176, 120, 22, font);
       g_steam = AddEdit(hwnd, IDC_STEAM, config.steam_id, 144, 172, 430, 28, font);
 
-      AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 220, 100, 34, font);
-      AddButton(hwnd, IDC_TEST, L"Comparar", 256, 220, 120, 34, font);
-      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 220, 100, 34, font);
-      AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 220, 86, 34, font);
+      g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 210, 220, 24, font);
+
+      AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 250, 100, 34, font);
+      AddButton(hwnd, IDC_TEST, L"Comparar", 256, 250, 120, 34, font);
+      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 250, 100, 34, font);
+      AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 250, 86, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               24, 278, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
+                               24, 310, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
       SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
       if (config.steam_id.empty()) {
@@ -2079,6 +2180,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
           SaveConfig(config);
           SetStatus(L"SteamID lido do save: " + steam_id);
         }
+      } else if (id == IDC_AUTOSTART) {
+        Config config = ReadConfigFromUi();
+        SaveConfig(config);
+        SetStatus(config.auto_start ? L"Inicialização com Windows ativada." : L"Inicialização com Windows desativada.");
       }
       return 0;
     }
@@ -2168,7 +2273,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
   HWND hwnd = CreateWindowExW(0, class_name, L"TBH Companion",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 400,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 430,
                               nullptr, nullptr, instance, nullptr);
   if (!hwnd) return 1;
 
