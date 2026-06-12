@@ -29,11 +29,8 @@ namespace {
 constexpr int IDC_SERVER = 1001;
 constexpr int IDC_TOKEN = 1002;
 constexpr int IDC_STEAM = 1003;
-constexpr int IDC_SAVE = 1004;
-constexpr int IDC_TEST = 1005;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
-constexpr int IDC_READ_SAVE = 1008;
 constexpr int IDC_AUTOSTART = 1009;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 
@@ -238,6 +235,15 @@ Config ReadConfigFromUi() {
   config.steam_id = GetWindowTextString(g_steam);
   config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
   return config;
+}
+
+bool UiConfigReady() {
+  return g_server && g_token && g_steam && g_autostart;
+}
+
+void SaveConfigFromUi() {
+  if (!UiConfigReady()) return;
+  SaveConfig(ReadConfigFromUi());
 }
 
 std::string Utf8(const std::wstring& text) {
@@ -2132,10 +2138,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
 
       g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 210, 220, 24, font);
 
-      AddButton(hwnd, IDC_SAVE, L"Salvar", 144, 250, 100, 34, font);
-      AddButton(hwnd, IDC_TEST, L"Comparar", 256, 250, 120, 34, font);
-      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 388, 250, 100, 34, font);
-      AddButton(hwnd, IDC_READ_SAVE, L"Ler save", 500, 250, 86, 34, font);
+      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 250, 120, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                24, 310, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
@@ -2155,31 +2158,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     }
     case WM_COMMAND: {
       int id = LOWORD(wparam);
-      if (id == IDC_SAVE) {
-        Config config = ReadConfigFromUi();
-        SaveConfig(config);
-        SetStatus(L"Configuração salva.");
+      int notification = HIWORD(wparam);
+      if ((id == IDC_SERVER || id == IDC_TOKEN || id == IDC_STEAM) && notification == EN_CHANGE) {
+        SaveConfigFromUi();
       } else if (id == IDC_OPEN) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
         OpenWebUi(config);
-      } else if (id == IDC_TEST) {
-        Config config = ReadConfigFromUi();
-        SaveConfig(config);
-        SetStatus(L"Comparando C++ com Python...");
-        std::wstring result = PostIngest(config);
-        SetStatus(result);
-      } else if (id == IDC_READ_SAVE) {
-        SetStatus(L"Lendo save...");
-        std::wstring steam_id = ReadSteamIdFromSave();
-        if (steam_id.empty()) {
-          SetStatus(L"Não foi possível ler o SteamID do save padrão.");
-        } else {
-          SetWindowTextW(g_steam, steam_id.c_str());
-          Config config = ReadConfigFromUi();
-          SaveConfig(config);
-          SetStatus(L"SteamID lido do save: " + steam_id);
-        }
       } else if (id == IDC_AUTOSTART) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
