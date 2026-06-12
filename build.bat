@@ -9,12 +9,13 @@ set RC_OUT=%OUT%\app.res
 set ITEMS_JSON=%ROOT%..\tbh-farm-local\runtime\items.json
 set ITEMS_ZIP=%ROOT%res\items.zip
 set ITEMS_HEADER=%ROOT%src\generated_items.h
+set ITEMS_INDEX=%ROOT%res\items_index.txt
 set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%ROOT%res" mkdir "%ROOT%res"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\build_items.ps1" -ItemsJson "%ITEMS_JSON%" -ItemsZip "%ITEMS_ZIP%" -ItemsHeader "%ITEMS_HEADER%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\build_items.ps1" -ItemsJson "%ITEMS_JSON%" -ItemsZip "%ITEMS_ZIP%" -ItemsHeader "%ITEMS_HEADER%" -ItemsIndex "%ITEMS_INDEX%"
 if errorlevel 1 exit /b 1
 
 call "%VCVARS%" >nul

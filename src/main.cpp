@@ -50,6 +50,9 @@ HWND g_main_window = nullptr;
 HANDLE g_worker_stop = nullptr;
 HANDLE g_worker_thread = nullptr;
 
+std::string Utf8(const std::wstring& text);
+std::wstring CompanionDir();
+
 struct Config {
   std::wstring server = L"https://tbh.gided.in";
   std::wstring token;
@@ -129,6 +132,16 @@ void SetStatus(const std::wstring& text) {
 }
 
 void PostStatus(const std::wstring& text) {
+  std::wstring line = text + L"\r\n";
+  std::wstring log_path = CompanionDir() + L"\\agent.log";
+  HANDLE log = CreateFileW(log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (log != INVALID_HANDLE_VALUE) {
+    std::string utf8 = Utf8(line);
+    DWORD written = 0;
+    WriteFile(log, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    CloseHandle(log);
+  }
   if (!g_main_window) return;
   auto* copy = new std::wstring(text);
   PostMessageW(g_main_window, WM_APP_STATUS, 0, reinterpret_cast<LPARAM>(copy));
@@ -1547,9 +1560,46 @@ JsonValue BuildBonusSource(const JsonValue& hero, const JsonValue* item, const J
   return out;
 }
 
+const JsonValue* ItemByKey(const std::string& key) {
+  static bool loaded = false;
+  static std::map<std::string, std::string> item_json_by_key;
+  static std::map<std::string, JsonValue> parsed_items;
+
+  if (!loaded) {
+    loaded = true;
+    HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_ITEMS_INDEX), RT_RCDATA);
+    HGLOBAL handle = resource ? LoadResource(nullptr, resource) : nullptr;
+    const char* data = handle ? static_cast<const char*>(LockResource(handle)) : nullptr;
+    DWORD size = resource ? SizeofResource(nullptr, resource) : 0;
+    if (data && size) {
+      std::string text(data, data + size);
+      size_t start = 0;
+      while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t tab = line.find('\t');
+        if (tab != std::string::npos) {
+          item_json_by_key[line.substr(0, tab)] = line.substr(tab + 1);
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+      }
+    }
+  }
+
+  auto parsed = parsed_items.find(key);
+  if (parsed != parsed_items.end()) return &parsed->second;
+  auto raw = item_json_by_key.find(key);
+  if (raw == item_json_by_key.end()) return nullptr;
+  JsonValue item;
+  if (!ParseJson(raw->second, item)) return nullptr;
+  auto inserted = parsed_items.insert({key, std::move(item)});
+  return &inserted.first->second;
+}
+
 JsonValue BuildEquippedItems(const JsonValue& hero,
                              const std::map<std::string, const JsonValue*>& item_by_uid,
-                             const std::map<std::string, const JsonValue*>& items_by_key,
                              double& exp_bonus,
                              double& gold_bonus,
                              JsonValue& bonus_sources) {
@@ -1563,9 +1613,8 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
     if (saved_it == item_by_uid.end()) continue;
     const JsonValue* saved_item = saved_it->second;
     const JsonValue* item_key = ObjectGet(*saved_item, "ItemKey");
-    auto item_it = items_by_key.find(JsonNumberKey(item_key));
-    if (item_it == items_by_key.end()) continue;
-    const JsonValue* item = item_it->second;
+    const JsonValue* item = ItemByKey(JsonNumberKey(item_key));
+    if (!item) continue;
 
     JsonValue all_stats = JsonValue::Array();
     JsonValue bonus_stats = JsonValue::Array();
@@ -1605,7 +1654,6 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
 
 JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
                            const std::map<std::string, const JsonValue*>& item_by_uid,
-                           const std::map<std::string, const JsonValue*>& items_by_key,
                            double& exp_bonus,
                            double& gold_bonus,
                            JsonValue& bonus_sources) {
@@ -1618,17 +1666,9 @@ JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
   ObjectSet(out, "equippedSkillKey", CopyOrEmptyArray(ObjectGet(hero, "equippedSKillKey")));
   if (include_equipment) {
     ObjectSet(out, "equippedItemIds", CopyOrEmptyArray(ObjectGet(hero, "equippedItemIds")));
-    ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+    ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
   }
   return out;
-}
-
-bool LoadItemsByKey(std::map<std::string, const JsonValue*>& items_by_key, JsonValue& items_root) {
-  std::string text;
-  if (!ReadTextFile(ItemsJsonPath(), text)) return false;
-  if (!ParseJson(text, items_root) || items_root.type != JsonValue::Type::Array) return false;
-  items_by_key = IndexArrayByNumberKey(&items_root, "key");
-  return true;
 }
 
 bool LoadSaveRoot(const std::string& json, JsonValue& save) {
@@ -1704,9 +1744,6 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   const JsonValue* attributes = player ? ObjectGet(*player, "attributeSaveDatas") : nullptr;
   const JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
 
-  JsonValue items_root;
-  std::map<std::string, const JsonValue*> items_by_key;
-  LoadItemsByKey(items_by_key, items_root);
   auto hero_by_key = IndexArrayByNumberKey(heroes, "heroKey");
   auto item_by_uid = IndexArrayByNumberKey(item_saves, "UniqueId");
 
@@ -1719,7 +1756,7 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
     for (const auto& hero_key : arranged->array) {
       auto it = hero_by_key.find(JsonNumberKey(&hero_key));
       if (it != hero_by_key.end()) {
-        party.array.push_back(BuildHeroSummary(*it->second, true, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+        party.array.push_back(BuildHeroSummary(*it->second, true, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
       }
     }
   }
@@ -1728,7 +1765,7 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   if (heroes && heroes->type == JsonValue::Type::Array) {
     for (const auto& hero : heroes->array) {
       if (JsonBool(ObjectGet(hero, "IsUnLock"))) {
-        unlocked.array.push_back(BuildHeroSummary(hero, false, item_by_uid, items_by_key, exp_bonus, gold_bonus, bonus_sources));
+        unlocked.array.push_back(BuildHeroSummary(hero, false, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
       }
     }
   }
@@ -1927,6 +1964,7 @@ std::wstring PostJsonPayload(const Config& config, const std::string& payload) {
   HINTERNET session = WinHttpOpen(L"TBH Companion Agent/0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return L"Falha ao abrir WinHTTP.";
+  WinHttpSetTimeouts(session, 10000, 10000, 10000, 10000);
 
   HINTERNET connect = WinHttpConnect(session, host_name.c_str(), parts.nPort, 0);
   if (!connect) {
@@ -1990,11 +2028,16 @@ bool RefreshSaveCache(WorkerState& state) {
   std::wstring path = DefaultSavePath();
   if (!FileMTime(path, mtime)) return false;
   if (state.has_save && SameFileTime(state.save_mtime, mtime)) return false;
+  PostStatus(L"Lendo save...");
   SaveSummary summary;
-  if (!ReadSaveSummary(summary)) return false;
+  if (!ReadSaveSummary(summary)) {
+    PostStatus(L"Falha ao ler save.");
+    return false;
+  }
   state.save = std::move(summary);
   state.save_mtime = mtime;
   state.has_save = true;
+  PostStatus(L"Save lido.");
   return true;
 }
 
@@ -2018,9 +2061,45 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   return true;
 }
 
+std::string WatcherStatusJson(const std::string& message) {
+  JsonValue watcher = JsonValue::Object();
+  ObjectSet(watcher, "source", JsonValue::String("cpp-agent"));
+  ObjectSet(watcher, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
+  ObjectSet(watcher, "message", JsonValue::String(message));
+  return JsonSerialize(watcher);
+}
+
+bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
+  PostStatus(L"Montando payload...");
+  std::string payload = CachedPayload(config, state);
+  std::string hash = Fnv1aHash(payload);
+  if (!force && hash == state.last_payload_hash) return false;
+
+  if (config.server.empty() || config.token.empty()) {
+    state.last_payload_hash = hash;
+    PostStatus(L"Dados atualizados localmente. Configure servidor/token para sync.");
+    return false;
+  }
+
+  PostStatus(L"Enviando sync (" + std::to_wstring(payload.size()) + L" bytes)...");
+  std::wstring result = PostJsonPayload(config, payload);
+  if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
+    state.last_payload_hash = hash;
+    PostStatus(L"Sync OK. Dados enviados.");
+    return true;
+  }
+
+  PostStatus(L"Sync falhou: " + result);
+  return false;
+}
+
 bool EnsureGameRunning() {
+  PostStatus(L"Verificando jogo...");
   DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
-  if (pid) return true;
+  if (pid) {
+    PostStatus(L"Jogo em execução.");
+    return true;
+  }
 
   PostStatus(L"Jogo não encontrado. Abrindo pelo Steam...");
   HINSTANCE result = ShellExecuteW(nullptr, L"open", STEAM_GAME_URI, nullptr, nullptr, SW_SHOWNORMAL);
@@ -2047,10 +2126,11 @@ bool EnsureGameRunning() {
 
 DWORD WINAPI WorkerProc(LPVOID) {
   WorkerState state;
+  state.memory.watcher_json = WatcherStatusJson("worker starting");
   PostStatus(L"Worker iniciado. Monitorando save e memoria.");
   RefreshSaveCache(state);
   bool game_ready = EnsureGameRunning();
-  if (game_ready) RefreshMemoryCache(state, true);
+  bool first_sync_done = false;
 
   while (WaitForSingleObject(g_worker_stop, 1000) == WAIT_TIMEOUT) {
     Config config = LoadConfig();
@@ -2073,8 +2153,6 @@ DWORD WINAPI WorkerProc(LPVOID) {
       continue;
     }
 
-    changed = RefreshMemoryCache(state) || changed;
-
     if (!state.has_save) {
       PostStatus(L"Aguardando save valido.");
       continue;
@@ -2084,23 +2162,14 @@ DWORD WINAPI WorkerProc(LPVOID) {
       SaveConfig(config);
     }
 
-    std::string payload = CachedPayload(config, state);
-    std::string hash = Fnv1aHash(payload);
-    if (!changed && hash == state.last_payload_hash) continue;
-    if (hash == state.last_payload_hash) continue;
-
-    if (config.server.empty() || config.token.empty()) {
-      state.last_payload_hash = hash;
-      PostStatus(L"Dados atualizados localmente. Configure servidor/token para sync.");
-      continue;
+    if (!first_sync_done || changed) {
+      first_sync_done = true;
+      SyncCachedPayload(config, state, true);
     }
 
-    std::wstring result = PostJsonPayload(config, payload);
-    if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
-      state.last_payload_hash = hash;
-      PostStatus(L"Sync OK. Save + memoria enviados.");
-    } else {
-      PostStatus(L"Sync falhou: " + result);
+    changed = RefreshMemoryCache(state) || changed;
+    if (changed) {
+      SyncCachedPayload(config, state);
     }
   }
   PostStatus(L"Worker parado.");
