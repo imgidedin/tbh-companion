@@ -34,6 +34,10 @@ constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
+constexpr UINT WM_APP_TRAY = WM_APP + 2;
+constexpr int IDM_TRAY_OPEN = 2001;
+constexpr int IDM_TRAY_WEB = 2002;
+constexpr int IDM_TRAY_EXIT = 2003;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
@@ -49,6 +53,9 @@ HWND g_status = nullptr;
 HWND g_main_window = nullptr;
 HANDLE g_worker_stop = nullptr;
 HANDLE g_worker_thread = nullptr;
+NOTIFYICONDATAW g_tray{};
+bool g_tray_added = false;
+UINT g_taskbar_created_msg = 0;
 
 std::string Utf8(const std::wstring& text);
 std::wstring CompanionDir();
@@ -139,8 +146,60 @@ std::wstring GetWindowTextString(HWND hwnd) {
   return Trim(value);
 }
 
+void AddTrayIcon(HWND hwnd) {
+  g_tray = {};
+  g_tray.cbSize = sizeof(g_tray);
+  g_tray.hWnd = hwnd;
+  g_tray.uID = 1;
+  g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  g_tray.uCallbackMessage = WM_APP_TRAY;
+  g_tray.hIcon = reinterpret_cast<HICON>(
+      LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+  wcsncpy_s(g_tray.szTip, L"TBH Companion", _TRUNCATE);
+  g_tray_added = Shell_NotifyIconW(NIM_ADD, &g_tray) != FALSE;
+}
+
+void RemoveTrayIcon() {
+  if (!g_tray_added) return;
+  Shell_NotifyIconW(NIM_DELETE, &g_tray);
+  g_tray_added = false;
+}
+
+void UpdateTrayTip(const std::wstring& text) {
+  if (!g_tray_added) return;
+  std::wstring tip = L"TBH Companion\n" + text;
+  g_tray.uFlags = NIF_TIP;
+  wcsncpy_s(g_tray.szTip, tip.c_str(), _TRUNCATE);
+  Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+void ShowTrayBalloon(const std::wstring& title, const std::wstring& text) {
+  if (!g_tray_added) return;
+  g_tray.uFlags = NIF_INFO;
+  wcsncpy_s(g_tray.szInfoTitle, title.c_str(), _TRUNCATE);
+  wcsncpy_s(g_tray.szInfo, text.c_str(), _TRUNCATE);
+  g_tray.dwInfoFlags = NIIF_INFO;
+  Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+void ShowTrayMenu(HWND hwnd) {
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+  AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Configurações");
+  AppendMenuW(menu, MF_STRING, IDM_TRAY_WEB, L"Abrir painel web");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Sair");
+  SetMenuDefaultItem(menu, IDM_TRAY_OPEN, FALSE);
+  POINT pt{};
+  GetCursorPos(&pt);
+  SetForegroundWindow(hwnd);
+  TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+  DestroyMenu(menu);
+}
+
 void SetStatus(const std::wstring& text) {
   SetWindowTextW(g_status, text.c_str());
+  UpdateTrayTip(text);
 }
 
 void PostStatus(const std::wstring& text) {
@@ -2565,6 +2624,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         }
       }
       StartWorker();
+      AddTrayIcon(hwnd);
       return 0;
     }
     case WM_COMMAND: {
@@ -2580,6 +2640,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         Config config = ReadConfigFromUi();
         SaveConfig(config);
         SetStatus(config.auto_start ? L"Inicialização com Windows ativada." : L"Inicialização com Windows desativada.");
+      } else if (id == IDM_TRAY_OPEN) {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+      } else if (id == IDM_TRAY_WEB) {
+        OpenWebUi(LoadConfig());
+      } else if (id == IDM_TRAY_EXIT) {
+        DestroyWindow(hwnd);
       }
       return 0;
     }
@@ -2597,13 +2664,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       SetBkColor(dc, RGB(23, 26, 29));
       return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
     }
+    case WM_APP_TRAY: {
+      UINT event = static_cast<UINT>(LOWORD(lparam));
+      if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK) {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+      } else if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
+        ShowTrayMenu(hwnd);
+      }
+      return 0;
+    }
+    case WM_CLOSE: {
+      // Fechar a janela apenas esconde; o worker continua na bandeja.
+      static bool hint_shown = false;
+      ShowWindow(hwnd, SW_HIDE);
+      if (!hint_shown) {
+        ShowTrayBalloon(L"TBH Companion", L"Continuo rodando em segundo plano. Clique com o botão direito no ícone para sair.");
+        hint_shown = true;
+      }
+      return 0;
+    }
     case WM_DESTROY:
+      RemoveTrayIcon();
       StopWorker();
       if (font) DeleteObject(font);
       if (title_font) DeleteObject(title_font);
       g_main_window = nullptr;
       PostQuitMessage(0);
       return 0;
+  }
+  if (g_taskbar_created_msg && message == g_taskbar_created_msg) {
+    // Explorer reiniciou: recoloca o icone na bandeja.
+    AddTrayIcon(hwnd);
+    return 0;
   }
   return DefWindowProcW(hwnd, message, wparam, lparam);
 }
@@ -2657,6 +2750,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   controls.dwICC = ICC_STANDARD_CLASSES;
   InitCommonControlsEx(&controls);
 
+  g_taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
+
   const wchar_t* class_name = L"TBHCompanionAgentWindow";
   WNDCLASSW wc{};
   wc.lpfnWndProc = WindowProc;
@@ -2680,8 +2775,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   if (small_icon) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
   if (big_icon) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
 
-  ShowWindow(hwnd, show);
-  UpdateWindow(hwnd);
+  // Ja configurado: inicia direto na bandeja. Primeira execucao mostra a janela.
+  Config startup_config = LoadConfig();
+  bool start_hidden = !startup_config.token.empty() || !startup_config.steam_id.empty();
+  if (start_hidden) {
+    ShowTrayBalloon(L"TBH Companion", L"Rodando em segundo plano. Clique no ícone da bandeja para abrir.");
+  } else {
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
+  }
 
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0)) {

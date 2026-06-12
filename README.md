@@ -25,6 +25,7 @@ O app salva configuracao em:
 Atual:
 
 - GUI nativa Win32.
+- Roda na bandeja do sistema: inicia oculto quando ja configurado, fechar a janela apenas esconde, menu de contexto com Configuracoes / Abrir painel web / Sair.
 - Salva automaticamente URL do servidor, token, SteamID e inicializacao com Windows.
 - Le o save ES3 padrao e monta o mesmo resumo gerado pelo worker Python.
 - Embute `items.json` como `items.zip` no exe e extrai para cache por SHA1 quando necessario.
