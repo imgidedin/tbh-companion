@@ -816,6 +816,14 @@ bool StageLabelLess(const std::string& a, const std::string& b) {
   return StageParts(a) < StageParts(b);
 }
 
+std::string DifficultyFromStageKey(long long stage_key) {
+  long long tier = stage_key / 1000;
+  if (tier == 4) return "TORMENT";
+  if (tier == 3) return "HELL";
+  if (tier == 2) return "NIGHTMARE";
+  return "NORMAL";
+}
+
 JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::string& difficulty) {
   struct StageGroup {
     std::vector<MemoryEvent> clears;
@@ -1707,7 +1715,8 @@ std::string JsonEscape(const std::string& input) {
 std::string SavePayload(const Config& config) {
   SaveSummary summary;
   bool has_save = ReadSaveSummary(summary);
-  MemorySnapshot memory = ReadMemorySnapshot("NORMAL");
+  std::string difficulty = has_save ? DifficultyFromStageKey(summary.current_stage_key) : "NORMAL";
+  MemorySnapshot memory = ReadMemorySnapshot(difficulty);
   std::string steam_raw = config.steam_id.empty() ? (summary.steam_id.empty() ? "default" : summary.steam_id) : Utf8(config.steam_id);
   std::string steam = JsonEscape(steam_raw);
   std::string save = "null";
@@ -1890,7 +1899,8 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
     state.memory_pid = pid;
   }
 
-  state.memory = ReadMemorySnapshot("NORMAL", &state.memory_regions, rediscover);
+  std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
+  state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, rediscover);
   state.last_memory_scan = now;
   if (rediscover) state.last_region_discovery = now;
   return true;
