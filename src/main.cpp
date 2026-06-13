@@ -24,12 +24,14 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace {
 
 constexpr int IDC_SERVER = 1001;
 constexpr int IDC_TOKEN = 1002;
 constexpr int IDC_STEAM = 1003;
+constexpr int IDC_PAIRING_SECRET = 1004;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
@@ -48,6 +50,7 @@ HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
 HWND g_token = nullptr;
 HWND g_steam = nullptr;
+HWND g_pairing_secret = nullptr;
 HWND g_autostart = nullptr;
 HWND g_status = nullptr;
 HWND g_main_window = nullptr;
@@ -64,6 +67,7 @@ struct Config {
   std::wstring server = L"https://tbh.gided.in";
   std::wstring token;
   std::wstring steam_id;
+  std::wstring pairing_secret;
   bool auto_start = false;
 };
 
@@ -137,6 +141,7 @@ struct WorkerState {
   DWORD last_memory_scan = 0;
   DWORD last_region_discovery = 0;
   std::string last_payload_hash;
+  std::string last_sync_config_signature;
   std::set<std::string> memory_seen;     // ids ja vistos (historico + baseline)
   bool memory_baseline_ready = false;    // primeira leitura vira baseline e e ignorada
   long long synced_index = -1;     // maior index de evento confirmado pelo servidor
@@ -250,6 +255,63 @@ std::string Fnv1aHash(const std::string& text) {
   return buffer;
 }
 
+std::string HexLower(const std::vector<unsigned char>& bytes) {
+  static const char* digits = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (unsigned char byte : bytes) {
+    out.push_back(digits[(byte >> 4) & 0x0F]);
+    out.push_back(digits[byte & 0x0F]);
+  }
+  return out;
+}
+
+std::string Sha256Hex(const std::string& text) {
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  DWORD object_length = 0;
+  DWORD data_length = 0;
+  std::vector<unsigned char> hash_object;
+  std::vector<unsigned char> digest(32);
+
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+  if (status >= 0) {
+    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length), sizeof(object_length),
+                               &data_length, 0);
+  }
+  if (status >= 0) {
+    hash_object.resize(object_length);
+    status = BCryptCreateHash(alg, &hash, hash_object.data(), object_length, nullptr, 0, 0);
+  }
+  if (status >= 0) {
+    status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(text.data())),
+                            static_cast<ULONG>(text.size()), 0);
+  }
+  if (status >= 0) {
+    status = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+  }
+  if (hash) BCryptDestroyHash(hash);
+  if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+  return status >= 0 ? HexLower(digest) : "";
+}
+
+std::string PairingHash(const Config& config, const std::string& steam_id) {
+  std::string secret = Utf8(config.pairing_secret);
+  if (secret.empty() || steam_id.empty()) return "";
+  return Sha256Hex("TBH Companion Pairing v1:" + steam_id + ":" + secret);
+}
+
+std::string EffectiveSteamId(const Config& config, const WorkerState& state) {
+  std::string steam = Utf8(config.steam_id);
+  if (steam.empty() && !state.save.steam_id.empty()) steam = state.save.steam_id;
+  return steam.empty() ? "default" : steam;
+}
+
+std::string SyncConfigSignature(const Config& config, const WorkerState& state) {
+  std::string steam = EffectiveSteamId(config, state);
+  return Fnv1aHash(Utf8(config.server) + "|" + Utf8(config.token) + "|" + steam + "|" + PairingHash(config, steam));
+}
+
 std::wstring ExePath();
 
 std::wstring ConfigPath() {
@@ -318,6 +380,10 @@ Config LoadConfig() {
 
   GetPrivateProfileStringW(L"player", L"steam_id", L"", buffer, 4096, path.c_str());
   config.steam_id = Trim(buffer);
+
+  GetPrivateProfileStringW(L"player", L"pairing_secret", L"", buffer, 4096, path.c_str());
+  config.pairing_secret = Trim(buffer);
+
   config.auto_start = IsAutoStartEnabled();
 
   return config;
@@ -328,6 +394,7 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"server", L"url", config.server.c_str(), path.c_str());
   WritePrivateProfileStringW(L"server", L"token", config.token.c_str(), path.c_str());
   WritePrivateProfileStringW(L"player", L"steam_id", config.steam_id.c_str(), path.c_str());
+  WritePrivateProfileStringW(L"player", L"pairing_secret", config.pairing_secret.c_str(), path.c_str());
   WritePrivateProfileStringW(L"app", L"auto_start", config.auto_start ? L"1" : L"0", path.c_str());
   SetAutoStart(config.auto_start);
 }
@@ -337,12 +404,13 @@ Config ReadConfigFromUi() {
   config.server = GetWindowTextString(g_server);
   config.token = GetWindowTextString(g_token);
   config.steam_id = GetWindowTextString(g_steam);
+  config.pairing_secret = GetWindowTextString(g_pairing_secret);
   config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
   return config;
 }
 
 bool UiConfigReady() {
-  return g_server && g_token && g_steam && g_autostart;
+  return g_server && g_token && g_steam && g_pairing_secret && g_autostart;
 }
 
 void SaveConfigFromUi() {
@@ -2622,24 +2690,28 @@ std::string SavePayload(const Config& config) {
   if (has_save) {
     save = summary.summary_json;
   }
+  std::string pairing_hash = PairingHash(config, steam_raw);
+  std::string pairing = pairing_hash.empty() ? "null" : ("\"" + pairing_hash + "\"");
   return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
+         ",\"pairingHash\":" + pairing +
          ",\"clears\":" + memory.clears_json +
          ",\"history\":" + memory.history_json +
          ",\"watcher\":" + memory.watcher_json + "}";
 }
 
 std::string CachedPayload(const Config& config, const WorkerState& state, int events_from_index = -1) {
-  std::string steam_raw = Utf8(config.steam_id);
-  if (steam_raw.empty() && !state.save.steam_id.empty()) steam_raw = state.save.steam_id;
-  if (steam_raw.empty()) steam_raw = "default";
+  std::string steam_raw = EffectiveSteamId(config, state);
   std::string steam = JsonEscape(steam_raw);
   std::string save = state.has_save ? state.save.summary_json : "null";
+  std::string pairing_hash = PairingHash(config, steam_raw);
+  std::string pairing = pairing_hash.empty() ? "null" : ("\"" + pairing_hash + "\"");
   std::string history = state.memory.history_json;
   if (events_from_index > 0) {
     std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
     history = JsonSerialize(BuildHistoryJson(state.memory.events, difficulty, events_from_index));
   }
   return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
+         ",\"pairingHash\":" + pairing +
          ",\"clears\":" + state.memory.clears_json +
          ",\"history\":" + history +
          ",\"watcher\":" + state.memory.watcher_json + "}";
@@ -2818,9 +2890,12 @@ bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = fa
   const std::vector<MemoryEvent>& events = state.memory.events;
   // Assinatura estavel do conteudo (sem updatedAt): so envia quando o save
   // muda ou quando ha eventos novos.
+  std::string steam_raw = EffectiveSteamId(config, state);
+  std::string pairing_hash = PairingHash(config, steam_raw);
   std::string signature = Fnv1aHash((state.has_save ? state.save.summary_json : "null") + "|" +
                                     std::to_string(events.size()) + "|" +
-                                    (events.empty() ? "" : events.back().id));
+                                    (events.empty() ? "" : events.back().id) + "|" +
+                                    pairing_hash);
   if (!force && signature == state.last_payload_hash) return false;
 
   if (config.server.empty() || config.token.empty()) {
@@ -2925,9 +3000,13 @@ DWORD WINAPI WorkerProc(LPVOID) {
       SaveConfig(config);
     }
 
-    if (!first_sync_done || changed) {
+    std::string sync_config_signature = SyncConfigSignature(config, state);
+    bool sync_config_changed = first_sync_done && sync_config_signature != state.last_sync_config_signature;
+
+    if (!first_sync_done || changed || sync_config_changed) {
       first_sync_done = true;
       SyncCachedPayload(config, state, true);
+      state.last_sync_config_signature = sync_config_signature;
     }
 
     changed = RefreshMemoryCache(state) || changed;
@@ -3028,12 +3107,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       AddLabel(hwnd, L"SteamID", 24, 176, 120, 22, font);
       g_steam = AddEdit(hwnd, IDC_STEAM, config.steam_id, 144, 172, 430, 28, font);
 
-      g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 210, 220, 24, font);
+      AddLabel(hwnd, L"Chave", 24, 216, 120, 22, font);
+      g_pairing_secret = AddEdit(hwnd, IDC_PAIRING_SECRET, config.pairing_secret, 144, 212, 430, 28, font, true);
 
-      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 250, 120, 34, font);
+      g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 220, 24, font);
+
+      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               24, 310, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
+                               24, 350, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
       SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
       if (config.steam_id.empty()) {
@@ -3052,7 +3134,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     case WM_COMMAND: {
       int id = LOWORD(wparam);
       int notification = HIWORD(wparam);
-      if ((id == IDC_SERVER || id == IDC_TOKEN || id == IDC_STEAM) && notification == EN_CHANGE) {
+      if ((id == IDC_SERVER || id == IDC_TOKEN || id == IDC_STEAM || id == IDC_PAIRING_SECRET) && notification == EN_CHANGE) {
         SaveConfigFromUi();
       } else if (id == IDC_OPEN) {
         Config config = ReadConfigFromUi();
@@ -3198,7 +3280,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
   HWND hwnd = CreateWindowExW(0, class_name, L"TBH Companion",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 430,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 470,
                               nullptr, nullptr, instance, nullptr);
   if (!hwnd) return 1;
 
