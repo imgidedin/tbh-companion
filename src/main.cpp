@@ -2546,6 +2546,18 @@ JsonValue BuildRunesSummary(const JsonValue* runes) {
   return out;
 }
 
+JsonValue BuildMonsterKills(const JsonValue* aggregates) {
+  JsonValue out = JsonValue::Object();
+  if (!aggregates || aggregates->type != JsonValue::Type::Array) return out;
+  for (const auto& row : aggregates->array) {
+    if (static_cast<long long>(JsonNumberDouble(ObjectGet(row, "Type"), -1)) != 0) continue;
+    std::string key = JsonNumberKey(ObjectGet(row, "SubKey"));
+    if (key.empty() || key == "0") continue;
+    ObjectSet(out, key, CopyOrNull(ObjectGet(row, "Value")));
+  }
+  return out;
+}
+
 JsonValue GoldQuantity(const JsonValue* currencies) {
   const JsonValue* gold = FindByNumberKey(currencies, "Key", "100001");
   return CopyOrNull(gold ? ObjectGet(*gold, "Quantity") : nullptr);
@@ -2561,6 +2573,7 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   const JsonValue* runes = player ? ObjectGet(*player, "RuneSaveData") : nullptr;
   const JsonValue* attributes = player ? ObjectGet(*player, "attributeSaveDatas") : nullptr;
   const JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
+  const JsonValue* aggregates = player ? ObjectGet(*player, "aggregateSaveDatas") : nullptr;
 
   auto hero_by_key = IndexArrayByNumberKey(heroes, "heroKey");
   auto item_by_uid = IndexArrayByNumberKey(item_saves, "UniqueId");
@@ -2612,6 +2625,7 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   ObjectSet(out, "attributeLevels", BuildLevelMap(attributes, "Key", "Level"));
   ObjectSet(out, "runeLevels", BuildLevelMap(runes, "RuneKey", "Level"));
   ObjectSet(out, "runes", BuildRunesSummary(runes));
+  ObjectSet(out, "monsterKills", BuildMonsterKills(aggregates));
   ObjectSet(out, "equipmentBonuses", std::move(equipment_bonuses));
   ObjectSet(out, "gold", GoldQuantity(player ? ObjectGet(*player, "currenySaveDatas") : nullptr));
   return out;
