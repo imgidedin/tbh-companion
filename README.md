@@ -14,6 +14,27 @@ Saida:
 build\TBH_Companion.exe
 ```
 
+## Release (build + publicar no GitHub)
+
+Para gerar e publicar uma versao nova de uma vez (com o jogo aberto, para a
+verificacao do mapa na memoria viva):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1
+```
+
+O `release.ps1`:
+
+1. Recalcula o mapa IL2CPP (`refresh_il2cpp_map.py`) para a versao atual do jogo.
+2. Compila o `TBH_Companion.exe` (encerrando antes uma instancia de dev rodando em `build\`).
+3. Descobre a versao do jogo e monta a tag: `<versao>`; se ja existir um release dessa versao, usa `<versao>-1`, `<versao>-2`, ...
+4. Commita as mudancas e envia para o `origin` (https://github.com/imgidedin/tbh-companion.git, adicionado automaticamente se faltar).
+5. Cria o **GitHub Release** na tag com `TBH_Companion.exe` e um `.zip` anexados para download.
+
+Flags: `-SkipMap` (so build+release), `-NoLive` (nao le a memoria do jogo),
+`-Draft` (release como rascunho), `-DryRun` (faz tudo local sem commitar/enviar/publicar),
+`-GameDir "caminho\TaskbarHero"`. Requer `git`, `gh` (autenticado: `gh auth login`) e `py` no PATH.
+
 ## Atualizar o mapa IL2CPP (versao nova do jogo)
 
 O agente le os eventos direto da memoria do jogo usando RVAs/offsets especificos
@@ -33,6 +54,9 @@ amostra dos ultimos eventos) e atualiza automaticamente, entre marcadores:
 - `src/main.cpp` (bloco `IL2CPP MAP` + `kGradeNames`)
 - `../tbh-farm-local-frontend/server.js` (`gradePt`)
 - `../tbh-farm-local-frontend/public/calculator.js` (`HISTORY_GRADE_PT`)
+
+> Dica: o `release.ps1` ja roda este passo. Use o comando acima sozinho quando
+> quiser so atualizar o mapa sem gerar um release.
 
 Opcoes: `--game-dir "caminho\TaskbarHero"`, `--no-live` (so dump, preserva os
 offsets que dependem de verificacao viva), `--dry-run` (so mostra o que mudaria).
