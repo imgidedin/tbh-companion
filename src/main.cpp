@@ -94,6 +94,9 @@ struct MemoryEvent {
   std::string color;
   std::string raw;
   std::string id;
+  std::string category;  // categoria autoritativa: equipment/material/chest/craft/stage/death
+  std::string grade;     // raridade autoritativa (EGradeType): COMMON..COSMIC, "" se nao se aplica
+  int item_key = 0;      // chave do item em items.json (BoxOpenLog), 0 se nao se aplica
   int index = 0;
   long long ts = 0;    // epoch (s) de quando o agente viu o evento pela primeira vez
   int order_key = -1;  // janela de texto de origem no scan (chave transitoria)
@@ -1041,6 +1044,46 @@ std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
   return output;
 }
 
+// Le o nome da classe IL2CPP de um objeto gerenciado (obj -> Il2CppClass -> name).
+std::string ReadObjectClassName(HANDLE process, uintptr_t obj) {
+  uintptr_t klass = ReadPtr(process, obj) & ~uintptr_t(1);
+  uintptr_t name_ptr = ReadPtr(process, klass + 0x10);
+  if (!name_ptr) return "";
+  char buffer[96] = {0};
+  SIZE_T read = 0;
+  if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(name_ptr), buffer, sizeof(buffer) - 1, &read)) {
+    return "";
+  }
+  return std::string(buffer, strnlen(buffer, sizeof(buffer) - 1));
+}
+
+// EGradeType (TaskBarHero 1.00.11) -> nome canonico (mapeado para PT no frontend).
+const char* GradeTypeName(int grade) {
+  switch (grade) {
+    case 0: return "COMMON";
+    case 1: return "UNCOMMON";
+    case 2: return "RARE";
+    case 3: return "LEGENDARY";
+    case 4: return "IMMORTAL";
+    case 5: return "ARCANA";
+    case 6: return "BEYOND";
+    case 7: return "CELESTIAL";
+    case 8: return "DIVINE";
+    case 9: return "COSMIC";
+    default: return "";  // 10 = NONE
+  }
+}
+
+const JsonValue* ItemByKey(const std::string& key);  // definido adiante
+
+// Categoria a partir do "type" do items.json (GEAR/MATERIAL/STAGEBOX).
+std::string CategoryFromItemType(const std::string& item_type) {
+  if (item_type == "GEAR") return "equipment";
+  if (item_type == "MATERIAL") return "material";
+  if (item_type == "STAGEBOX") return "chest";
+  return "";
+}
+
 // Le a List<LogData> do LogManager do jogo via cadeia de ponteiros do mapa
 // IL2CPP. Os eventos vem em ordem de insercao (cronologica) e com o DateTime
 // real de cada um — sem varrer heap, sem adivinhar ordem.
@@ -1095,6 +1138,34 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
       if (parsed.empty()) continue;  // tipo de log que nao acompanhamos (level up, etc.)
       MemoryEvent event = std::move(parsed.front());
       event.ts = ticks ? DotNetTicksToEpoch(ticks) : 0;
+
+      // Enriquecimento autoritativo a partir da classe IL2CPP do log.
+      // BoxOpenLog = item obtido (.ctor(string itemStringKey, EGradeType grade)):
+      // itemStringKey "ItemName_<key>" @0x40, grade @0x48. GetBoxLog = bau.
+      std::string klass_name = ReadObjectClassName(process, obj);
+      if (klass_name == "BoxOpenLog") {
+        std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + 0x40));
+        size_t underscore = item_key_str.rfind(L'_');
+        if (underscore != std::wstring::npos) {
+          std::string key = Utf8(item_key_str.substr(underscore + 1));
+          event.item_key = atoi(key.c_str());
+          if (const JsonValue* item = ItemByKey(key)) {
+            event.category = CategoryFromItemType(JsonStringValue(ObjectGet(*item, "type")));
+          }
+        }
+        int grade_value = 10;
+        ReadInt32(process, obj + 0x48, grade_value);
+        event.grade = GradeTypeName(grade_value);
+      } else if (klass_name == "GetBoxLog") {
+        event.category = "chest";
+      } else if (event.type == "clear" || event.type == "failure") {
+        event.category = "stage";
+      } else if (event.type == "death") {
+        event.category = "death";
+      } else if (event.raw.rfind("Resultado", 0) == 0) {
+        event.category = "craft";
+      }
+
       // O relogio [HH:MM] repete a cada dia; o timestamp real torna o id unico.
       event.id = EventId(event) + (event.ts > 0 ? "|" + std::to_string(event.ts) : "");
       event.index = static_cast<int>(out.size());
@@ -1327,6 +1398,9 @@ JsonValue EventJson(const MemoryEvent& event) {
   if (!event.enemy.empty()) ObjectSet(out, "enemy", JsonValue::String(event.enemy));
   ObjectSet(out, "clock", JsonValue::String(event.clock));
   if (!event.color.empty()) ObjectSet(out, "color", JsonValue::String(event.color));
+  if (!event.category.empty()) ObjectSet(out, "category", JsonValue::String(event.category));
+  if (!event.grade.empty()) ObjectSet(out, "grade", JsonValue::String(event.grade));
+  if (event.item_key > 0) ObjectSet(out, "itemKey", JsonValue::Number(static_cast<long long>(event.item_key)));
   ObjectSet(out, "raw", JsonValue::String(event.raw));
   ObjectSet(out, "id", JsonValue::String(event.id));
   ObjectSet(out, "index", JsonValue::Number(static_cast<long long>(event.index)));
@@ -1733,6 +1807,9 @@ bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
   event.enemy = JsonStringValue(ObjectGet(value, "enemy"));
   event.clock = JsonStringValue(ObjectGet(value, "clock"));
   event.color = JsonStringValue(ObjectGet(value, "color"));
+  event.category = JsonStringValue(ObjectGet(value, "category"));
+  event.grade = JsonStringValue(ObjectGet(value, "grade"));
+  event.item_key = static_cast<int>(JsonNumberDouble(ObjectGet(value, "itemKey")));
   event.raw = JsonStringValue(ObjectGet(value, "raw"));
   event.id = JsonStringValue(ObjectGet(value, "id"));
   if (event.id.empty()) event.id = EventId(event);

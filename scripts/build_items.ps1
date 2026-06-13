@@ -50,6 +50,8 @@ foreach ($item in $items) {
   $slim = [ordered]@{
     key = $item.key
     name = $item.name
+    type = $item.type
+    gearType = $item.gearType
     grade = $item.grade
     parts = $item.parts
     icon = $item.icon
