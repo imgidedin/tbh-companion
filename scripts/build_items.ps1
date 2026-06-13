@@ -1,8 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$ItemsJson,
   [Parameter(Mandatory=$true)][string]$ItemsZip,
-  [Parameter(Mandatory=$true)][string]$ItemsHeader,
-  [Parameter(Mandatory=$true)][string]$ItemsIndex
+  [Parameter(Mandatory=$true)][string]$ItemsHeader
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,26 +40,6 @@ constexpr wchar_t EMBEDDED_ITEMS_SHA1[] = L"$sha";
 "@
 
 [IO.File]::WriteAllText($ItemsHeader, $header, [Text.Encoding]::ASCII)
-
-$items = Get-Content -LiteralPath $ItemsJson -Raw -Encoding UTF8 | ConvertFrom-Json
-$lines = New-Object System.Collections.Generic.List[string]
-foreach ($item in $items) {
-  $key = [string]$item.key
-  if (!$key) { continue }
-  $slim = [ordered]@{
-    key = $item.key
-    name = $item.name
-    type = $item.type
-    gearType = $item.gearType
-    grade = $item.grade
-    parts = $item.parts
-    icon = $item.icon
-    level = $item.level
-    variant = $item.variant
-    stats = $item.stats
-  }
-  $json = ConvertTo-Json $slim -Depth 12 -Compress
-  $lines.Add($key + "`t" + $json)
-}
-
-[IO.File]::WriteAllLines($ItemsIndex, $lines, [Text.Encoding]::UTF8)
+# O agente le as definicoes direto do items.json extraido do items.zip embutido
+# (ItemByKey), entao nao geramos mais um indice cru — isso mantinha ~2.3MB a mais
+# dentro do exe.

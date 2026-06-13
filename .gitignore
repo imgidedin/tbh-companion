@@ -5,3 +5,4 @@ scripts/.cache/
 *.pdb
 *.ilk
 *.log
+res/items_index.txt

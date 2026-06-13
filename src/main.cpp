@@ -2255,41 +2255,27 @@ JsonValue BuildBonusSource(const JsonValue& hero, const JsonValue* item, const J
 }
 
 const JsonValue* ItemByKey(const std::string& key) {
+  // Carrega as definicoes do items.json (extraido do items.zip embutido) uma
+  // vez e indexa por key. Antes embutiamos um indice .txt cru de ~2.3MB no exe;
+  // reusar o zip (181KB) e descompactar reduz o binario em ~2MB.
   static bool loaded = false;
-  static std::map<std::string, std::string> item_json_by_key;
-  static std::map<std::string, JsonValue> parsed_items;
+  static JsonValue items_array;  // mantem o array parseado vivo (ponteiros estaveis)
+  static std::map<std::string, const JsonValue*> by_key;
 
   if (!loaded) {
     loaded = true;
-    HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_ITEMS_INDEX), RT_RCDATA);
-    HGLOBAL handle = resource ? LoadResource(nullptr, resource) : nullptr;
-    const char* data = handle ? static_cast<const char*>(LockResource(handle)) : nullptr;
-    DWORD size = resource ? SizeofResource(nullptr, resource) : 0;
-    if (data && size) {
-      std::string text(data, data + size);
-      size_t start = 0;
-      while (start < text.size()) {
-        size_t end = text.find('\n', start);
-        std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        size_t tab = line.find('\t');
-        if (tab != std::string::npos) {
-          item_json_by_key[line.substr(0, tab)] = line.substr(tab + 1);
-        }
-        if (end == std::string::npos) break;
-        start = end + 1;
+    std::string text;
+    if (ReadTextFile(ItemsJsonPath(), text) && ParseJson(text, items_array) &&
+        items_array.type == JsonValue::Type::Array) {
+      for (const auto& item : items_array.array) {
+        std::string k = JsonNumberKey(ObjectGet(item, "key"));
+        if (!k.empty()) by_key.emplace(k, &item);
       }
     }
   }
 
-  auto parsed = parsed_items.find(key);
-  if (parsed != parsed_items.end()) return &parsed->second;
-  auto raw = item_json_by_key.find(key);
-  if (raw == item_json_by_key.end()) return nullptr;
-  JsonValue item;
-  if (!ParseJson(raw->second, item)) return nullptr;
-  auto inserted = parsed_items.insert({key, std::move(item)});
-  return &inserted.first->second;
+  auto it = by_key.find(key);
+  return it == by_key.end() ? nullptr : it->second;
 }
 
 JsonValue BuildEquippedItems(const JsonValue& hero,

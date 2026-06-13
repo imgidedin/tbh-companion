@@ -2,4 +2,3 @@
 
 IDI_APPICON ICON "..\\res\\app.ico"
 IDR_ITEMS_ZIP RCDATA "..\\res\\items.zip"
-IDR_ITEMS_INDEX RCDATA "..\\res\\items_index.txt"
