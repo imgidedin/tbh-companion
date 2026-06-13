@@ -764,10 +764,33 @@ std::string CleanEventRaw(const std::wstring& input) {
   return Utf8(out);
 }
 
+// Texto interno do primeiro <color=#...>...</color> (nome do item principal nos
+// logs de cubo), com markup interno removido.
+std::string FirstColoredText(const std::wstring& text) {
+  size_t open = text.find(L"<color=#");
+  if (open == std::wstring::npos) return "";
+  size_t gt = text.find(L'>', open);
+  if (gt == std::wstring::npos) return "";
+  size_t close = text.find(L"</color>", gt);
+  if (close == std::wstring::npos) return "";
+  return CleanMarkupUtf8(text.substr(gt + 1, close - gt - 1));
+}
+
+// Relogio "HH:MM" extraido do sufixo " <voffset...>[HH:MM]...".
+std::string ExtractClockSuffix(const std::wstring& text) {
+  size_t rb = text.rfind(L']');
+  if (rb == std::wstring::npos) return "";
+  size_t lb = text.rfind(L'[', rb);
+  if (lb == std::wstring::npos || rb <= lb) return "";
+  std::wstring inner = text.substr(lb + 1, rb - lb - 1);
+  return (inner.size() >= 4 && inner.find(L':') != std::wstring::npos) ? Utf8(inner) : "";
+}
+
 std::string EventId(const MemoryEvent& event) {
   if (event.type == "clear") return "clear|" + event.label + "|" + std::to_string(event.seconds) + "|" + event.clock;
   if (event.type == "failure") return "failure|" + event.label + "|" + event.progress + "|" + event.clock;
   if (event.type == "death") return "death|" + event.hero + "|" + event.enemy + "|" + event.clock;
+  if (event.type == "craft") return "craft|" + event.category + "|" + event.item + "|" + event.clock;
   if (event.type == "drop") {
     bool craft = event.raw.rfind("Resultado", 0) == 0;
     return std::string(craft ? "craft|" : "drop|") + event.item + "|" + event.clock;
@@ -1087,6 +1110,22 @@ std::string CategoryFromItemType(const std::string& item_type) {
   return "";
 }
 
+// Familia de logs de cubo -> categoria do evento (type "craft"). Vazio se a
+// classe nao for de cubo. Todas tem item key @0x40 e grade @0x48 (como
+// BoxOpenLog), exceto a sintese (so dois EGradeType @0x40/@0x44).
+std::string CubeLogCategory(const std::string& klass) {
+  if (klass == "CubeCraftingLog" || klass == "CubeAlchemyLog" ||
+      klass == "CubeExtractionLog" || klass == "CubeOfferingLog") {
+    return "craft";
+  }
+  if (klass == "CubeSynthesisLog") return "synthesis";
+  if (klass == "CubeDecorationLog" || klass == "CubeEngravingLog" ||
+      klass == "CubeInscriptionLog") {
+    return "decoration";
+  }
+  return "";
+}
+
 // Le a List<LogData> do LogManager do jogo via cadeia de ponteiros do mapa
 // IL2CPP. Os eventos vem em ordem de insercao (cronologica) e com o DateTime
 // real de cada um — sem varrer heap, sem adivinhar ordem.
@@ -1136,16 +1175,51 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
       unsigned long long ticks = 0;
       ReadProcessMemory(process, reinterpret_cast<LPCVOID>(obj + kLogDataDateTimeOffset), &ticks,
                         sizeof(ticks), &read);
+      std::string klass_name = ReadObjectClassName(process, obj);
+      long long stamp = ticks ? DotNetTicksToEpoch(ticks) : 0;
+
+      // Familia de cubo (fabricacao/sintese/decoracao/...): o texto nao casa com
+      // os regexes de evento, entao montamos direto a partir da classe IL2CPP +
+      // campos estruturados (item key @0x40, grade @0x48; sintese usa @0x44).
+      std::string cube_category = CubeLogCategory(klass_name);
+      if (!cube_category.empty()) {
+        std::wstring full = text + clock_suffix;
+        MemoryEvent event;
+        event.type = "craft";
+        event.category = cube_category;
+        event.color = ExtractColorTag(full);
+        event.raw = CleanEventRaw(full);
+        event.clock = ExtractClockSuffix(clock_suffix);
+        event.ts = stamp;
+        int grade_value = 10;
+        if (klass_name == "CubeSynthesisLog") {
+          ReadInt32(process, obj + 0x44, grade_value);  // afterGrade (grau resultante)
+          // Sintese nao tem item; o titulo usa o texto cru ("Grau X consumido...").
+        } else {
+          event.item = FirstColoredText(text);  // nome principal (item fabricado/decorado)
+          std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + kBoxOpenItemKeyOffset));
+          size_t underscore = item_key_str.rfind(L'_');
+          if (underscore != std::wstring::npos) {
+            event.item_key = atoi(Utf8(item_key_str.substr(underscore + 1)).c_str());
+          }
+          ReadInt32(process, obj + kBoxOpenGradeOffset, grade_value);
+        }
+        event.grade = GradeTypeName(grade_value);
+        event.id = EventId(event) + (event.ts > 0 ? "|" + std::to_string(event.ts) : "");
+        event.index = static_cast<int>(out.size());
+        out.push_back(std::move(event));
+        continue;
+      }
+
       std::vector<MemoryEvent> parsed;
       AppendRegexEvents(parsed, text + clock_suffix);
       if (parsed.empty()) continue;  // tipo de log que nao acompanhamos (level up, etc.)
       MemoryEvent event = std::move(parsed.front());
-      event.ts = ticks ? DotNetTicksToEpoch(ticks) : 0;
+      event.ts = stamp;
 
       // Enriquecimento autoritativo a partir da classe IL2CPP do log.
       // BoxOpenLog = item obtido (.ctor(string itemStringKey, EGradeType grade)):
       // itemStringKey "ItemName_<key>" @0x40, grade @0x48. GetBoxLog = bau.
-      std::string klass_name = ReadObjectClassName(process, obj);
       if (klass_name == "BoxOpenLog") {
         std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + kBoxOpenItemKeyOffset));
         size_t underscore = item_key_str.rfind(L'_');
@@ -1165,8 +1239,6 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
         event.category = "stage";
       } else if (event.type == "death") {
         event.category = "death";
-      } else if (event.raw.rfind("Resultado", 0) == 0) {
-        event.category = "craft";
       }
 
       // O relogio [HH:MM] repete a cada dia; o timestamp real torna o id unico.
