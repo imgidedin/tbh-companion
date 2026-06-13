@@ -94,6 +94,7 @@ struct MemoryEvent {
   std::string raw;
   std::string id;
   int index = 0;
+  int order_key = -1;  // chave de ordenacao transitoria (minutos, com ajuste de meia-noite)
 };
 
 int EventClockKey(const MemoryEvent& event) {
@@ -131,6 +132,8 @@ struct WorkerState {
   DWORD last_memory_scan = 0;
   DWORD last_region_discovery = 0;
   std::string last_payload_hash;
+  long long synced_index = -1;     // maior index de evento confirmado pelo servidor
+  std::string synced_first_id;     // detecta reset/reordenacao do historico local
 };
 
 std::wstring Trim(std::wstring value) {
@@ -850,6 +853,7 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
   static const std::wregex drop_re(
       LR"((?:(?:Resultado de fabricação:\s*(?:<color=#[0-9A-Fa-f]+>)?([^<.]{2,80})(?:</color>)?)|(?:<color=#[0-9A-Fa-f]+>)?([A-ZÁÉÍÓÚÃÕÂÊÔÇ][A-Za-zÁÉÍÓÚáéíóúÃÕãõÂÊÔâêôÇç0-9'’+ -]{1,80})(?:</color>)?\s+obtido)\.(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)");
 
+  std::vector<std::pair<size_t, MemoryEvent>> found;
   auto add_matches = [&](const std::wregex& regex, const std::string& type) {
     for (std::wsregex_iterator it(text.begin(), text.end(), regex), end; it != end; ++it) {
       const std::wsmatch& match = *it;
@@ -881,7 +885,7 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
         }
       }
       event.id = EventId(event);
-      events.push_back(std::move(event));
+      found.emplace_back(static_cast<size_t>(match.position(0)), std::move(event));
     }
   };
 
@@ -889,6 +893,30 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
   if (mask & kEventFailure) add_matches(fail_re, "failure");
   if (mask & kEventDeath) add_matches(death_re, "death");
   if (mask & kEventDrop) add_matches(drop_re, "drop");
+
+  // O buffer de log do jogo e cronologico: ordena pela posicao no texto para
+  // intercalar corretamente os tipos de evento.
+  std::stable_sort(found.begin(), found.end(),
+                   [](const std::pair<size_t, MemoryEvent>& a, const std::pair<size_t, MemoryEvent>& b) {
+                     return a.first < b.first;
+                   });
+
+  // Atribui chave de ordenacao pelo relogio [HH:MM], com ajuste de virada de
+  // meia-noite; eventos sem relogio herdam a chave do evento anterior no texto.
+  int day_offset = 0;
+  int prev_raw = -1;
+  int prev_key = -1;
+  for (auto& item : found) {
+    MemoryEvent& event = item.second;
+    int raw_key = EventClockKey(event);
+    if (raw_key >= 0) {
+      if (prev_raw >= 0 && raw_key + 360 < prev_raw) day_offset += 24 * 60;
+      prev_raw = raw_key;
+      prev_key = raw_key + day_offset;
+    }
+    event.order_key = prev_key;
+    events.push_back(std::move(event));
+  }
 }
 
 std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
@@ -904,6 +932,15 @@ std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
     output.push_back(std::move(copy));
   }
   return output;
+}
+
+// Ordena cronologicamente os eventos de um snapshot: a ordem dentro de cada
+// trecho de texto ja e cronologica, e o order_key (relogio) reconcilia trechos
+// e regioes lidos em ordem arbitraria.
+std::vector<MemoryEvent> FinalizeScanEvents(std::vector<MemoryEvent>& events) {
+  std::stable_sort(events.begin(), events.end(),
+                   [](const MemoryEvent& a, const MemoryEvent& b) { return a.order_key < b.order_key; });
+  return UniqueEvents(events);
 }
 
 std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
@@ -985,7 +1022,7 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
     if (!cached_region_limit) {
       *cached_regions = std::move(still_valid);
     }
-    return UniqueEvents(events);
+    return FinalizeScanEvents(events);
   }
 
   if (cached_regions && discover_regions) cached_regions->clear();
@@ -1038,7 +1075,7 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
       cached_regions->push_back(candidate.region);
     }
   }
-  return UniqueEvents(events);
+  return FinalizeScanEvents(events);
 }
 
 JsonValue EventJson(const MemoryEvent& event) {
@@ -1082,7 +1119,8 @@ std::string DifficultyFromStageKey(long long stage_key) {
   return "NORMAL";
 }
 
-JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::string& difficulty) {
+JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::string& difficulty,
+                           int events_from_index = -1) {
   struct StageGroup {
     std::vector<MemoryEvent> clears;
     std::vector<MemoryEvent> failures;
@@ -1202,7 +1240,10 @@ JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::st
   }
 
   JsonValue event_json = JsonValue::Array();
-  for (const auto& event : events) event_json.array.push_back(EventJson(event));
+  for (const auto& event : events) {
+    if (events_from_index >= 0 && event.index < events_from_index) continue;
+    event_json.array.push_back(EventJson(event));
+  }
 
   JsonValue totals = JsonValue::Object();
   ObjectSet(totals, "clears", JsonValue::Number(static_cast<long long>(total_clears)));
@@ -1214,6 +1255,9 @@ JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::st
   ObjectSet(out, "source", JsonValue::String("memory"));
   ObjectSet(out, "kind", JsonValue::String("log-history"));
   ObjectSet(out, "difficulty", JsonValue::String(difficulty));
+  // partial=true: o array "events" contem apenas eventos novos; o servidor
+  // mescla por id sem apagar os ja registrados. Resumos/totais sao completos.
+  if (events_from_index >= 0) ObjectSet(out, "partial", JsonValue::Bool(true));
   ObjectSet(out, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
   ObjectSet(out, "lastEvent", events.empty() ? JsonValue::Null() : EventJson(events.back()));
   ObjectSet(out, "total", JsonValue::Number(static_cast<long long>(events.size())));
@@ -1476,6 +1520,26 @@ bool LoadMemoryHistoryCache(MemorySnapshot& snapshot, const std::string& difficu
 void SaveMemoryHistoryCache(const MemorySnapshot& snapshot) {
   if (snapshot.history_json.empty() || snapshot.history_json == "null") return;
   WriteTextFile(MemoryHistoryPath(), Widen(snapshot.history_json));
+}
+
+std::wstring SyncStatePath() {
+  return CompanionDir() + L"\\sync-state.json";
+}
+
+void LoadSyncState(WorkerState& state) {
+  std::string text;
+  if (!ReadTextFile(SyncStatePath(), text)) return;
+  JsonValue root;
+  if (!ParseJson(text, root)) return;
+  state.synced_index = static_cast<long long>(JsonNumberDouble(ObjectGet(root, "lastIndex"), -1));
+  state.synced_first_id = JsonStringValue(ObjectGet(root, "firstId"));
+}
+
+void SaveSyncState(const WorkerState& state) {
+  JsonValue root = JsonValue::Object();
+  ObjectSet(root, "lastIndex", JsonValue::Number(state.synced_index));
+  ObjectSet(root, "firstId", JsonValue::String(state.synced_first_id));
+  WriteTextFile(SyncStatePath(), Widen(JsonSerialize(root)));
 }
 
 std::wstring TempComparePath() {
@@ -2186,15 +2250,20 @@ std::string SavePayload(const Config& config) {
          ",\"watcher\":" + memory.watcher_json + "}";
 }
 
-std::string CachedPayload(const Config& config, const WorkerState& state) {
+std::string CachedPayload(const Config& config, const WorkerState& state, int events_from_index = -1) {
   std::string steam_raw = Utf8(config.steam_id);
   if (steam_raw.empty() && !state.save.steam_id.empty()) steam_raw = state.save.steam_id;
   if (steam_raw.empty()) steam_raw = "default";
   std::string steam = JsonEscape(steam_raw);
   std::string save = state.has_save ? state.save.summary_json : "null";
+  std::string history = state.memory.history_json;
+  if (events_from_index > 0) {
+    std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
+    history = JsonSerialize(BuildHistoryJson(state.memory.events, difficulty, events_from_index));
+  }
   return "{\"steamId\":\"" + steam + "\",\"siteId\":\"" + steam + "\",\"save\":" + save +
          ",\"clears\":" + state.memory.clears_json +
-         ",\"history\":" + state.memory.history_json +
+         ",\"history\":" + history +
          ",\"watcher\":" + state.memory.watcher_json + "}";
 }
 
@@ -2357,10 +2426,12 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   if (process_changed) {
     state.memory_regions.clear();
     state.memory_pid = pid;
-    if (pid && LoadMemoryRegionCache(pid, state.memory_regions)) {
-      state.last_region_discovery = now;
-      PostStatus(L"Cache de memoria carregado (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
-      if (LoadMemoryHistoryCache(state.memory, difficulty)) {
+    if (pid) {
+      if (LoadMemoryRegionCache(pid, state.memory_regions)) {
+        state.last_region_discovery = now;
+        PostStatus(L"Cache de memoria carregado (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
+      }
+      if (state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, difficulty)) {
         PostStatus(L"Historico de memoria local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
       }
     }
@@ -2380,7 +2451,10 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
     scan_start = GetTickCount();
     state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, true);
     rediscover = true;
-  } else if (!rediscover) {
+  }
+  // Sempre mescla com o historico anterior: a ordem e os indices dos eventos
+  // ja conhecidos nunca mudam; novos eventos sao apenas anexados ao final.
+  if (!previous_memory.events.empty()) {
     state.memory.events = MergeMemoryEvents(previous_memory.events, state.memory.events);
     RebuildMemorySnapshotJson(state.memory, difficulty);
   }
@@ -2411,22 +2485,39 @@ std::string WatcherStatusJson(const std::string& message) {
 }
 
 bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
-  PostStatus(L"Montando payload...");
-  std::string payload = CachedPayload(config, state);
-  std::string hash = Fnv1aHash(payload);
-  if (!force && hash == state.last_payload_hash) return false;
+  const std::vector<MemoryEvent>& events = state.memory.events;
+  // Assinatura estavel do conteudo (sem updatedAt): so envia quando o save
+  // muda ou quando ha eventos novos.
+  std::string signature = Fnv1aHash((state.has_save ? state.save.summary_json : "null") + "|" +
+                                    std::to_string(events.size()) + "|" +
+                                    (events.empty() ? "" : events.back().id));
+  if (!force && signature == state.last_payload_hash) return false;
 
   if (config.server.empty() || config.token.empty()) {
-    state.last_payload_hash = hash;
+    state.last_payload_hash = signature;
     PostStatus(L"Dados atualizados localmente. Configure servidor/token para sync.");
     return false;
   }
 
-  PostStatus(L"Enviando sync (" + std::to_wstring(payload.size()) + L" bytes)...");
+  // Envio incremental: manda apenas eventos com index > synced_index. Se o
+  // historico local foi resetado/reordenado (firstId mudou), reenvia tudo.
+  int from_index = 0;
+  if (state.synced_index >= 0 && !events.empty() && state.synced_first_id == events.front().id) {
+    from_index = static_cast<int>((std::min)(state.synced_index + 1, static_cast<long long>(events.size())));
+  }
+  long long new_events = static_cast<long long>(events.size()) - from_index;
+
+  PostStatus(L"Montando payload...");
+  std::string payload = CachedPayload(config, state, from_index);
+  PostStatus(L"Enviando sync (" + std::to_wstring(payload.size()) + L" bytes, " +
+             std::to_wstring(new_events) + L" eventos novos)...");
   std::wstring result = PostJsonPayload(config, payload);
   if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
-    state.last_payload_hash = hash;
-    PostStatus(L"Sync OK. Dados enviados.");
+    state.last_payload_hash = signature;
+    state.synced_index = events.empty() ? -1 : events.back().index;
+    state.synced_first_id = events.empty() ? "" : events.front().id;
+    SaveSyncState(state);
+    PostStatus(L"Sync OK (" + std::to_wstring(new_events) + L" eventos novos enviados).");
     return true;
   }
 
@@ -2468,6 +2559,7 @@ bool EnsureGameRunning() {
 DWORD WINAPI WorkerProc(LPVOID) {
   WorkerState state;
   state.memory.watcher_json = WatcherStatusJson("worker starting");
+  LoadSyncState(state);
   PostStatus(L"Worker iniciado. Monitorando save e memoria.");
   RefreshSaveCache(state);
   bool game_ready = EnsureGameRunning();
