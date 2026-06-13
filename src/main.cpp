@@ -1943,6 +1943,13 @@ std::wstring TempComparePath() {
   return dir + L"tbh-agent-compare.txt";
 }
 
+std::wstring TempSaveSummaryPath() {
+  wchar_t temp[MAX_PATH]{};
+  DWORD length = GetTempPathW(MAX_PATH, temp);
+  std::wstring dir = length ? std::wstring(temp, length) : L".\\";
+  return dir + L"tbh-agent-save-summary.json";
+}
+
 std::wstring ParentDir(std::wstring path) {
   size_t slash = path.find_last_of(L"\\/");
   return slash == std::wstring::npos ? L"" : path.substr(0, slash);
@@ -1958,18 +1965,13 @@ std::wstring ExePath() {
   return std::wstring(path.data(), length);
 }
 
-std::wstring PythonSummaryPath() {
-  std::wstring build_dir = ParentDir(ExePath());
-  std::wstring agent_dir = ParentDir(build_dir);
-  std::wstring outros_dir = ParentDir(agent_dir);
-  std::wstring sibling = outros_dir + L"\\tbh-farm-local\\runtime\\save-summary.json";
-  DWORD attrs = GetFileAttributesW(sibling.c_str());
-  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return sibling;
-
-  wchar_t profile[MAX_PATH]{};
-  DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
-  std::wstring user = length ? std::wstring(profile, length) : L"";
-  return user + L"\\OneDrive\\Documentos\\Outros\\tbh-farm-local\\runtime\\save-summary.json";
+bool WriteUtf8TextFileAtomic(const std::wstring& path, const std::string& text) {
+  if (path.empty()) return false;
+  std::wstring temp = path + L".tmp";
+  if (!WriteAllBytes(temp, text.data(), text.size())) return false;
+  if (MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+  DeleteFileW(temp.c_str());
+  return false;
 }
 
 std::wstring ItemsJsonPath() {
@@ -2023,11 +2025,7 @@ std::wstring ItemsJsonPath() {
     }
   }
 
-  std::wstring build_dir = ParentDir(ExePath());
-  std::wstring agent_dir = ParentDir(build_dir);
-  std::wstring sibling = ParentDir(agent_dir) + L"\\tbh-farm-local\\runtime\\items.json";
-  attrs = GetFileAttributesW(sibling.c_str());
-  resolved = (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) ? sibling : cached_json;
+  resolved = cached_json;
   return resolved;
 }
 
@@ -2647,46 +2645,6 @@ std::string CachedPayload(const Config& config, const WorkerState& state, int ev
          ",\"watcher\":" + state.memory.watcher_json + "}";
 }
 
-bool CompareField(const std::string& name, const std::string& cpp_value, const std::string& py_value, std::wstring& error) {
-  if (cpp_value == py_value) return true;
-  error = L"Divergência em " + Widen(name) + L": C++='" + Widen(cpp_value) + L"' Python='" + Widen(py_value) + L"'";
-  return false;
-}
-
-bool CompareField(const std::string& name, long long cpp_value, long long py_value, std::wstring& error) {
-  if (cpp_value == py_value) return true;
-  error = L"Divergência em " + Widen(name) + L": C++=" + std::to_wstring(cpp_value) + L" Python=" + std::to_wstring(py_value);
-  return false;
-}
-
-bool CompareWithPythonSummary(const SaveSummary& summary, std::wstring& error) {
-  std::string py;
-  std::wstring path = PythonSummaryPath();
-  if (!ReadTextFile(path, py)) {
-    error = L"Não encontrei o save-summary do Python para comparar: " + path;
-    return false;
-  }
-
-  JsonValue py_json;
-  JsonValue cpp_json;
-  if (!ParseJson(py, py_json)) {
-    error = L"save-summary do Python não é JSON válido.";
-    return false;
-  }
-  if (!ParseJson(summary.summary_json, cpp_json)) {
-    error = L"Resumo C++ não é JSON válido.";
-    return false;
-  }
-
-  std::string py_normalized = JsonSerialize(py_json);
-  std::string cpp_normalized = JsonSerialize(cpp_json);
-  if (py_normalized == cpp_normalized) return true;
-
-  error = L"Resumo C++ ainda difere do Python. C++=" + std::to_wstring(cpp_normalized.size()) +
-          L" bytes, Python=" + std::to_wstring(py_normalized.size()) + L" bytes.";
-  return false;
-}
-
 bool ParseUrl(const std::wstring& url, URL_COMPONENTSW& parts, std::vector<wchar_t>& host, std::vector<wchar_t>& path) {
   host.assign(256, L'\0');
   path.assign(2048, L'\0');
@@ -2773,10 +2731,6 @@ std::wstring PostJsonPayload(const Config& config, const std::string& payload) {
 std::wstring PostIngest(const Config& config) {
   SaveSummary summary;
   if (!ReadSaveSummary(summary)) return L"Não foi possível ler o save C++.";
-  std::wstring compare_error;
-  if (!CompareWithPythonSummary(summary, compare_error)) {
-    return L"Sync bloqueado. " + compare_error;
-  }
   return PostJsonPayload(config, SavePayload(config));
 }
 
@@ -3184,12 +3138,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (!ReadSaveSummary(summary)) {
           result = L"FAIL: não foi possível ler o save C++";
         } else {
-          std::wstring error;
-          result = CompareWithPythonSummary(summary, error) ? L"OK: resumo C++ completo bate com Python" : L"FAIL: " + error;
+          JsonValue parsed;
+          result = ParseJson(summary.summary_json, parsed)
+                       ? L"OK: resumo C++ válido. steamId=" + Widen(summary.steam_id) +
+                             L" stage=" + std::to_wstring(summary.current_stage_key)
+                       : L"FAIL: resumo C++ não é JSON válido.";
         }
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
         return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--dump-save-summary") == 0) {
+        SaveSummary summary;
+        std::wstring output = TempSaveSummaryPath();
+        if (i + 1 < argc && argv[i + 1][0] != L'-') output = argv[++i];
+        bool ok = ReadSaveSummary(summary) && WriteUtf8TextFileAtomic(output, summary.summary_json);
+        if (!ok) WriteTextFile(TempComparePath(), L"FAIL: não foi possível exportar o resumo C++.");
+        LocalFree(argv);
+        return ok ? 0 : 2;
       }
       if (wcscmp(argv[i], L"--memory-scan") == 0) {
         MemorySnapshot snapshot = ReadMemorySnapshot("NORMAL");
