@@ -521,6 +521,8 @@ def main() -> int:
     ap.add_argument("--game-dir", help="pasta do TaskBarHero (com GameAssembly.dll)")
     ap.add_argument("--no-live", action="store_true", help="nao verificar na memoria do jogo")
     ap.add_argument("--dry-run", action="store_true", help="so mostra o que mudaria")
+    ap.add_argument("--print-version", action="store_true",
+                    help="so imprime a versao do jogo (sem dump/patch) e sai")
     args = ap.parse_args()
 
     if sys.platform != "win32":
@@ -528,6 +530,9 @@ def main() -> int:
 
     game_dir = find_game_dir(args.game_dir)
     version = game_version(game_dir)
+    if args.print_version:
+        print(version)
+        return 0
     print(f"[*] Jogo: {game_dir}  (versao {version})")
 
     dumper = ensure_dumper()
