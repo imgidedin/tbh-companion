@@ -1,6 +1,9 @@
 build/
 dist/
 scripts/.cache/
+exported-assets/
+scripts/exported-assets/
+.tools/
 *.obj
 *.pdb
 *.ilk

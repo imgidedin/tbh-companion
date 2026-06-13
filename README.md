@@ -63,6 +63,48 @@ offsets que dependem de verificacao viva), `--dry-run` (so mostra o que mudaria)
 Depois: `build.bat`, reinicie o agente e suba o frontend. Se o enum de raridade
 ganhar um grade novo, o script avisa para preencher a traducao PT em `GRADE_PT`.
 
+## Exportar assets Unity (dev/manual)
+
+Para extrair sprites/artwork do jogo para uma arvore local facil de portar para
+o frontend, exporte o jogo pelo AssetRipper GUI e depois organize o
+`ExportedProject` gerado:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\export_unity_assets.ps1 -OrganizeExportedProject "C:\caminho\ExportedProject"
+```
+
+O script gera `exported-assets\TaskBarHero-<versao>\frontend-pack\`, com:
+
+- `images\`: PNGs separados em heroes, pets, monsters, items, stages,
+  skills-effects, ui, fonts e misc.
+- `data\raw-csv\`: CSVs originais extraidos de `TextAsset`.
+- `data\json\`: JSONs dos dados principais (`HeroInfoData`, `MonsterInfoData`,
+  `PetInfoData`, `StageInfoData`, `ItemInfoData`, etc.).
+- `data\localization\extracted\`: traducoes oficiais extraidas dos bundles
+  Addressables do jogo (`en-US` e `pt-BR`) em JSON e TSV.
+- `audio\`: sons extraidos de `AudioClip`.
+- `contact-sheets\`: folhas de contato para revisar visualmente os assets.
+
+Por padrao, sem flags, ele so detecta o jogo/versao e mostra o plano:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\export_unity_assets.ps1
+```
+
+A trava para nao exportar duas vezes a mesma versao esta pronta, mas desligada
+por enquanto. Quando quiser validar esse comportamento, adicione
+`-EnforceVersionGuard`; se precisar sobrescrever uma exportacao existente, use
+tambem `-Force`.
+
+Tambem existe um modo CLI experimental (`-Enable -ExporterExe ...`), mas o fluxo
+principal hoje e AssetRipper GUI + `-OrganizeExportedProject`.
+
+A extracao de localization usa Python + `UnityPy` para ler os bundles em
+`TaskBarHero_Data\StreamingAssets\aa\StandaloneWindows64`. O script tenta achar
+Python automaticamente e instala `UnityPy` se faltar. Se precisar apontar um
+Python especifico, use `-PythonExe`; para pular essa etapa temporariamente, use
+`-SkipLocalizationBundleExtract`.
+
 ## Config
 
 O app salva configuracao em:
