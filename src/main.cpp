@@ -885,21 +885,34 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 }
 
 // ===== Leitura direta do LogManager via mapa IL2CPP =====
-// Mapa extraido (dev-time) de GameAssembly.dll + global-metadata.dat com o
-// Il2CppDumper para TaskBarHero 1.00.11:
-//   nn<LogManager>_TypeInfo  RVA 0x57E3118 (singleton base class)
-//   nn<T>.bbwm (instancia)   static field @0x0
-//   LogManager.beqe          List<LogData> @0x20 (ordem de insercao, max 2000)
-//   LogData.bepz (texto)     string @0x20
-//   LogData.beqa (relogio)   string @0x28 (sufixo " <voffset...>[HH:MM]...")
-//   LogData.beqb (DateTime)  @0x30 (ticks .NET, hora local, kind nos 2 bits altos)
-// Se o jogo atualizar, basta rodar o Il2CppDumper de novo e revisar os valores.
+// O bloco abaixo entre os marcadores BEGIN/END e GERADO automaticamente por
+// scripts/refresh_il2cpp_map.py (Il2CppDumper + verificacao na memoria viva).
+// Quando o jogo atualizar, rode esse script e recompile. NAO edite a mao.
+//
+//   nn<LogManager>_TypeInfo : RVA do singleton base do LogManager
+//   StaticFieldsOffset      : Il2CppClass.static_fields (depende da versao do il2cpp)
+//   LogManagerListOffset    : LogManager.<List<LogData>> (ordem de insercao)
+//   LogDataTextOffset       : LogData.<texto> (string com markup do evento)
+//   LogDataClockOffset      : LogData.<relogio> (sufixo " <voffset...>[HH:MM]...")
+//   LogDataDateTimeOffset   : LogData.<DateTime> (ticks .NET, hora local)
+//   BoxOpenItemKeyOffset    : BoxOpenLog.<itemStringKey> ("ItemName_<key>")
+//   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
+//   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
+//
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.11) =====
 constexpr uintptr_t kLogManagerTypeInfoRva = 0x57E3118;
-constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;  // Il2CppClass.static_fields (metadata v31)
+constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
 constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
+constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
+constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
+static const char* const kGradeNames[] = {
+    "COMMON", "UNCOMMON", "RARE", "LEGENDARY", "IMMORTAL",
+    "ARCANA", "BEYOND", "CELESTIAL", "DIVINE", "COSMIC",
+};
+// ===== END IL2CPP MAP =====
 
 uintptr_t FindModuleBase(DWORD pid, const wchar_t* module_name) {
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
@@ -1057,21 +1070,11 @@ std::string ReadObjectClassName(HANDLE process, uintptr_t obj) {
   return std::string(buffer, strnlen(buffer, sizeof(buffer) - 1));
 }
 
-// EGradeType (TaskBarHero 1.00.11) -> nome canonico (mapeado para PT no frontend).
+// EGradeType -> nome canonico (mapeado para PT no frontend). Indexa kGradeNames,
+// que e regenerado pelo refresh_il2cpp_map.py a partir do enum do jogo.
 const char* GradeTypeName(int grade) {
-  switch (grade) {
-    case 0: return "COMMON";
-    case 1: return "UNCOMMON";
-    case 2: return "RARE";
-    case 3: return "LEGENDARY";
-    case 4: return "IMMORTAL";
-    case 5: return "ARCANA";
-    case 6: return "BEYOND";
-    case 7: return "CELESTIAL";
-    case 8: return "DIVINE";
-    case 9: return "COSMIC";
-    default: return "";  // 10 = NONE
-  }
+  if (grade < 0 || grade >= static_cast<int>(sizeof(kGradeNames) / sizeof(kGradeNames[0]))) return "";
+  return kGradeNames[grade];
 }
 
 const JsonValue* ItemByKey(const std::string& key);  // definido adiante
@@ -1144,7 +1147,7 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
       // itemStringKey "ItemName_<key>" @0x40, grade @0x48. GetBoxLog = bau.
       std::string klass_name = ReadObjectClassName(process, obj);
       if (klass_name == "BoxOpenLog") {
-        std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + 0x40));
+        std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + kBoxOpenItemKeyOffset));
         size_t underscore = item_key_str.rfind(L'_');
         if (underscore != std::wstring::npos) {
           std::string key = Utf8(item_key_str.substr(underscore + 1));
@@ -1154,7 +1157,7 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
           }
         }
         int grade_value = 10;
-        ReadInt32(process, obj + 0x48, grade_value);
+        ReadInt32(process, obj + kBoxOpenGradeOffset, grade_value);
         event.grade = GradeTypeName(grade_value);
       } else if (klass_name == "GetBoxLog") {
         event.category = "chest";

@@ -14,6 +14,31 @@ Saida:
 build\TBH_Companion.exe
 ```
 
+## Atualizar o mapa IL2CPP (versao nova do jogo)
+
+O agente le os eventos direto da memoria do jogo usando RVAs/offsets especificos
+da versao (bloco `IL2CPP MAP` em `src/main.cpp`). Quando sai uma versao nova,
+rode **com o jogo aberto**:
+
+```bat
+py scripts\refresh_il2cpp_map.py
+```
+
+O script: localiza o jogo (Steam) e a versao, baixa/usa o Il2CppDumper, gera o
+dump, extrai os offsets (LogManager, LogData, BoxOpenLog, enum `EGradeType`),
+**verifica na memoria viva** (resolve a cadeia de ponteiros, descobre o offset de
+`static_fields` por forca bruta, confirma texto/relogio/DateTime e mostra uma
+amostra dos ultimos eventos) e atualiza automaticamente, entre marcadores:
+
+- `src/main.cpp` (bloco `IL2CPP MAP` + `kGradeNames`)
+- `../tbh-farm-local-frontend/server.js` (`gradePt`)
+- `../tbh-farm-local-frontend/public/calculator.js` (`HISTORY_GRADE_PT`)
+
+Opcoes: `--game-dir "caminho\TaskbarHero"`, `--no-live` (so dump, preserva os
+offsets que dependem de verificacao viva), `--dry-run` (so mostra o que mudaria).
+Depois: `build.bat`, reinicie o agente e suba o frontend. Se o enum de raridade
+ganhar um grade novo, o script avisa para preencher a traducao PT em `GRADE_PT`.
+
 ## Config
 
 O app salva configuracao em:

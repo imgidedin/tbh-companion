@@ -1,4 +1,5 @@
 build/
+scripts/.cache/
 *.obj
 *.pdb
 *.ilk
