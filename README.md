@@ -34,6 +34,8 @@ Atual:
 - Monitora logs da memoria do `TaskBarHero.exe`, mantendo cache das regioes candidatas para reduzir custo.
 - Scan de memoria otimizado: busca multi-padrao via `memchr`, janelas de contexto mescladas (regex roda uma vez por trecho) e passe rapido apenas em memoria privada gravavel (heap gerenciado), com fallback para scan completo.
 - Eventos ordenados cronologicamente: ordenacao estavel por posicao no texto + relogio `[HH:MM]` (com tratamento de virada de meia-noite); o historico mesclado preserva indices ja atribuidos (append-only).
+- Eventos enxutos: `raw` limpo (sem markup do Unity), cor da raridade extraida no campo `color`, ids curtos (`tipo|item|relogio`).
+- Recalibracao periodica (5 min) das regioes de memoria: o jogo realoca o buffer de log e o cache de regioes fica obsoleto.
 - Sync incremental: faz POST para `/api/ingest` apenas quando o payload muda, enviando somente os eventos novos (`history.partial`); o servidor mescla por id e nunca apaga eventos ja registrados. O progresso fica em `%LOCALAPPDATA%\TBH Companion\sync-state.json` — apague esse arquivo para forcar um reenvio completo (ex.: apos restaurar o banco do servidor).
 - Pode ser configurado para iniciar automaticamente com o Windows.
 - Abre a UI web do SteamID configurado.

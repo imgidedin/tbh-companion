@@ -91,6 +91,7 @@ struct MemoryEvent {
   std::string hero;
   std::string enemy;
   std::string clock;
+  std::string color;
   std::string raw;
   std::string id;
   int index = 0;
@@ -723,11 +724,48 @@ std::string CleanMarkupUtf8(const std::wstring& input) {
   return Utf8(NormalizeMemoryText(out));
 }
 
+// Cor da primeira tag <color=#RRGGBB> (raridade no frontend), em maiusculas.
+std::string ExtractColorTag(const std::wstring& text) {
+  size_t pos = text.find(L"<color=#");
+  if (pos == std::wstring::npos) return "";
+  size_t start = pos + 7;  // aponta para '#'
+  size_t end = text.find(L'>', start);
+  if (end == std::wstring::npos || end - start != 7) return "";
+  std::string out = Utf8(text.substr(start, 7));
+  for (char& c : out) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+  return out;
+}
+
+// Texto limpo do evento: sem tags de markup e sem o sufixo de relogio
+// "[HH:MM]" (que ja vai no campo clock).
+std::string CleanEventRaw(const std::wstring& input) {
+  std::wstring out;
+  out.reserve(input.size());
+  bool in_tag = false;
+  for (wchar_t c : input) {
+    if (c == L'<') { in_tag = true; continue; }
+    if (c == L'>') { in_tag = false; continue; }
+    if (!in_tag) out.push_back(c);
+  }
+  out = NormalizeMemoryText(out);
+  size_t bracket = out.rfind(L'[');
+  if (bracket != std::wstring::npos && out.size() - bracket == 7 && out.back() == L']' &&
+      iswdigit(out[bracket + 1]) && iswdigit(out[bracket + 2]) && out[bracket + 3] == L':' &&
+      iswdigit(out[bracket + 4]) && iswdigit(out[bracket + 5])) {
+    out.erase(bracket);
+    while (!out.empty() && out.back() == L' ') out.pop_back();
+  }
+  return Utf8(out);
+}
+
 std::string EventId(const MemoryEvent& event) {
-  if (event.type == "clear") return "clear|" + event.label + "|" + std::to_string(event.seconds) + "|" + event.clock + "|" + event.raw;
-  if (event.type == "failure") return "failure|" + event.label + "|" + event.progress + "|" + event.clock + "|" + event.raw;
-  if (event.type == "death") return "death|" + event.hero + "|" + event.enemy + "|" + event.clock + "|" + event.raw;
-  if (event.type == "drop") return "drop|" + event.item + "|" + event.clock + "|" + event.raw;
+  if (event.type == "clear") return "clear|" + event.label + "|" + std::to_string(event.seconds) + "|" + event.clock;
+  if (event.type == "failure") return "failure|" + event.label + "|" + event.progress + "|" + event.clock;
+  if (event.type == "death") return "death|" + event.hero + "|" + event.enemy + "|" + event.clock;
+  if (event.type == "drop") {
+    bool craft = event.raw.rfind("Resultado", 0) == 0;
+    return std::string(craft ? "craft|" : "drop|") + event.item + "|" + event.clock;
+  }
   return event.type + "|" + event.raw;
 }
 
@@ -859,7 +897,8 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
       const std::wsmatch& match = *it;
       MemoryEvent event;
       event.type = type;
-      event.raw = Utf8(match.str(0));
+      event.color = ExtractColorTag(match.str(0));
+      event.raw = CleanEventRaw(match.str(0));
       if (type == "clear") {
         event.label = Utf8(match.str(1));
         event.seconds = _wtoi(match.str(2).c_str());
@@ -1088,6 +1127,7 @@ JsonValue EventJson(const MemoryEvent& event) {
   if (!event.hero.empty()) ObjectSet(out, "hero", JsonValue::String(event.hero));
   if (!event.enemy.empty()) ObjectSet(out, "enemy", JsonValue::String(event.enemy));
   ObjectSet(out, "clock", JsonValue::String(event.clock));
+  if (!event.color.empty()) ObjectSet(out, "color", JsonValue::String(event.color));
   ObjectSet(out, "raw", JsonValue::String(event.raw));
   ObjectSet(out, "id", JsonValue::String(event.id));
   ObjectSet(out, "index", JsonValue::Number(static_cast<long long>(event.index)));
@@ -1492,6 +1532,7 @@ bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
   event.hero = JsonStringValue(ObjectGet(value, "hero"));
   event.enemy = JsonStringValue(ObjectGet(value, "enemy"));
   event.clock = JsonStringValue(ObjectGet(value, "clock"));
+  event.color = JsonStringValue(ObjectGet(value, "color"));
   event.raw = JsonStringValue(ObjectGet(value, "raw"));
   event.id = JsonStringValue(ObjectGet(value, "id"));
   if (event.id.empty()) event.id = EventId(event);
@@ -2438,6 +2479,9 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   }
 
   bool rediscover = force_discover || state.memory_regions.empty();
+  // Recalibracao periodica: o jogo realoca o buffer de log (GC), entao regioes
+  // cacheadas ficam obsoletas e eventos novos deixam de aparecer.
+  if (!rediscover && now - state.last_region_discovery > 300000) rediscover = true;
   bool due = force_discover || rediscover || now - state.last_memory_scan > 5000;
   if (!due) return false;
 
