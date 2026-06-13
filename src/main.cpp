@@ -95,7 +95,8 @@ struct MemoryEvent {
   std::string raw;
   std::string id;
   int index = 0;
-  int order_key = -1;  // chave de ordenacao transitoria (minutos, com ajuste de meia-noite)
+  long long ts = 0;    // epoch (s) de quando o agente viu o evento pela primeira vez
+  int order_key = -1;  // janela de texto de origem no scan (chave transitoria)
 };
 
 int EventClockKey(const MemoryEvent& event) {
@@ -133,6 +134,8 @@ struct WorkerState {
   DWORD last_memory_scan = 0;
   DWORD last_region_discovery = 0;
   std::string last_payload_hash;
+  std::set<std::string> memory_seen;     // ids ja vistos (historico + baseline)
+  bool memory_baseline_ready = false;    // primeira leitura vira baseline e e ignorada
   long long synced_index = -1;     // maior index de evento confirmado pelo servidor
   std::string synced_first_id;     // detecta reset/reordenacao do historico local
 };
@@ -878,6 +881,86 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
   return bytes;
 }
 
+// ===== Leitura direta do LogManager via mapa IL2CPP =====
+// Mapa extraido (dev-time) de GameAssembly.dll + global-metadata.dat com o
+// Il2CppDumper para TaskBarHero 1.00.11:
+//   nn<LogManager>_TypeInfo  RVA 0x57E3118 (singleton base class)
+//   nn<T>.bbwm (instancia)   static field @0x0
+//   LogManager.beqe          List<LogData> @0x20 (ordem de insercao, max 2000)
+//   LogData.bepz (texto)     string @0x20
+//   LogData.beqa (relogio)   string @0x28 (sufixo " <voffset...>[HH:MM]...")
+//   LogData.beqb (DateTime)  @0x30 (ticks .NET, hora local, kind nos 2 bits altos)
+// Se o jogo atualizar, basta rodar o Il2CppDumper de novo e revisar os valores.
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x57E3118;
+constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;  // Il2CppClass.static_fields (metadata v31)
+constexpr uintptr_t kLogManagerListOffset = 0x20;
+constexpr uintptr_t kLogDataTextOffset = 0x20;
+constexpr uintptr_t kLogDataClockOffset = 0x28;
+constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
+
+uintptr_t FindModuleBase(DWORD pid, const wchar_t* module_name) {
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+  if (snapshot == INVALID_HANDLE_VALUE) return 0;
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  uintptr_t base = 0;
+  std::wstring wanted = LowerWide(module_name);
+  if (Module32FirstW(snapshot, &entry)) {
+    do {
+      if (LowerWide(entry.szModule) == wanted) {
+        base = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+        break;
+      }
+    } while (Module32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return base;
+}
+
+uintptr_t ReadPtr(HANDLE process, uintptr_t address) {
+  uintptr_t value = 0;
+  SIZE_T read = 0;
+  if (!address) return 0;
+  if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &read) ||
+      read != sizeof(value)) {
+    return 0;
+  }
+  return value;
+}
+
+bool ReadInt32(HANDLE process, uintptr_t address, int& value) {
+  SIZE_T read = 0;
+  return ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &read) &&
+         read == sizeof(value);
+}
+
+// System.String: comprimento (int32) @0x10, chars UTF-16 @0x14.
+std::wstring ReadManagedString(HANDLE process, uintptr_t address) {
+  if (!address) return L"";
+  int length = 0;
+  if (!ReadInt32(process, address + 0x10, length) || length <= 0 || length > 8192) return L"";
+  std::wstring out(static_cast<size_t>(length), L'\0');
+  SIZE_T read = 0;
+  if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address + 0x14), &out[0],
+                         static_cast<SIZE_T>(length) * 2, &read)) {
+    return L"";
+  }
+  out.resize(read / 2);
+  return out;
+}
+
+// Ticks .NET (hora local do jogo) -> epoch UTC em segundos.
+long long DotNetTicksToEpoch(unsigned long long raw_ticks) {
+  unsigned long long ticks = raw_ticks & 0x3FFFFFFFFFFFFFFFULL;  // remove o DateTimeKind
+  long long as_if_utc = static_cast<long long>(ticks / 10000000ULL) - 62135596800LL;
+  struct tm parts {};
+  time_t base = static_cast<time_t>(as_if_utc);
+  if (gmtime_s(&parts, &base) != 0) return as_if_utc;
+  parts.tm_isdst = -1;
+  time_t utc = mktime(&parts);  // interpreta os campos como hora local
+  return utc > 0 ? static_cast<long long>(utc) : as_if_utc;
+}
+
 void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& text, unsigned mask = kEventAll) {
   static const std::wregex clear_re(
       LR"((?:<color=#[0-9A-Fa-f]+>)?Est[aá]gio\s+(\d+-\d+)(?:</color>)?\s+conclu[ií]do\.\s*\((\d+)s\)(?:\s*<voffset[^>]*><size=[^>]*>\[([^\]]+)\]</size></voffset>)?)",
@@ -940,22 +1023,7 @@ void AppendRegexEvents(std::vector<MemoryEvent>& events, const std::wstring& tex
                      return a.first < b.first;
                    });
 
-  // Atribui chave de ordenacao pelo relogio [HH:MM], com ajuste de virada de
-  // meia-noite; eventos sem relogio herdam a chave do evento anterior no texto.
-  int day_offset = 0;
-  int prev_raw = -1;
-  int prev_key = -1;
-  for (auto& item : found) {
-    MemoryEvent& event = item.second;
-    int raw_key = EventClockKey(event);
-    if (raw_key >= 0) {
-      if (prev_raw >= 0 && raw_key + 360 < prev_raw) day_offset += 24 * 60;
-      prev_raw = raw_key;
-      prev_key = raw_key + day_offset;
-    }
-    event.order_key = prev_key;
-    events.push_back(std::move(event));
-  }
+  for (auto& item : found) events.push_back(std::move(item.second));
 }
 
 std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
@@ -973,13 +1041,139 @@ std::vector<MemoryEvent> UniqueEvents(const std::vector<MemoryEvent>& events) {
   return output;
 }
 
-// Ordena cronologicamente os eventos de um snapshot: a ordem dentro de cada
-// trecho de texto ja e cronologica, e o order_key (relogio) reconcilia trechos
-// e regioes lidos em ordem arbitraria.
+// Le a List<LogData> do LogManager do jogo via cadeia de ponteiros do mapa
+// IL2CPP. Os eventos vem em ordem de insercao (cronologica) e com o DateTime
+// real de cada um — sem varrer heap, sem adivinhar ordem.
+// Retorna false se a cadeia nao resolver (jogo carregando ou versao diferente).
+bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string* error = nullptr) {
+  out.clear();
+  auto fail = [&](const char* why) {
+    if (error) *error = why;
+    return false;
+  };
+  if (!pid) return fail("jogo nao esta rodando");
+  uintptr_t module_base = FindModuleBase(pid, L"GameAssembly.dll");
+  if (!module_base) return fail("GameAssembly.dll nao encontrada");
+  HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (!process) return fail("sem acesso ao processo");
+
+  bool ok = false;
+  do {
+    uintptr_t klass = ReadPtr(process, module_base + kLogManagerTypeInfoRva);
+    if (!klass) { fail("TypeInfo nulo (jogo inicializando?)"); break; }
+    uintptr_t statics = ReadPtr(process, klass + kKlassStaticFieldsOffset);
+    uintptr_t instance = ReadPtr(process, statics);
+    if (!instance) { fail("singleton LogManager ainda nao criado"); break; }
+    uintptr_t list = ReadPtr(process, instance + kLogManagerListOffset);
+    if (!list) { fail("lista de log nula"); break; }
+    uintptr_t items = ReadPtr(process, list + 0x10);  // List<T>._items (array)
+    int size = 0;
+    if (!items || !ReadInt32(process, list + 0x18, size) || size < 0 || size > 4000) {
+      fail("lista de log invalida");
+      break;
+    }
+    // Le todos os ponteiros do array de uma vez.
+    std::vector<uintptr_t> pointers(static_cast<size_t>(size));
+    SIZE_T read = 0;
+    if (size > 0 && (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(items + 0x20), pointers.data(),
+                                        pointers.size() * sizeof(uintptr_t), &read) ||
+                     read != pointers.size() * sizeof(uintptr_t))) {
+      fail("falha lendo array de log");
+      break;
+    }
+    out.reserve(pointers.size());
+    for (uintptr_t obj : pointers) {
+      if (!obj) continue;
+      std::wstring text = ReadManagedString(process, ReadPtr(process, obj + kLogDataTextOffset));
+      if (text.empty()) continue;
+      std::wstring clock_suffix = ReadManagedString(process, ReadPtr(process, obj + kLogDataClockOffset));
+      unsigned long long ticks = 0;
+      ReadProcessMemory(process, reinterpret_cast<LPCVOID>(obj + kLogDataDateTimeOffset), &ticks,
+                        sizeof(ticks), &read);
+      std::vector<MemoryEvent> parsed;
+      AppendRegexEvents(parsed, text + clock_suffix);
+      if (parsed.empty()) continue;  // tipo de log que nao acompanhamos (level up, etc.)
+      MemoryEvent event = std::move(parsed.front());
+      event.ts = ticks ? DotNetTicksToEpoch(ticks) : 0;
+      // O relogio [HH:MM] repete a cada dia; o timestamp real torna o id unico.
+      event.id = EventId(event) + (event.ts > 0 ? "|" + std::to_string(event.ts) : "");
+      event.index = static_cast<int>(out.size());
+      out.push_back(std::move(event));
+    }
+    ok = true;
+  } while (false);
+  CloseHandle(process);
+  return ok;
+}
+
+// Reconstroi a ordem cronologica do scan. Cada janela de texto e uma fatia
+// contigua (ou copia antiga) do mesmo buffer de log, entao a ordem interna e
+// confiavel. As janelas sao reconciliadas por sobreposicao de conteudo: a mais
+// longa (o log vivo) vira a base e as demais sao mescladas ancorando os
+// eventos em comum. O relogio [HH:MM] nao serve para ordenar, pois se repete
+// a cada dia.
 std::vector<MemoryEvent> FinalizeScanEvents(std::vector<MemoryEvent>& events) {
-  std::stable_sort(events.begin(), events.end(),
-                   [](const MemoryEvent& a, const MemoryEvent& b) { return a.order_key < b.order_key; });
-  return UniqueEvents(events);
+  // Agrupa por janela (order_key), com dedupe por id dentro de cada janela.
+  std::vector<std::vector<MemoryEvent>> sequences;
+  std::vector<std::set<std::string>> seq_seen;
+  std::map<int, size_t> seq_by_key;
+  for (auto& event : events) {
+    if (event.id.empty()) event.id = EventId(event);
+    auto it = seq_by_key.find(event.order_key);
+    if (it == seq_by_key.end()) {
+      it = seq_by_key.emplace(event.order_key, sequences.size()).first;
+      sequences.emplace_back();
+      seq_seen.emplace_back();
+    }
+    if (seq_seen[it->second].insert(event.id).second) {
+      sequences[it->second].push_back(std::move(event));
+    }
+  }
+
+  // Da mais longa para a mais curta (estavel na ordem de descoberta).
+  std::vector<size_t> order(sequences.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return sequences[a].size() > sequences[b].size(); });
+
+  std::vector<MemoryEvent> master;
+  for (size_t si : order) {
+    auto& seq = sequences[si];
+    if (seq.empty()) continue;
+    if (master.empty()) {
+      master = std::move(seq);
+      continue;
+    }
+    std::map<std::string, size_t> pos;
+    for (size_t i = 0; i < master.size(); ++i) pos.emplace(master[i].id, i);
+    std::vector<MemoryEvent> result;
+    result.reserve(master.size() + seq.size());
+    std::vector<MemoryEvent> pending;  // eventos novos aguardando a proxima ancora
+    size_t next = 0;
+    for (auto& event : seq) {
+      auto found = pos.find(event.id);
+      if (found == pos.end()) {
+        pending.push_back(std::move(event));
+        continue;
+      }
+      size_t p = found->second;
+      if (p >= next) {
+        for (size_t i = next; i < p; ++i) result.push_back(std::move(master[i]));
+        for (auto& pe : pending) result.push_back(std::move(pe));
+        result.push_back(std::move(master[p]));
+        next = p + 1;
+      } else {
+        for (auto& pe : pending) result.push_back(std::move(pe));
+      }
+      pending.clear();
+    }
+    // Sem ancora alguma: copia antiga sem sobreposicao, assume anterior ao
+    // master. Com ancoras: pendentes ficam logo apos a ultima ancora.
+    for (auto& pe : pending) result.push_back(std::move(pe));
+    for (size_t i = next; i < master.size(); ++i) result.push_back(std::move(master[i]));
+    master = std::move(result);
+  }
+  return UniqueEvents(master);
 }
 
 std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
@@ -997,6 +1191,7 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
   };
   std::vector<RegionCandidate> region_candidates;
   std::vector<NeedleHit> hits;
+  int window_counter = 0;
   auto scan_region = [&](unsigned char* base, SIZE_T size, bool remember) {
     if (!base || size == 0 || size > max_region) return;
     std::vector<unsigned char> data = ReadProcessBytes(process, base, size);
@@ -1019,6 +1214,10 @@ std::vector<MemoryEvent> ScanMemoryEvents(HANDLE process,
       std::vector<MemoryEvent> found;
       std::wstring text = NormalizeMemoryText(DecodeUtf16Le(data.data() + left, right - left));
       AppendRegexEvents(found, text, mask);
+      // Marca a janela de origem: FinalizeScanEvents reconcilia janelas por
+      // sobreposicao de conteudo.
+      for (auto& event : found) event.order_key = window_counter;
+      ++window_counter;
       bool has_new_event = false;
       for (const auto& event : found) {
         std::string id = event.id.empty() ? EventId(event) : event.id;
@@ -1131,6 +1330,7 @@ JsonValue EventJson(const MemoryEvent& event) {
   ObjectSet(out, "raw", JsonValue::String(event.raw));
   ObjectSet(out, "id", JsonValue::String(event.id));
   ObjectSet(out, "index", JsonValue::Number(static_cast<long long>(event.index)));
+  if (event.ts > 0) ObjectSet(out, "ts", JsonValue::Number(event.ts));
   return out;
 }
 
@@ -1537,6 +1737,7 @@ bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
   event.id = JsonStringValue(ObjectGet(value, "id"));
   if (event.id.empty()) event.id = EventId(event);
   event.index = static_cast<int>(JsonNumberDouble(ObjectGet(value, "index")));
+  event.ts = static_cast<long long>(JsonNumberDouble(ObjectGet(value, "ts")));
   return true;
 }
 
@@ -2459,73 +2660,66 @@ bool RefreshSaveCache(WorkerState& state) {
   return true;
 }
 
-bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
-  DWORD now = GetTickCount();
-  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
-  std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
-  bool process_changed = pid != state.memory_pid;
-  if (process_changed) {
-    state.memory_regions.clear();
-    state.memory_pid = pid;
-    if (pid) {
-      if (LoadMemoryRegionCache(pid, state.memory_regions)) {
-        state.last_region_discovery = now;
-        PostStatus(L"Cache de memoria carregado (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
-      }
-      if (state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, difficulty)) {
-        PostStatus(L"Historico de memoria local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
-      }
-    }
-  }
-
-  bool rediscover = force_discover || state.memory_regions.empty();
-  // Recalibracao periodica: o jogo realoca o buffer de log (GC), entao regioes
-  // cacheadas ficam obsoletas e eventos novos deixam de aparecer.
-  if (!rediscover && now - state.last_region_discovery > 300000) rediscover = true;
-  bool due = force_discover || rediscover || now - state.last_memory_scan > 5000;
-  if (!due) return false;
-
-  DWORD scan_start = GetTickCount();
-  size_t region_count_before = state.memory_regions.size();
-  PostStatus(rediscover ? L"Lendo memoria com calibracao completa..." : L"Lendo memoria pelo cache...");
-  MemorySnapshot previous_memory = state.memory;
-  state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, rediscover, rediscover ? 0 : 24);
-  if (!rediscover && state.memory.events.empty()) {
-    PostStatus(L"Cache de memoria invalido. Recalibrando...");
-    scan_start = GetTickCount();
-    state.memory = ReadMemorySnapshot(difficulty, &state.memory_regions, true);
-    rediscover = true;
-  }
-  // Sempre mescla com o historico anterior: a ordem e os indices dos eventos
-  // ja conhecidos nunca mudam; novos eventos sao apenas anexados ao final.
-  if (!previous_memory.events.empty()) {
-    state.memory.events = MergeMemoryEvents(previous_memory.events, state.memory.events);
-    RebuildMemorySnapshotJson(state.memory, difficulty);
-  }
-  DWORD scan_ms = GetTickCount() - scan_start;
-  state.last_memory_scan = now;
-  PostStatus(L"Memoria lida em " + std::to_wstring(scan_ms) + L"ms (" +
-             std::to_wstring(state.memory.events.size()) + L" eventos, " +
-             std::to_wstring(state.memory_regions.size()) + L" regioes).");
-  if (rediscover) {
-    state.last_region_discovery = now;
-    SaveMemoryRegionCache(state.memory_pid, state.memory_regions);
-    PostStatus(L"Cache de memoria salvo (" + std::to_wstring(state.memory_regions.size()) + L" regioes).");
-  } else if (state.memory_regions.size() != region_count_before) {
-    SaveMemoryRegionCache(state.memory_pid, state.memory_regions);
-    PostStatus(L"Cache de memoria compactado (" + std::to_wstring(region_count_before) + L" -> " +
-               std::to_wstring(state.memory_regions.size()) + L" regioes).");
-  }
-  SaveMemoryHistoryCache(state.memory);
-  return true;
-}
-
 std::string WatcherStatusJson(const std::string& message) {
   JsonValue watcher = JsonValue::Object();
   ObjectSet(watcher, "source", JsonValue::String("cpp-agent"));
   ObjectSet(watcher, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
   ObjectSet(watcher, "message", JsonValue::String(message));
   return JsonSerialize(watcher);
+}
+
+bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
+  DWORD now = GetTickCount();
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
+  bool process_changed = pid != state.memory_pid;
+  if (process_changed) {
+    state.memory_pid = pid;
+    state.memory_seen.clear();
+    if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, difficulty)) {
+      PostStatus(L"Historico local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
+    }
+    for (const auto& event : state.memory.events) state.memory_seen.insert(event.id);
+  }
+
+  if (!pid) return false;
+  bool due = force_discover || now - state.last_memory_scan > 2000;
+  if (!due) return false;
+  state.last_memory_scan = now;
+
+  // Leitura direta da List<LogData> do LogManager via mapa IL2CPP: ordem de
+  // insercao garantida pelo proprio jogo e DateTime real por evento. Leva
+  // milissegundos (4 ponteiros + array), nada de varrer heap.
+  DWORD scan_start = GetTickCount();
+  std::vector<MemoryEvent> scanned;
+  std::string error;
+  if (!ReadLogManagerEvents(pid, scanned, &error)) {
+    PostStatus(L"Leitura do log falhou: " + Widen(error));
+    return false;
+  }
+
+  size_t added = 0;
+  for (auto& event : scanned) {
+    if (!state.memory_seen.insert(event.id).second) continue;
+    event.index = static_cast<int>(state.memory.events.size());
+    state.memory.events.push_back(std::move(event));
+    ++added;
+  }
+  bool changed = false;
+  if (added > 0 || state.memory.history_json == "null") {
+    RebuildMemorySnapshotJson(state.memory, difficulty);
+    SaveMemoryHistoryCache(state.memory);
+    changed = true;
+  }
+  state.memory.pid = pid;
+  state.memory.watcher_json = WatcherStatusJson("cpp-agent il2cpp reader");
+
+  DWORD scan_ms = GetTickCount() - scan_start;
+  if (added > 0) {
+    PostStatus(std::to_wstring(added) + L" evento(s) novo(s) em " + std::to_wstring(scan_ms) + L"ms (" +
+               std::to_wstring(state.memory.events.size()) + L" no historico).");
+  }
+  return changed;
 }
 
 bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
