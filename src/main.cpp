@@ -2371,12 +2371,18 @@ std::string BonusType(const JsonValue& stat) {
   return {};
 }
 
+JsonValue StatDisplayValue(const JsonValue& stat) {
+  const JsonValue* display = ObjectGet(stat, "disp");
+  if (!display) display = ObjectGet(stat, "display");
+  return CopyOrNull(display);
+}
+
 JsonValue BuildBonusStatSummary(const JsonValue& stat, const std::string& section, const std::string& type, double percent) {
   JsonValue out = JsonValue::Object();
   ObjectSet(out, "type", JsonValue::String(type));
   ObjectSet(out, "stat", CopyOrNull(ObjectGet(stat, "stat")));
   ObjectSet(out, "percent", JsonValue::Number(percent));
-  ObjectSet(out, "display", CopyOrNull(ObjectGet(stat, "disp")));
+  ObjectSet(out, "display", StatDisplayValue(stat));
   ObjectSet(out, "section", JsonValue::String(section));
   return out;
 }
@@ -2388,8 +2394,321 @@ JsonValue BuildBonusSource(const JsonValue& hero, const JsonValue* item, const J
   ObjectSet(out, "name", item ? CopyOrNull(ObjectGet(*item, "name")) : JsonValue::Null());
   ObjectSet(out, "type", JsonValue::String(type));
   ObjectSet(out, "percent", JsonValue::Number(percent));
-  ObjectSet(out, "display", CopyOrNull(ObjectGet(stat, "disp")));
+  ObjectSet(out, "display", StatDisplayValue(stat));
   return out;
+}
+
+struct StatModInfo {
+  long long key;
+  const char* stat;
+  const char* mod;
+};
+
+const StatModInfo* FindStatModInfo(long long key) {
+  static const StatModInfo kStatMods[] = {
+      {100101, "AttackDamage", "FLAT"},
+      {100102, "AttackDamage", "ADDITIVE"},
+      {100201, "AttackSpeed", "ADDITIVE"},
+      {100301, "CriticalChance", "FLAT"},
+      {100302, "CriticalChance", "ADDITIVE"},
+      {100401, "CriticalDamage", "FLAT"},
+      {100501, "MaxHp", "FLAT"},
+      {100502, "MaxHp", "ADDITIVE"},
+      {100601, "Armor", "FLAT"},
+      {100602, "Armor", "ADDITIVE"},
+      {100701, "CooldownReduction", "FLAT"},
+      {100801, "MovementSpeed", "ADDITIVE"},
+      {100901, "AreaOfEffect", "ADDITIVE"},
+      {101001, "BaseAttackCountReduction", "FLAT"},
+      {101101, "SkillRangeExpansion", "FLAT"},
+      {101201, "FireResistance", "FLAT"},
+      {101301, "ColdResistance", "FLAT"},
+      {101401, "LightningResistance", "FLAT"},
+      {101501, "ChaosResistance", "FLAT"},
+      {101601, "DodgeChance", "FLAT"},
+      {101701, "BlockChance", "FLAT"},
+      {101801, "MaxDodgeChance", "FLAT"},
+      {101901, "MaxBlockChance", "FLAT"},
+      {102001, "Multistrike", "FLAT"},
+      {102101, "HpLeech", "FLAT"},
+      {102201, "ProjectileCount", "FLAT"},
+      {102301, "HpRegenPerSec", "FLAT"},
+      {102401, "PhysicalDamagePercent", "FLAT"},
+      {102501, "FireDamagePercent", "FLAT"},
+      {102601, "ColdDamagePercent", "FLAT"},
+      {102701, "LightningDamagePercent", "FLAT"},
+      {102801, "ChaosDamagePercent", "FLAT"},
+      {102901, "MaxFireResistance", "FLAT"},
+      {103001, "MaxColdResistance", "FLAT"},
+      {103101, "MaxLightningResistance", "FLAT"},
+      {103201, "MaxChaosResistance", "FLAT"},
+      {103301, "AddHpPerHit", "FLAT"},
+      {103401, "DamageReduction", "FLAT"},
+      {103501, "PhysicalDamageReduction", "FLAT"},
+      {103601, "FireDamageReduction", "FLAT"},
+      {103701, "ColdDamageReduction", "FLAT"},
+      {103801, "LightningDamageReduction", "FLAT"},
+      {103901, "ChaosDamageReduction", "FLAT"},
+      {104001, "DamageAbsorption", "FLAT"},
+      {104101, "DamageAddition", "FLAT"},
+      {104201, "PhysicalDamageAddition", "FLAT"},
+      {104301, "FireDamageAddition", "FLAT"},
+      {104401, "ColdDamageAddition", "FLAT"},
+      {104501, "LightningDamageAddition", "FLAT"},
+      {104601, "ChaosDamageAddition", "FLAT"},
+      {104701, "IncreaseExpAmount", "FLAT"},
+      {104801, "AdditionalExp", "FLAT"},
+      {104901, "CastSpeed", "ADDITIVE"},
+      {105201, "AllElementalResistance", "FLAT"},
+      {105202, "MovementSpeed", "FLAT"},
+      {105301, "AddHpPerKill", "FLAT"},
+      {105401, "IncreaseAreaOfEffectDamage", "ADDITIVE"},
+      {105501, "IncreaseMeleeDamage", "ADDITIVE"},
+      {105601, "IncreaseProjectileDamage", "ADDITIVE"},
+      {105701, "IncreaseSummonDamage", "ADDITIVE"},
+      {105801, "SkillDurationIncrease", "ADDITIVE"},
+      {105901, "SkillHealIncrease", "ADDITIVE"},
+  };
+  for (const auto& info : kStatMods) {
+    if (info.key == key) return &info;
+  }
+  return nullptr;
+}
+
+const char* StatTypeName(long long type) {
+  switch (type) {
+    case 1: return "AttackDamage";
+    case 2: return "AttackSpeed";
+    case 3: return "CriticalChance";
+    case 4: return "CriticalDamage";
+    case 5: return "MaxHp";
+    case 6: return "Armor";
+    case 7: return "CooldownReduction";
+    case 8: return "MovementSpeed";
+    case 9: return "AreaOfEffect";
+    case 10: return "BaseAttackCountReduction";
+    case 11: return "SkillRangeExpansion";
+    case 12: return "FireResistance";
+    case 13: return "ColdResistance";
+    case 14: return "LightningResistance";
+    case 15: return "ChaosResistance";
+    case 16: return "DodgeChance";
+    case 17: return "BlockChance";
+    case 18: return "MaxDodgeChance";
+    case 19: return "MaxBlockChance";
+    case 20: return "Multistrike";
+    case 21: return "HpLeech";
+    case 22: return "ProjectileCount";
+    case 23: return "HpRegenPerSec";
+    case 24: return "PhysicalDamagePercent";
+    case 25: return "FireDamagePercent";
+    case 26: return "ColdDamagePercent";
+    case 27: return "LightningDamagePercent";
+    case 28: return "ChaosDamagePercent";
+    case 29: return "MaxFireResistance";
+    case 30: return "MaxColdResistance";
+    case 31: return "MaxLightningResistance";
+    case 32: return "MaxChaosResistance";
+    case 33: return "AddHpPerHit";
+    case 34: return "DamageReduction";
+    case 35: return "PhysicalDamageReduction";
+    case 36: return "FireDamageReduction";
+    case 37: return "ColdDamageReduction";
+    case 38: return "LightningDamageReduction";
+    case 39: return "ChaosDamageReduction";
+    case 40: return "DamageAbsorption";
+    case 41: return "DamageAddition";
+    case 42: return "PhysicalDamageAddition";
+    case 43: return "FireDamageAddition";
+    case 44: return "ColdDamageAddition";
+    case 45: return "LightningDamageAddition";
+    case 46: return "ChaosDamageAddition";
+    case 47: return "IncreaseExpAmount";
+    case 48: return "AdditionalExp";
+    case 49: return "CastSpeed";
+    case 52: return "AllElementalResistance";
+    case 53: return "AddHpPerKill";
+    case 54: return "IncreaseAreaOfEffectDamage";
+    case 55: return "IncreaseMeleeDamage";
+    case 56: return "IncreaseProjectileDamage";
+    case 57: return "IncreaseSummonDamage";
+    case 58: return "SkillDurationIncrease";
+    case 59: return "SkillHealIncrease";
+    default: return "";
+  }
+}
+
+const char* ModTypeName(long long type) {
+  switch (type) {
+    case 1: return "ADDITIVE";
+    case 2: return "MULTIPLICATIVE";
+    default: return "FLAT";
+  }
+}
+
+std::string TrimTrailingZeros(std::string value) {
+  size_t dot = value.find('.');
+  if (dot == std::string::npos) return value;
+  while (!value.empty() && value.back() == '0') value.pop_back();
+  if (!value.empty() && value.back() == '.') value.pop_back();
+  return value.empty() ? "0" : value;
+}
+
+std::string FormatScaledValue(double value, double divisor, const std::string& suffix = "") {
+  double scaled = divisor == 0 ? value : value / divisor;
+  std::ostringstream stream;
+  if (std::fabs(scaled - std::round(scaled)) < 0.000000001) {
+    stream << static_cast<long long>(std::llround(scaled));
+  } else {
+    stream.precision(3);
+    stream << std::fixed << scaled;
+  }
+  return TrimTrailingZeros(stream.str()) + suffix;
+}
+
+bool IsDirectPercentStat(const std::string& stat) {
+  return stat == "FireResistance" || stat == "ColdResistance" || stat == "LightningResistance" ||
+         stat == "ChaosResistance" || stat == "AllElementalResistance" ||
+         stat == "MaxFireResistance" || stat == "MaxColdResistance" ||
+         stat == "MaxLightningResistance" || stat == "MaxChaosResistance";
+}
+
+bool IsTenthsPercentStat(const std::string& stat, const std::string& mod) {
+  if (mod == "ADDITIVE" || mod == "MULTIPLICATIVE") return true;
+  return stat == "AttackSpeed" || stat == "CriticalChance" || stat == "CriticalDamage" ||
+         stat == "CooldownReduction" || stat == "DodgeChance" || stat == "BlockChance" ||
+         stat == "MaxDodgeChance" || stat == "MaxBlockChance" || stat == "HpLeech" ||
+         stat == "DamageReduction" || stat == "PhysicalDamageReduction" ||
+         stat == "FireDamageReduction" || stat == "ColdDamageReduction" ||
+         stat == "LightningDamageReduction" || stat == "ChaosDamageReduction" ||
+         stat == "PhysicalDamagePercent" || stat == "FireDamagePercent" ||
+         stat == "ColdDamagePercent" || stat == "LightningDamagePercent" ||
+         stat == "ChaosDamagePercent" || stat == "DamageAddition" ||
+         stat == "PhysicalDamageAddition" || stat == "FireDamageAddition" ||
+         stat == "ColdDamageAddition" || stat == "LightningDamageAddition" ||
+         stat == "ChaosDamageAddition" || stat == "IncreaseExpAmount";
+}
+
+std::string FormatEnchantDisplay(const std::string& stat, const std::string& mod, double value) {
+  std::string body;
+  if (stat == "HpRegenPerSec") {
+    body = FormatScaledValue(value, 100.0);
+  } else if (stat == "DamageAbsorption") {
+    body = FormatScaledValue(value, 10.0);
+  } else if (IsDirectPercentStat(stat)) {
+    body = FormatScaledValue(value, 1.0, "%");
+  } else if (IsTenthsPercentStat(stat, mod)) {
+    body = FormatScaledValue(value, 10.0, "%");
+  } else {
+    body = FormatScaledValue(value, 1.0);
+  }
+  return (value > 0 ? "+" : "") + body;
+}
+
+const char* EnchantSectionName(long long recipe_type) {
+  switch (recipe_type) {
+    case 3: return "decoration";
+    case 4: return "engraving";
+    case 5: return "inscription";
+    default: return "";
+  }
+}
+
+long long SlotCapacity(const JsonValue* item, const std::string& section) {
+  if (!item) return 0;
+  const JsonValue* slots = ObjectGet(*item, "slots");
+  return static_cast<long long>(JsonNumberDouble(slots ? ObjectGet(*slots, section) : nullptr));
+}
+
+long long EnchantCountByIndex(const JsonValue& saved_item, size_t index) {
+  const JsonValue* counts = ObjectGet(saved_item, "EnchantCount");
+  if (!counts || counts->type != JsonValue::Type::Array || counts->array.size() <= index) return 0;
+  return static_cast<long long>(JsonNumberDouble(&counts->array[index]));
+}
+
+long long EnchantAppliedTotal(const JsonValue& saved_item, const std::string& section) {
+  if (section == "decoration") return static_cast<long long>(JsonNumberDouble(ObjectGet(saved_item, "DecorationAppliedTotalCount")));
+  if (section == "engraving") return static_cast<long long>(JsonNumberDouble(ObjectGet(saved_item, "EngravingAppliedTotalCount")));
+  if (section == "inscription") return static_cast<long long>(JsonNumberDouble(ObjectGet(saved_item, "InscriptionAppliedTotalCount")));
+  return 0;
+}
+
+JsonValue BuildEnchantStatSummary(const JsonValue& enchant, const std::string& section, long long slot) {
+  long long stat_mod_key = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "StatModKey")));
+  long long stat_type = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "StatType")));
+  long long mod_type = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "ModType")));
+  long long tier = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "Tier")));
+  double value = JsonNumberDouble(ObjectGet(enchant, "Value"));
+
+  const StatModInfo* info = FindStatModInfo(stat_mod_key);
+  std::string stat = info ? info->stat : StatTypeName(stat_type);
+  std::string mod = info ? info->mod : ModTypeName(mod_type);
+  if (stat.empty()) stat = "Stat" + std::to_string(stat_type);
+
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "stat", JsonValue::String(stat));
+  ObjectSet(out, "mod", JsonValue::String(mod));
+  ObjectSet(out, "value", JsonValue::Number(value));
+  ObjectSet(out, "display", JsonValue::String(FormatEnchantDisplay(stat, mod, value)));
+  ObjectSet(out, "section", JsonValue::String(section));
+  ObjectSet(out, "slotType", JsonValue::String(section));
+  ObjectSet(out, "slot", JsonValue::Number(slot));
+  ObjectSet(out, "tier", JsonValue::Number(tier));
+  ObjectSet(out, "statModKey", JsonValue::Number(stat_mod_key));
+  ObjectSet(out, "statType", JsonValue::Number(stat_type));
+  ObjectSet(out, "recipeType", CopyOrNull(ObjectGet(enchant, "RecipeType")));
+  ObjectSet(out, "materialKey", CopyOrNull(ObjectGet(enchant, "MaterialKey")));
+  return out;
+}
+
+JsonValue BuildEnchantSlots(const JsonValue& saved_item, const JsonValue* item, JsonValue& all_stats,
+                            JsonValue& bonus_stats, const JsonValue& hero, const JsonValue* item_key,
+                            double& exp_bonus, double& gold_bonus, JsonValue& bonus_sources) {
+  JsonValue slots = JsonValue::Object();
+  std::map<std::string, long long> filled_counts;
+  std::map<std::string, JsonValue> items_by_section;
+  for (const std::string section : {"decoration", "engraving", "inscription"}) {
+    items_by_section[section] = JsonValue::Array();
+    filled_counts[section] = 0;
+  }
+
+  const JsonValue* enchants = ObjectGet(saved_item, "EnchantData");
+  if (enchants && enchants->type == JsonValue::Type::Array) {
+    for (const auto& enchant : enchants->array) {
+      long long recipe_type = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "RecipeType")));
+      long long stat_mod_key = static_cast<long long>(JsonNumberDouble(ObjectGet(enchant, "StatModKey")));
+      double value = JsonNumberDouble(ObjectGet(enchant, "Value"));
+      const char* section_name = EnchantSectionName(recipe_type);
+      if (!section_name[0] || (stat_mod_key == 0 && std::fabs(value) < 0.000000001)) continue;
+      std::string section = section_name;
+      long long slot = ++filled_counts[section];
+
+      JsonValue stat = BuildEnchantStatSummary(enchant, section, slot);
+      all_stats.array.push_back(stat);
+
+      std::string type = BonusType(stat);
+      double percent = JsonNumberDouble(ObjectGet(stat, "value")) / 10.0;
+      if (!type.empty() && std::fabs(percent) > 0.000000001) {
+        bonus_stats.array.push_back(BuildBonusStatSummary(stat, section, type, percent));
+        if (type == "exp") exp_bonus += percent;
+        if (type == "gold") gold_bonus += percent;
+        bonus_sources.array.push_back(BuildBonusSource(hero, item, item_key, type, percent, stat));
+      }
+      items_by_section[section].array.push_back(std::move(stat));
+    }
+  }
+
+  size_t count_index = 0;
+  for (const std::string section : {"decoration", "engraving", "inscription"}) {
+    long long count = (std::max)(filled_counts[section], EnchantCountByIndex(saved_item, count_index++));
+    count = (std::max)(count, EnchantAppliedTotal(saved_item, section));
+    JsonValue section_value = JsonValue::Object();
+    ObjectSet(section_value, "capacity", JsonValue::Number(SlotCapacity(item, section)));
+    ObjectSet(section_value, "filled", JsonValue::Number(count));
+    ObjectSet(section_value, "items", std::move(items_by_section[section]));
+    ObjectSet(slots, section, std::move(section_value));
+  }
+  return slots;
 }
 
 const JsonValue* ItemByKey(const std::string& key) {
@@ -2454,6 +2773,9 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
       }
     }
 
+    JsonValue enchant_slots = BuildEnchantSlots(*saved_item, item, all_stats, bonus_stats, hero, item_key,
+                                                exp_bonus, gold_bonus, bonus_sources);
+
     JsonValue out = JsonValue::Object();
     ObjectSet(out, "uniqueId", unique_id);
     ObjectSet(out, "itemKey", CopyOrNull(item_key));
@@ -2463,6 +2785,8 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
     ObjectSet(out, "icon", CopyOrNull(ObjectGet(*item, "icon")));
     ObjectSet(out, "level", CopyOrNull(ObjectGet(*item, "level")));
     ObjectSet(out, "variant", CopyOrNull(ObjectGet(*item, "variant")));
+    ObjectSet(out, "slotCapacity", CopyOrNull(ObjectGet(*item, "slots")));
+    ObjectSet(out, "enchantSlots", std::move(enchant_slots));
     ObjectSet(out, "stats", std::move(all_stats));
     ObjectSet(out, "bonusStats", std::move(bonus_stats));
     equipped.array.push_back(std::move(out));
