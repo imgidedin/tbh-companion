@@ -7,7 +7,7 @@
   Etapas:
     1. Recalcula o mapa IL2CPP (scripts\refresh_il2cpp_map.py) para a versao
        atual do jogo. Com o jogo aberto, faz a verificacao na memoria viva.
-    2. Compila o executavel (build.bat).
+    2. Fecha a instancia local, compila o executavel (build.bat) e relanca ao fim.
     3. Descobre a versao do jogo e monta a tag: <versao>; se ja existir um
        release dessa versao, usa <versao>-1, <versao>-2, ...
     4. Commita as mudancas do agente e envia para o origin
@@ -51,6 +51,7 @@ $ExePath = Join-Path $AgentDir "build\TBH_Companion.exe"
 $DistDir = Join-Path $AgentDir "dist"
 $MapScript = Join-Path $PSScriptRoot "refresh_il2cpp_map.py"
 $BuildBat = Join-Path $AgentDir "build.bat"
+$ProcessScript = Join-Path $PSScriptRoot "companion_process.ps1"
 $Git = @("-C", $AgentDir)                            # roda git sempre no repo do agente
 
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -61,6 +62,14 @@ function Exec([scriptblock]$cmd) {
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try { & $cmd } finally { $ErrorActionPreference = $old }
+}
+function StopCompanion() {
+  Exec { & powershell -NoProfile -ExecutionPolicy Bypass -File $ProcessScript -ExePath $ExePath -Stop }
+  if ($LASTEXITCODE -ne 0) { Fail "nao foi possivel encerrar o TBH_Companion.exe local." }
+}
+function StartCompanion() {
+  Exec { & powershell -NoProfile -ExecutionPolicy Bypass -File $ProcessScript -ExePath $ExePath -Start }
+  if ($LASTEXITCODE -ne 0) { Fail "nao foi possivel iniciar o TBH_Companion.exe local." }
 }
 
 Push-Location $AgentDir
@@ -96,11 +105,8 @@ try {
   Step "Compilando o executavel (build.bat)..."
   # Encerra uma instancia de dev rodando a partir do proprio build\ (senao o
   # linker falha com LNK1104). Nao mexe em exes instalados em outro lugar.
-  Get-Process -Name "TBH_Companion" -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -eq $ExePath } |
-    ForEach-Object { Stop-Process -Id $_.Id -Force }
-  Start-Sleep -Milliseconds 500
-  Exec { & cmd.exe /c "call `"$BuildBat`"" }
+  StopCompanion
+  Exec { & cmd.exe /c "call `"$BuildBat`" --no-restart" }
   if ($LASTEXITCODE -ne 0) { Fail "build.bat falhou." }
   if (-not (Test-Path $ExePath)) { Fail "Executavel nao encontrado: $ExePath" }
   Write-Host ("    OK: {0} ({1:N0} bytes)" -f $ExePath, (Get-Item $ExePath).Length)
@@ -155,6 +161,8 @@ Gerado por ``scripts\release.ps1``.
     Write-Host "    tag:     $tag"
     Write-Host "    assets:  $exeAsset ; $zipAsset"
     Write-Host "    repo:    $RepoUrl"
+    Step "Iniciando o companion local atualizado..."
+    StartCompanion
     return
   }
 
@@ -184,6 +192,9 @@ Gerado por ``scripts\release.ps1``.
   if ($Draft) { $relArgs += "--draft" }
   Exec { & gh @relArgs }
   if ($LASTEXITCODE -ne 0) { Fail "gh release create falhou." }
+
+  Step "Iniciando o companion local atualizado..."
+  StartCompanion
 
   Step "Concluido!"
   Write-Host "    Release: https://github.com/imgidedin/tbh-companion/releases/tag/$tag" -ForegroundColor Green

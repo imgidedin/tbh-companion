@@ -8,6 +8,13 @@ Worker leve em C++ Win32 puro para configurar e enviar dados ao servidor do comp
 build.bat
 ```
 
+O build fecha uma instancia local de `build\TBH_Companion.exe`, recompila e
+inicia o executavel novo ao terminar. Para compilar sem relancar o app:
+
+```bat
+build.bat --no-restart
+```
+
 Saida:
 
 ```text
@@ -26,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 O `release.ps1`:
 
 1. Recalcula o mapa IL2CPP (`refresh_il2cpp_map.py`) para a versao atual do jogo.
-2. Compila o `TBH_Companion.exe` (encerrando antes uma instancia de dev rodando em `build\`).
+2. Fecha uma instancia de dev rodando em `build\`, compila o `TBH_Companion.exe` e relanca o executavel novo ao final.
 3. Descobre a versao do jogo e monta a tag: `<versao>`; se ja existir um release dessa versao, usa `<versao>-1`, `<versao>-2`, ...
 4. Commita as mudancas e envia para o `origin` (https://github.com/imgidedin/tbh-companion.git, adicionado automaticamente se faltar).
 5. Cria o **GitHub Release** na tag com `TBH_Companion.exe` e um `.zip` anexados para download.

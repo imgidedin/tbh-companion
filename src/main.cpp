@@ -46,6 +46,8 @@ constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStud
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
 constexpr wchar_t STEAM_GAME_URI[] = L"steam://rungameid/3678970";
 constexpr wchar_t AUTOSTART_VALUE_NAME[] = L"TBH Companion";
+constexpr wchar_t APP_WINDOW_CLASS[] = L"TBHCompanionAgentWindow";
+constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\TBHCompanionAgentSingleInstance";
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -3702,6 +3704,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LocalFree(argv);
   }
 
+  HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
+  if (!instance_mutex) return 1;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    HWND existing = FindWindowW(APP_WINDOW_CLASS, nullptr);
+    if (existing) {
+      ShowWindow(existing, SW_SHOW);
+      SetForegroundWindow(existing);
+    }
+    CloseHandle(instance_mutex);
+    return 0;
+  }
+
   INITCOMMONCONTROLSEX controls{};
   controls.dwSize = sizeof(controls);
   controls.dwICC = ICC_STANDARD_CLASSES;
@@ -3709,21 +3723,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
   g_taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
 
-  const wchar_t* class_name = L"TBHCompanionAgentWindow";
   WNDCLASSW wc{};
   wc.lpfnWndProc = WindowProc;
   wc.hInstance = instance;
-  wc.lpszClassName = class_name;
+  wc.lpszClassName = APP_WINDOW_CLASS;
   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APPICON));
   wc.hbrBackground = CreateSolidBrush(RGB(23, 26, 29));
   RegisterClassW(&wc);
 
-  HWND hwnd = CreateWindowExW(0, class_name, L"TBH Companion",
+  HWND hwnd = CreateWindowExW(0, APP_WINDOW_CLASS, L"TBH Companion",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               CW_USEDEFAULT, CW_USEDEFAULT, 620, 470,
                               nullptr, nullptr, instance, nullptr);
-  if (!hwnd) return 1;
+  if (!hwnd) {
+    CloseHandle(instance_mutex);
+    return 1;
+  }
 
   HICON small_icon = reinterpret_cast<HICON>(
       LoadImageW(instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
@@ -3747,5 +3763,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  CloseHandle(instance_mutex);
   return 0;
 }
