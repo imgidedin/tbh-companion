@@ -847,6 +847,14 @@ std::string FirstColoredText(const std::wstring& text) {
   return CleanMarkupUtf8(text.substr(gt + 1, close - gt - 1));
 }
 
+std::string DropItemNameFromRaw(const std::string& raw) {
+  size_t obtained = raw.find(" obtido");
+  if (obtained == std::string::npos) return raw;
+  std::string item = raw.substr(0, obtained);
+  while (!item.empty() && item.back() == ' ') item.pop_back();
+  return item;
+}
+
 // Relogio "HH:MM" extraido do sufixo " <voffset...>[HH:MM]...".
 std::string ExtractClockSuffix(const std::wstring& text) {
   size_t rb = text.rfind(L']');
@@ -1282,6 +1290,42 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
         continue;
       }
 
+      // BoxOpenLog tem dados autoritativos nos campos IL2CPP. Nao use a regex
+      // textual como gate: nomes localizados podem conter simbolos como "1º".
+      if (klass_name == "BoxOpenLog") {
+        std::wstring full = text + clock_suffix;
+        MemoryEvent event;
+        event.type = "drop";
+        event.color = ExtractColorTag(full);
+        event.raw = CleanEventRaw(full);
+        event.clock = ExtractClockSuffix(clock_suffix);
+        event.ts = stamp;
+        event.item = FirstColoredText(text);
+
+        std::string item_name_fallback;
+        std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + kBoxOpenItemKeyOffset));
+        size_t underscore = item_key_str.rfind(L'_');
+        if (underscore != std::wstring::npos) {
+          std::string key = Utf8(item_key_str.substr(underscore + 1));
+          event.item_key = atoi(key.c_str());
+          if (const JsonValue* item = ItemByKey(key)) {
+            item_name_fallback = JsonStringValue(ObjectGet(*item, "name"));
+            event.category = CategoryFromItemType(JsonStringValue(ObjectGet(*item, "type")));
+          }
+        }
+        if (event.item.empty()) event.item = DropItemNameFromRaw(event.raw);
+        if (event.item.empty()) event.item = item_name_fallback;
+        if (event.item.empty() && !item_key_str.empty()) event.item = Utf8(item_key_str);
+
+        int grade_value = 10;
+        ReadInt32(process, obj + kBoxOpenGradeOffset, grade_value);
+        event.grade = GradeTypeName(grade_value);
+        event.id = EventId(event) + (event.ts > 0 ? "|" + std::to_string(event.ts) : "");
+        event.index = static_cast<int>(out.size());
+        out.push_back(std::move(event));
+        continue;
+      }
+
       std::vector<MemoryEvent> parsed;
       AppendRegexEvents(parsed, text + clock_suffix);
       if (parsed.empty()) continue;  // tipo de log que nao acompanhamos (level up, etc.)
@@ -1289,22 +1333,7 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
       event.ts = stamp;
 
       // Enriquecimento autoritativo a partir da classe IL2CPP do log.
-      // BoxOpenLog = item obtido (.ctor(string itemStringKey, EGradeType grade)):
-      // itemStringKey "ItemName_<key>" @0x40, grade @0x48. GetBoxLog = bau.
-      if (klass_name == "BoxOpenLog") {
-        std::wstring item_key_str = ReadManagedString(process, ReadPtr(process, obj + kBoxOpenItemKeyOffset));
-        size_t underscore = item_key_str.rfind(L'_');
-        if (underscore != std::wstring::npos) {
-          std::string key = Utf8(item_key_str.substr(underscore + 1));
-          event.item_key = atoi(key.c_str());
-          if (const JsonValue* item = ItemByKey(key)) {
-            event.category = CategoryFromItemType(JsonStringValue(ObjectGet(*item, "type")));
-          }
-        }
-        int grade_value = 10;
-        ReadInt32(process, obj + kBoxOpenGradeOffset, grade_value);
-        event.grade = GradeTypeName(grade_value);
-      } else if (klass_name == "GetBoxLog") {
+      if (klass_name == "GetBoxLog") {
         event.category = "chest";
       } else if (event.type == "clear" || event.type == "failure") {
         event.category = "stage";

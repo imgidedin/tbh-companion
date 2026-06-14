@@ -239,6 +239,7 @@ Regras:
 
 - Eventos de item devem cruzar `item_key` com `items.json` embutido.
 - Categoria de `BoxOpenLog` vem de item type quando possivel.
+- `BoxOpenLog` deve ser montado pelos campos IL2CPP antes de qualquer regex textual; nomes localizados podem conter simbolos/pontuacao como `1º`.
 - `GetBoxLog` representa bau, nao item obtido.
 - Eventos de "Ouro obtido" por alquimia/craft devem ser categorizados especificamente; nao transformar todo evento em craft.
 - Evite heuristicas por texto quando classe IL2CPP fornece a informacao.
@@ -732,4 +733,3 @@ Subagentes de pesquisa devem receber escopo claro e pedido explicito para nao ed
 - Revisar apos cada update relevante do TaskBarHero.
 - Manter este documento operacional, com caminhos reais e comandos reais.
 - Nao transformar este arquivo em historico de tarefas temporarias.
-
