@@ -63,6 +63,32 @@ offsets que dependem de verificacao viva), `--dry-run` (so mostra o que mudaria)
 Depois: `build.bat`, reinicie o agente e suba o frontend. Se o enum de raridade
 ganhar um grade novo, o script avisa para preencher a traducao PT em `GRADE_PT`.
 
+## Atualizar runtime local do frontend
+
+Na janela do `TBH_Companion.exe`, o botao **Atualizar dev** exporta os dados
+locais usados pelo frontend em modo dev e substitui os arquivos:
+
+- `save-summary.json`
+- `clears.json`
+- `log-history.json`
+- `watcher-status.json`
+
+O destino segue esta ordem:
+
+1. `TBH_DEV_RUNTIME_DIR`, se a variavel de ambiente estiver definida.
+2. Uma pasta irma `tbh-farm-local\runtime`, encontrada subindo a partir do
+   caminho do executavel do agente.
+3. `%LOCALAPPDATA%\TBH Companion\runtime`, como fallback.
+
+A mesma rotina pode ser chamada por terminal com:
+
+```bat
+build\TBH_Companion.exe --export-dev-runtime
+```
+
+Se nao houver historico vivo nem cache valido, a rotina falha sem sobrescrever a
+runtime com `null`.
+
 ## Exportar assets Unity (dev/manual)
 
 Para extrair sprites/artwork do jogo para uma arvore local facil de portar para

@@ -35,6 +35,7 @@ constexpr int IDC_PAIRING_SECRET = 1004;
 constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
+constexpr int IDC_EXPORT_DEV_RUNTIME = 1010;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr int IDM_TRAY_OPEN = 2001;
@@ -2023,6 +2024,24 @@ std::wstring ParentDir(std::wstring path) {
   return slash == std::wstring::npos ? L"" : path.substr(0, slash);
 }
 
+bool DirectoryExists(const std::wstring& path) {
+  DWORD attrs = GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool EnsureDirectoryTree(const std::wstring& dir) {
+  if (dir.empty()) return false;
+  if (DirectoryExists(dir)) return true;
+
+  std::wstring parent = ParentDir(dir);
+  if (!parent.empty() && parent != dir && !DirectoryExists(parent)) {
+    if (!EnsureDirectoryTree(parent)) return false;
+  }
+
+  if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
+  return GetLastError() == ERROR_ALREADY_EXISTS && DirectoryExists(dir);
+}
+
 std::wstring ExePath() {
   std::vector<wchar_t> path(MAX_PATH);
   DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -3224,6 +3243,79 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   return changed;
 }
 
+std::wstring DevRuntimeDir() {
+  std::vector<wchar_t> env(32768);
+  DWORD length = GetEnvironmentVariableW(L"TBH_DEV_RUNTIME_DIR", env.data(), static_cast<DWORD>(env.size()));
+  if (length > 0 && length < env.size()) return std::wstring(env.data(), length);
+
+  std::wstring cursor = ParentDir(ExePath());
+  for (int depth = 0; depth < 8 && !cursor.empty(); ++depth) {
+    std::wstring candidate = cursor + L"\\tbh-farm-local";
+    if (DirectoryExists(candidate)) return candidate + L"\\runtime";
+    std::wstring parent = ParentDir(cursor);
+    if (parent.empty() || parent == cursor) break;
+    cursor = parent;
+  }
+  return CompanionDir() + L"\\runtime";
+}
+
+bool WriteDevRuntimeJson(const std::wstring& runtime_dir,
+                         const wchar_t* file_name,
+                         const std::string& json,
+                         std::wstring& error) {
+  std::wstring path = runtime_dir + L"\\" + file_name;
+  if (WriteUtf8TextFileAtomic(path, json)) return true;
+  error = L"Falha ao escrever " + path;
+  return false;
+}
+
+bool WriteDevRuntimeFiles(const SaveSummary& save,
+                          const MemorySnapshot& memory,
+                          const std::wstring& runtime_dir,
+                          std::wstring& error) {
+  if (!EnsureDirectoryTree(runtime_dir)) {
+    error = L"Falha ao criar pasta runtime dev: " + runtime_dir;
+    return false;
+  }
+  return WriteDevRuntimeJson(runtime_dir, L"save-summary.json", save.summary_json, error) &&
+         WriteDevRuntimeJson(runtime_dir, L"clears.json", memory.clears_json, error) &&
+         WriteDevRuntimeJson(runtime_dir, L"log-history.json", memory.history_json, error) &&
+         WriteDevRuntimeJson(runtime_dir, L"watcher-status.json", memory.watcher_json, error);
+}
+
+std::wstring ExportDevRuntimeSnapshot() {
+  SaveSummary summary;
+  if (!ReadSaveSummary(summary)) return L"Falha: não foi possível ler o save do jogo.";
+
+  WorkerState state;
+  state.save = std::move(summary);
+  state.has_save = true;
+  state.memory.watcher_json = WatcherStatusJson("manual dev export starting");
+
+  RefreshMemoryCache(state, true);
+
+  std::string difficulty = DifficultyFromStageKey(state.save.current_stage_key);
+  if (state.memory.history_json == "null" || state.memory.clears_json == "null") {
+    MemorySnapshot cached;
+    if (LoadMemoryHistoryCache(cached, difficulty)) state.memory = std::move(cached);
+  }
+
+  if (state.memory.history_json == "null" || state.memory.clears_json == "null") {
+    return L"Falha: não foi possível ler o histórico. Abra o TaskBarHero.exe e tente de novo.";
+  }
+
+  state.memory.watcher_json =
+      WatcherStatusJson(state.memory.pid ? "manual dev export from live game" : "manual dev export from cached history");
+  SaveMemoryHistoryCache(state.memory);
+
+  std::wstring runtime_dir = DevRuntimeDir();
+  std::wstring error;
+  if (!WriteDevRuntimeFiles(state.save, state.memory, runtime_dir, error)) return error;
+
+  return L"OK: runtime dev atualizado em " + runtime_dir + L" (" +
+         std::to_wstring(state.memory.events.size()) + L" evento(s)).";
+}
+
 bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
   const std::vector<MemoryEvent>& events = state.memory.events;
   // Assinatura estavel do conteudo (sem updatedAt): so envia quando o save
@@ -3451,6 +3543,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 220, 24, font);
 
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
+      AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 290, 150, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                24, 350, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
@@ -3478,6 +3571,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         Config config = ReadConfigFromUi();
         SaveConfig(config);
         OpenWebUi(config);
+      } else if (id == IDC_EXPORT_DEV_RUNTIME) {
+        SaveConfig(ReadConfigFromUi());
+        SetStatus(L"Exportando runtime dev...");
+        SetStatus(ExportDevRuntimeSnapshot());
       } else if (id == IDC_AUTOSTART) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
@@ -3576,6 +3673,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (!ok) WriteTextFile(TempComparePath(), L"FAIL: não foi possível exportar o resumo C++.");
         LocalFree(argv);
         return ok ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--export-dev-runtime") == 0) {
+        std::wstring result = ExportDevRuntimeSnapshot();
+        WriteTextFile(TempComparePath(), result);
+        LocalFree(argv);
+        return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
       }
       if (wcscmp(argv[i], L"--memory-scan") == 0) {
         MemorySnapshot snapshot = ReadMemorySnapshot("NORMAL");
