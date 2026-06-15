@@ -36,7 +36,6 @@ constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
 constexpr int IDC_EXPORT_DEV_RUNTIME = 1010;
-constexpr int IDC_MOVE_INVENTORY_TO_STORAGE = 1011;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr int IDM_TRAY_OPEN = 2001;
@@ -969,93 +968,6 @@ DWORD FindProcessIdByName(const wchar_t* process_name) {
   }
   CloseHandle(snapshot);
   return found;
-}
-
-struct MainWindowSearch {
-  DWORD pid = 0;
-  HWND hwnd = nullptr;
-};
-
-BOOL CALLBACK EnumMainWindowCallback(HWND hwnd, LPARAM lparam) {
-  auto* search = reinterpret_cast<MainWindowSearch*>(lparam);
-  DWORD window_pid = 0;
-  GetWindowThreadProcessId(hwnd, &window_pid);
-  if (window_pid != search->pid) return TRUE;
-  if (!IsWindowVisible(hwnd)) return TRUE;
-  if (GetWindow(hwnd, GW_OWNER)) return TRUE;
-  RECT rect{};
-  if (!GetWindowRect(hwnd, &rect) || rect.right <= rect.left || rect.bottom <= rect.top) return TRUE;
-  search->hwnd = hwnd;
-  return FALSE;
-}
-
-HWND FindMainWindowByProcessId(DWORD pid) {
-  MainWindowSearch search;
-  search.pid = pid;
-  EnumWindows(EnumMainWindowCallback, reinterpret_cast<LPARAM>(&search));
-  return search.hwnd;
-}
-
-bool CursorInsideClient(HWND hwnd, POINT* client_point = nullptr) {
-  POINT cursor{};
-  if (!GetCursorPos(&cursor)) return false;
-  POINT client = cursor;
-  if (!ScreenToClient(hwnd, &client)) return false;
-  RECT rect{};
-  if (!GetClientRect(hwnd, &rect)) return false;
-  if (client.x < rect.left || client.x >= rect.right || client.y < rect.top || client.y >= rect.bottom) return false;
-  if (client_point) *client_point = client;
-  return true;
-}
-
-void InitKeyboardInput(INPUT& input, WORD vk, DWORD flags) {
-  input = {};
-  input.type = INPUT_KEYBOARD;
-  input.ki.wVk = vk;
-  input.ki.dwFlags = flags;
-}
-
-void InitMouseInput(INPUT& input, DWORD flags) {
-  input = {};
-  input.type = INPUT_MOUSE;
-  input.mi.dwFlags = flags;
-}
-
-bool SendCtrlRightClickAtCursor(HWND game_window, std::wstring& error) {
-  DWORD game_pid = 0;
-  GetWindowThreadProcessId(game_window, &game_pid);
-
-  ShowWindow(game_window, SW_RESTORE);
-  SetForegroundWindow(game_window);
-  Sleep(150);
-
-  HWND foreground = GetForegroundWindow();
-  DWORD foreground_pid = 0;
-  GetWindowThreadProcessId(foreground, &foreground_pid);
-  if (foreground_pid != game_pid) {
-    error = L"o jogo não ficou em foco para receber o comando";
-    return false;
-  }
-
-  POINT client{};
-  if (!CursorInsideClient(game_window, &client)) {
-    error = L"cursor fora da janela do jogo; posicione sobre um item do inventário";
-    return false;
-  }
-
-  INPUT inputs[4];
-  InitKeyboardInput(inputs[0], VK_LCONTROL, 0);
-  InitMouseInput(inputs[1], MOUSEEVENTF_RIGHTDOWN);
-  InitMouseInput(inputs[2], MOUSEEVENTF_RIGHTUP);
-  InitKeyboardInput(inputs[3], VK_LCONTROL, KEYEVENTF_KEYUP);
-
-  constexpr UINT input_count = static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0]));
-  UINT sent = SendInput(input_count, inputs, sizeof(INPUT));
-  if (sent != input_count) {
-    error = L"SendInput falhou: erro Windows " + std::to_wstring(GetLastError());
-    return false;
-  }
-  return true;
 }
 
 bool IsReadableRegion(const MEMORY_BASIC_INFORMATION& info) {
@@ -3242,122 +3154,6 @@ bool ReadSaveSummary(SaveSummary& summary) {
   return !summary.steam_id.empty();
 }
 
-struct InventoryMoveCandidate {
-  bool valid = false;
-  long long inventory_index = -1;
-  long long storage_index = -1;
-  std::string item_unique_id;
-  std::string item_name;
-  std::wstring error;
-};
-
-long long JsonInteger(const JsonValue* value, long long fallback = 0) {
-  return static_cast<long long>(JsonNumberDouble(value, static_cast<double>(fallback)));
-}
-
-const JsonValue* FindInventoryTab(const JsonValue& root, const std::string& id) {
-  const JsonValue* inventory = ObjectGet(root, "inventory");
-  const JsonValue* tabs = inventory ? ObjectGet(*inventory, "tabs") : nullptr;
-  if (!tabs || tabs->type != JsonValue::Type::Array) return nullptr;
-  for (const auto& tab : tabs->array) {
-    if (JsonStringValue(ObjectGet(tab, "id")) == id) return &tab;
-  }
-  return nullptr;
-}
-
-std::string InventorySlotItemName(const JsonValue& slot) {
-  const JsonValue* item = ObjectGet(slot, "item");
-  std::string name = item ? JsonStringValue(ObjectGet(*item, "name")) : "";
-  if (!name.empty()) return name;
-  return JsonNumberKey(ObjectGet(slot, "itemUniqueId"));
-}
-
-InventoryMoveCandidate FindInventoryToStorageCandidate(const SaveSummary& summary) {
-  InventoryMoveCandidate candidate;
-  JsonValue root;
-  if (!ParseJson(summary.summary_json, root)) {
-    candidate.error = L"não foi possível validar inventário/storage no resumo do save";
-    return candidate;
-  }
-
-  const JsonValue* inventory = FindInventoryTab(root, "inventory");
-  const JsonValue* storage = FindInventoryTab(root, "storage");
-  const JsonValue* inventory_slots = inventory ? ObjectGet(*inventory, "slots") : nullptr;
-  const JsonValue* storage_slots = storage ? ObjectGet(*storage, "slots") : nullptr;
-  if (!inventory_slots || inventory_slots->type != JsonValue::Type::Array) {
-    candidate.error = L"inventário não encontrado no save";
-    return candidate;
-  }
-  if (!storage_slots || storage_slots->type != JsonValue::Type::Array) {
-    candidate.error = L"storage não encontrado no save";
-    return candidate;
-  }
-
-  const JsonValue* source = nullptr;
-  for (const auto& slot : inventory_slots->array) {
-    if (JsonBool(ObjectGet(slot, "occupied"), false)) {
-      source = &slot;
-      break;
-    }
-  }
-  if (!source) {
-    candidate.error = L"não há item no inventário para mover";
-    return candidate;
-  }
-
-  const JsonValue* target = nullptr;
-  for (const auto& slot : storage_slots->array) {
-    if (JsonBool(ObjectGet(slot, "unlocked"), false) && !JsonBool(ObjectGet(slot, "occupied"), false)) {
-      target = &slot;
-    }
-  }
-  if (!target) {
-    candidate.error = L"não há slot livre no storage";
-    return candidate;
-  }
-
-  candidate.valid = true;
-  candidate.inventory_index = JsonInteger(ObjectGet(*source, "index"), -1);
-  candidate.storage_index = JsonInteger(ObjectGet(*target, "index"), -1);
-  candidate.item_unique_id = JsonNumberKey(ObjectGet(*source, "itemUniqueId"));
-  candidate.item_name = InventorySlotItemName(*source);
-  return candidate;
-}
-
-void SetStatusImmediate(const std::wstring& text) {
-  SetStatus(text);
-  if (!g_status) return;
-  InvalidateRect(g_status, nullptr, TRUE);
-  UpdateWindow(g_status);
-}
-
-std::wstring MoveInventoryItemToStorageFromGameUi() {
-  SaveSummary summary;
-  if (!ReadSaveSummary(summary)) return L"Falha: não foi possível ler o save do jogo.";
-
-  InventoryMoveCandidate candidate = FindInventoryToStorageCandidate(summary);
-  if (!candidate.valid) return L"Falha: " + candidate.error + L".";
-
-  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
-  if (!pid) return L"Falha: TaskBarHero.exe não está rodando.";
-  HWND game_window = FindMainWindowByProcessId(pid);
-  if (!game_window) return L"Falha: janela principal do TaskBarHero não encontrada.";
-
-  std::wstring candidate_item = Widen(candidate.item_name.empty() ? candidate.item_unique_id : candidate.item_name);
-  SetStatusImmediate(L"Em 3s, posicione o mouse sobre o item que deseja mover. Candidato do save: " +
-                     candidate_item + L".");
-  ShowWindow(game_window, SW_RESTORE);
-  SetForegroundWindow(game_window);
-  Sleep(3000);
-
-  std::wstring error;
-  if (!SendCtrlRightClickAtCursor(game_window, error)) return L"Falha: " + error + L".";
-
-  return L"Ctrl+clique direito enviado ao item sob o cursor. Candidato do save: " + candidate_item + L" (inv " +
-         std::to_wstring(candidate.inventory_index) + L", storage livre " +
-         std::to_wstring(candidate.storage_index) + L"). O save pode demorar alguns segundos para refletir a mudança.";
-}
-
 std::wstring ReadSteamIdFromSave() {
   SaveSummary summary;
   return ReadSaveSummary(summary) ? Widen(summary.steam_id) : L"";
@@ -3887,7 +3683,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
 
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
       AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 290, 150, 34, font);
-      AddButton(hwnd, IDC_MOVE_INVENTORY_TO_STORAGE, L"Mover p/ baú", 438, 290, 136, 34, font);
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                24, 350, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
@@ -3919,10 +3714,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SaveConfig(ReadConfigFromUi());
         SetStatus(L"Exportando runtime dev...");
         SetStatus(ExportDevRuntimeSnapshot());
-      } else if (id == IDC_MOVE_INVENTORY_TO_STORAGE) {
-        SaveConfig(ReadConfigFromUi());
-        SetStatus(L"Preparando mover inventário -> baú...");
-        SetStatus(MoveInventoryItemToStorageFromGameUi());
       } else if (id == IDC_AUTOSTART) {
         Config config = ReadConfigFromUi();
         SaveConfig(config);
