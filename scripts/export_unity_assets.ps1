@@ -174,14 +174,30 @@ function Resolve-PythonExe() {
 }
 
 function Ensure-UnityPy([string]$python) {
-  & $python -c "import UnityPy" *> $null
-  if ($LASTEXITCODE -eq 0) {
+  $oldPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & $python -c "import UnityPy" *> $null
+    $hasUnityPy = $LASTEXITCODE -eq 0
+  } finally {
+    $ErrorActionPreference = $oldPreference
+  }
+
+  if ($hasUnityPy) {
     return
   }
 
   Write-Host "  UnityPy nao encontrado; instalando no Python selecionado..."
-  & $python -m pip install UnityPy
-  if ($LASTEXITCODE -ne 0) {
+  $oldPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & $python -m pip install UnityPy
+    $pipExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $oldPreference
+  }
+
+  if ($pipExitCode -ne 0) {
     Fail "Nao consegui instalar UnityPy. Instale manualmente com: $python -m pip install UnityPy"
   }
 }

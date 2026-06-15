@@ -369,6 +369,8 @@ Funcoes importantes:
 - `New-ContactSheets`: gera folhas de contato.
 - `Organize-ExportedProject`: monta o `frontend-pack`.
 
+Observacao PowerShell: checagens de dependencia Python, como `python -c "import UnityPy"`, devem desativar temporariamente `$ErrorActionPreference = "Stop"` ou capturar o exit code explicitamente. No Windows PowerShell, stderr de processo nativo pode virar erro terminante antes do script instalar a dependencia.
+
 Salvaguardas:
 
 - `-EnforceVersionGuard` impede exportar duas vezes a mesma versao.
