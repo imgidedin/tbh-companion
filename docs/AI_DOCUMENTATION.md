@@ -21,7 +21,7 @@ O repo `tbh-companion-agent` contem um worker Win32 C++ puro que roda no PC do j
 - abre/minimiza na bandeja;
 - inicia o jogo pelo Steam se necessario;
 - le o save ES3 oficial do TaskBarHero;
-- extrai resumo de save com gold, stage atual, herois, itens equipados, runas, pets e monster kills;
+- extrai resumo de save com gold, stage atual, herois, itens equipados, inventario/storage, runas, pets e monster kills;
 - le eventos vivos diretamente da memoria do jogo via `LogManager`/IL2CPP;
 - classifica eventos de clear, falha, morte, baus e drops;
 - envia payload incremental para o frontend remoto em `POST /api/ingest`;
@@ -170,6 +170,7 @@ Dados extraidos:
 - stage atual e max stage
 - herois e equipe ativa
 - equipamentos e stats dos herois
+- inventario, storage e stash de troca (`inventorySaveDatas`, `stashSaveDatas`, `tradingStashSaveDatas`) com slots desbloqueados, vazios e itens resolvidos por `itemSaveDatas`
 - pets e estados de unlock/viewed
 - runas e niveis
 - monster kills agregadas

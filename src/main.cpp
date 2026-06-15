@@ -2761,6 +2761,62 @@ JsonValue BuildEnchantSlots(const JsonValue& saved_item, const JsonValue* item, 
   return slots;
 }
 
+JsonValue BuildSavedItemSummary(const JsonValue& saved_item,
+                                const JsonValue* item,
+                                const JsonValue* item_key,
+                                const JsonValue& bonus_owner,
+                                double& exp_bonus,
+                                double& gold_bonus,
+                                JsonValue& bonus_sources) {
+  JsonValue all_stats = JsonValue::Array();
+  JsonValue bonus_stats = JsonValue::Array();
+  const JsonValue* stats = item ? ObjectGet(*item, "stats") : nullptr;
+  for (const std::string section_name : {"base", "inherent"}) {
+    const JsonValue* section = stats ? ObjectGet(*stats, section_name) : nullptr;
+    if (!section || section->type != JsonValue::Type::Array) continue;
+    for (const auto& stat : section->array) {
+      all_stats.array.push_back(BuildStatSummary(stat, section_name));
+      std::string type = BonusType(stat);
+      double value = JsonNumberDouble(ObjectGet(stat, "value"));
+      double percent = value / 10.0;
+      if (!type.empty() && std::fabs(percent) > 0.000000001) {
+        bonus_stats.array.push_back(BuildBonusStatSummary(stat, section_name, type, percent));
+        if (type == "exp") exp_bonus += percent;
+        if (type == "gold") gold_bonus += percent;
+        bonus_sources.array.push_back(BuildBonusSource(bonus_owner, item, item_key, type, percent, stat));
+      }
+    }
+  }
+
+  JsonValue enchant_slots = BuildEnchantSlots(saved_item, item, all_stats, bonus_stats, bonus_owner, item_key,
+                                              exp_bonus, gold_bonus, bonus_sources);
+
+  JsonValue out = JsonValue::Object();
+  ObjectSet(out, "uniqueId", CopyOrNull(ObjectGet(saved_item, "UniqueId")));
+  ObjectSet(out, "itemKey", CopyOrNull(item_key));
+  ObjectSet(out, "name", item ? CopyOrNull(ObjectGet(*item, "name")) : JsonValue::Null());
+  ObjectSet(out, "grade", item ? CopyOrNull(ObjectGet(*item, "grade")) : JsonValue::Null());
+  ObjectSet(out, "part", item ? CopyOrNull(ObjectGet(*item, "parts")) : JsonValue::Null());
+  ObjectSet(out, "icon", item ? CopyOrNull(ObjectGet(*item, "icon")) : JsonValue::Null());
+  ObjectSet(out, "level", item ? CopyOrNull(ObjectGet(*item, "level")) : JsonValue::Null());
+  ObjectSet(out, "variant", item ? CopyOrNull(ObjectGet(*item, "variant")) : JsonValue::Null());
+  ObjectSet(out, "slotCapacity", item ? CopyOrNull(ObjectGet(*item, "slots")) : JsonValue::Null());
+  ObjectSet(out, "enchantSlots", std::move(enchant_slots));
+  ObjectSet(out, "stats", std::move(all_stats));
+  ObjectSet(out, "bonusStats", std::move(bonus_stats));
+
+  if (const JsonValue* value = ObjectGet(saved_item, "IsBlocked")) ObjectSet(out, "blocked", *value);
+  if (const JsonValue* value = ObjectGet(saved_item, "IsChaotic")) ObjectSet(out, "chaotic", *value);
+  if (const JsonValue* value = ObjectGet(saved_item, "IsServerPendingItem")) ObjectSet(out, "serverPending", *value);
+  if (const JsonValue* value = ObjectGet(saved_item, "IsViewed")) {
+    ObjectSet(out, "viewed", *value);
+    ObjectSet(out, "isNew", JsonValue::Bool(!JsonBool(value, true)));
+  }
+  if (const JsonValue* value = ObjectGet(saved_item, "IsNew")) ObjectSet(out, "isNew", *value);
+
+  return out;
+}
+
 const JsonValue* ItemByKey(const std::string& key) {
   // Carrega as definicoes do items.json (extraido do items.zip embutido) uma
   // vez e indexa por key. Antes embutiamos um indice .txt cru de ~2.3MB no exe;
@@ -2802,44 +2858,8 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
     const JsonValue* item_key = ObjectGet(*saved_item, "ItemKey");
     const JsonValue* item = ItemByKey(JsonNumberKey(item_key));
     if (!item) continue;
-
-    JsonValue all_stats = JsonValue::Array();
-    JsonValue bonus_stats = JsonValue::Array();
-    const JsonValue* stats = ObjectGet(*item, "stats");
-    for (const std::string section_name : {"base", "inherent"}) {
-      const JsonValue* section = stats ? ObjectGet(*stats, section_name) : nullptr;
-      if (!section || section->type != JsonValue::Type::Array) continue;
-      for (const auto& stat : section->array) {
-        all_stats.array.push_back(BuildStatSummary(stat, section_name));
-        std::string type = BonusType(stat);
-        double value = JsonNumberDouble(ObjectGet(stat, "value"));
-        double percent = value / 10.0;
-        if (!type.empty() && std::fabs(percent) > 0.000000001) {
-          bonus_stats.array.push_back(BuildBonusStatSummary(stat, section_name, type, percent));
-          if (type == "exp") exp_bonus += percent;
-          if (type == "gold") gold_bonus += percent;
-          bonus_sources.array.push_back(BuildBonusSource(hero, item, item_key, type, percent, stat));
-        }
-      }
-    }
-
-    JsonValue enchant_slots = BuildEnchantSlots(*saved_item, item, all_stats, bonus_stats, hero, item_key,
-                                                exp_bonus, gold_bonus, bonus_sources);
-
-    JsonValue out = JsonValue::Object();
-    ObjectSet(out, "uniqueId", unique_id);
-    ObjectSet(out, "itemKey", CopyOrNull(item_key));
-    ObjectSet(out, "name", CopyOrNull(ObjectGet(*item, "name")));
-    ObjectSet(out, "grade", CopyOrNull(ObjectGet(*item, "grade")));
-    ObjectSet(out, "part", CopyOrNull(ObjectGet(*item, "parts")));
-    ObjectSet(out, "icon", CopyOrNull(ObjectGet(*item, "icon")));
-    ObjectSet(out, "level", CopyOrNull(ObjectGet(*item, "level")));
-    ObjectSet(out, "variant", CopyOrNull(ObjectGet(*item, "variant")));
-    ObjectSet(out, "slotCapacity", CopyOrNull(ObjectGet(*item, "slots")));
-    ObjectSet(out, "enchantSlots", std::move(enchant_slots));
-    ObjectSet(out, "stats", std::move(all_stats));
-    ObjectSet(out, "bonusStats", std::move(bonus_stats));
-    equipped.array.push_back(std::move(out));
+    equipped.array.push_back(BuildSavedItemSummary(*saved_item, item, item_key, hero, exp_bonus, gold_bonus,
+                                                   bonus_sources));
   }
   return equipped;
 }
@@ -2937,6 +2957,93 @@ JsonValue GoldQuantity(const JsonValue* currencies) {
   return CopyOrNull(gold ? ObjectGet(*gold, "Quantity") : nullptr);
 }
 
+const JsonValue* SlotUnlockField(const JsonValue& slot) {
+  const JsonValue* unlocked = ObjectGet(slot, "IsUnlock");
+  if (!unlocked) unlocked = ObjectGet(slot, "IsUnLock");
+  return unlocked;
+}
+
+JsonValue BuildInventorySlotSummary(const JsonValue& slot,
+                                    const std::map<std::string, const JsonValue*>& item_by_uid) {
+  JsonValue out = JsonValue::Object();
+  const JsonValue* item_uid = ObjectGet(slot, "ItemUniqueId");
+  const JsonValue* unlocked = SlotUnlockField(slot);
+  ObjectSet(out, "index", CopyOrNull(ObjectGet(slot, "Index")));
+  ObjectSet(out, "unlocked", unlocked ? *unlocked : JsonValue::Bool(false));
+  if (const JsonValue* unlocked_by_rune = ObjectGet(slot, "IsUnlockedByRune")) {
+    ObjectSet(out, "unlockedByRune", *unlocked_by_rune);
+  }
+  ObjectSet(out, "itemUniqueId", CopyOrNull(item_uid));
+  ObjectSet(out, "occupied", JsonValue::Bool(!IsZeroNumber(item_uid)));
+
+  auto saved_it = item_by_uid.find(JsonNumberKey(item_uid));
+  if (saved_it == item_by_uid.end()) {
+    ObjectSet(out, "item", JsonValue::Null());
+    return out;
+  }
+
+  const JsonValue* saved_item = saved_it->second;
+  const JsonValue* item_key = ObjectGet(*saved_item, "ItemKey");
+  const JsonValue* item = ItemByKey(JsonNumberKey(item_key));
+  JsonValue bonus_owner = JsonValue::Object();
+  double ignored_exp_bonus = 0;
+  double ignored_gold_bonus = 0;
+  JsonValue ignored_bonus_sources = JsonValue::Array();
+  ObjectSet(out, "item", BuildSavedItemSummary(*saved_item, item, item_key, bonus_owner, ignored_exp_bonus,
+                                               ignored_gold_bonus, ignored_bonus_sources));
+  return out;
+}
+
+JsonValue BuildInventoryTabSummary(const std::string& id,
+                                   const std::string& label,
+                                   const JsonValue* source_slots,
+                                   const std::map<std::string, const JsonValue*>& item_by_uid) {
+  JsonValue tab = JsonValue::Object();
+  JsonValue slots = JsonValue::Array();
+  long long total = 0;
+  long long unlocked_count = 0;
+  long long occupied_count = 0;
+
+  if (source_slots && source_slots->type == JsonValue::Type::Array) {
+    total = static_cast<long long>(source_slots->array.size());
+    for (const auto& slot : source_slots->array) {
+      const JsonValue* unlocked = SlotUnlockField(slot);
+      bool is_unlocked = JsonBool(unlocked, false);
+      bool is_occupied = !IsZeroNumber(ObjectGet(slot, "ItemUniqueId"));
+      if (is_unlocked) unlocked_count++;
+      if (is_occupied) occupied_count++;
+      if (is_unlocked) slots.array.push_back(BuildInventorySlotSummary(slot, item_by_uid));
+    }
+  }
+
+  ObjectSet(tab, "id", JsonValue::String(id));
+  ObjectSet(tab, "label", JsonValue::String(label));
+  ObjectSet(tab, "totalSlots", JsonValue::Number(total));
+  ObjectSet(tab, "unlockedSlots", JsonValue::Number(unlocked_count));
+  ObjectSet(tab, "lockedSlots", JsonValue::Number((std::max)(0LL, total - unlocked_count)));
+  ObjectSet(tab, "occupiedSlots", JsonValue::Number(occupied_count));
+  ObjectSet(tab, "emptySlots", JsonValue::Number((std::max)(0LL, unlocked_count - occupied_count)));
+  ObjectSet(tab, "slots", std::move(slots));
+  return tab;
+}
+
+JsonValue BuildInventorySummary(const JsonValue* player,
+                                const std::map<std::string, const JsonValue*>& item_by_uid) {
+  JsonValue out = JsonValue::Object();
+  JsonValue tabs = JsonValue::Array();
+  tabs.array.push_back(BuildInventoryTabSummary("inventory", "Inventário",
+                                                player ? ObjectGet(*player, "inventorySaveDatas") : nullptr,
+                                                item_by_uid));
+  tabs.array.push_back(BuildInventoryTabSummary("storage", "Storage",
+                                                player ? ObjectGet(*player, "stashSaveDatas") : nullptr,
+                                                item_by_uid));
+  tabs.array.push_back(BuildInventoryTabSummary("trade", "Troca",
+                                                player ? ObjectGet(*player, "tradingStashSaveDatas") : nullptr,
+                                                item_by_uid));
+  ObjectSet(out, "tabs", std::move(tabs));
+  return out;
+}
+
 JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   const JsonValue* player = ObjectGet(save, "PlayerSaveData");
   const JsonValue* account = ObjectGet(save, "AccountSaveData");
@@ -3001,6 +3108,7 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   ObjectSet(out, "runes", BuildRunesSummary(runes));
   ObjectSet(out, "monsterKills", BuildMonsterKills(aggregates));
   ObjectSet(out, "equipmentBonuses", std::move(equipment_bonuses));
+  ObjectSet(out, "inventory", BuildInventorySummary(player, item_by_uid));
   ObjectSet(out, "gold", GoldQuantity(player ? ObjectGet(*player, "currenySaveDatas") : nullptr));
   return out;
 }
