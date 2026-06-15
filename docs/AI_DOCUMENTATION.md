@@ -26,6 +26,7 @@ O repo `tbh-companion-agent` contem um worker Win32 C++ puro que roda no PC do j
 - classifica eventos de clear, falha, morte, baus e drops;
 - envia payload incremental para o frontend remoto em `POST /api/ingest`;
 - embute `res/items.zip` no executavel para resolver dados de item;
+- possui acao local guardada para mover item do inventario para storage via gesto nativo do jogo;
 - possui scripts para recalcular offsets IL2CPP por versao do jogo;
 - possui scripts para exportar assets Unity e gerar `frontend-pack` para o frontend.
 
@@ -59,6 +60,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
 | Historico/clears | `BuildHistoryJson`, `BuildClearsJson`, caches locais. |
 | Sync | `CachedPayload`, `PostJsonPayload`, `SyncCachedPayload`, sync incremental. |
+| Automacao local de UI | `MoveInventoryItemToStorageFromGameUi` valida save e envia `Ctrl+clique` ao jogo. |
 | Harness CLI | `--compare`, `--dump-save-summary`, `--memory-scan`. |
 
 ### Loop do worker
@@ -90,6 +92,25 @@ Campos importantes:
 - autostart no registro do Windows.
 
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
+
+### Automacao local inventario -> storage
+
+O botao `Mover p/ bau` na UI Win32 do agente e uma automacao local e guardada para mover um item do inventario para o storage sem editar o save.
+
+Fluxo atual:
+
+1. `ReadSaveSummary` le o save e `FindInventoryToStorageCandidate` valida que ha item no inventario e slot desbloqueado livre no storage.
+2. O agente foca a janela principal do `TaskBarHero.exe`.
+3. A UI mostra uma contagem de 3s para o usuario posicionar o mouse sobre o item desejado no inventario aberto do jogo.
+4. `SendCtrlLeftClickAtCursor` envia `LeftControl + clique esquerdo`, que corresponde ao `MoveToStash` encontrado no dump do jogo.
+5. O jogo decide o slot final do storage; o agente nao escreve no save.
+
+Limitacoes intencionais desta etapa:
+
+- ainda nao ha fila/remoto/frontend para tarefas de mover item;
+- ainda nao ha clique automatico no slot de origem; o comando move o item sob o cursor porque o mapeamento vivo de coordenadas da UI Unity ainda precisa ser implementado;
+- o save pode demorar alguns segundos para refletir a mudanca feita pela UI do jogo;
+- se a UI de inventario/storage nao estiver aberta ou o cursor nao estiver sobre um item movivel, o jogo pode ignorar o comando.
 
 ### Arquivos de cache/local runtime
 
