@@ -1021,7 +1021,7 @@ void InitMouseInput(INPUT& input, DWORD flags) {
   input.mi.dwFlags = flags;
 }
 
-bool SendCtrlLeftClickAtCursor(HWND game_window, std::wstring& error) {
+bool SendCtrlRightClickAtCursor(HWND game_window, std::wstring& error) {
   DWORD game_pid = 0;
   GetWindowThreadProcessId(game_window, &game_pid);
 
@@ -1045,8 +1045,8 @@ bool SendCtrlLeftClickAtCursor(HWND game_window, std::wstring& error) {
 
   INPUT inputs[4];
   InitKeyboardInput(inputs[0], VK_LCONTROL, 0);
-  InitMouseInput(inputs[1], MOUSEEVENTF_LEFTDOWN);
-  InitMouseInput(inputs[2], MOUSEEVENTF_LEFTUP);
+  InitMouseInput(inputs[1], MOUSEEVENTF_RIGHTDOWN);
+  InitMouseInput(inputs[2], MOUSEEVENTF_RIGHTUP);
   InitKeyboardInput(inputs[3], VK_LCONTROL, KEYEVENTF_KEYUP);
 
   constexpr UINT input_count = static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0]));
@@ -3351,9 +3351,9 @@ std::wstring MoveInventoryItemToStorageFromGameUi() {
   Sleep(3000);
 
   std::wstring error;
-  if (!SendCtrlLeftClickAtCursor(game_window, error)) return L"Falha: " + error + L".";
+  if (!SendCtrlRightClickAtCursor(game_window, error)) return L"Falha: " + error + L".";
 
-  return L"Ctrl+clique enviado ao item sob o cursor. Candidato do save: " + candidate_item + L" (inv " +
+  return L"Ctrl+clique direito enviado ao item sob o cursor. Candidato do save: " + candidate_item + L" (inv " +
          std::to_wstring(candidate.inventory_index) + L", storage livre " +
          std::to_wstring(candidate.storage_index) + L"). O save pode demorar alguns segundos para refletir a mudança.";
 }

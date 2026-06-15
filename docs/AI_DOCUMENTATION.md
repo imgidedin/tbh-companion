@@ -60,7 +60,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
 | Historico/clears | `BuildHistoryJson`, `BuildClearsJson`, caches locais. |
 | Sync | `CachedPayload`, `PostJsonPayload`, `SyncCachedPayload`, sync incremental. |
-| Automacao local de UI | `MoveInventoryItemToStorageFromGameUi` valida save e envia `Ctrl+clique` ao jogo. |
+| Automacao local de UI | `MoveInventoryItemToStorageFromGameUi` valida save e envia `Ctrl+clique direito` ao jogo. |
 | Harness CLI | `--compare`, `--dump-save-summary`, `--memory-scan`. |
 
 ### Loop do worker
@@ -102,7 +102,7 @@ Fluxo atual:
 1. `ReadSaveSummary` le o save e `FindInventoryToStorageCandidate` valida que ha item no inventario e slot desbloqueado livre no storage.
 2. O agente foca a janela principal do `TaskBarHero.exe`.
 3. A UI mostra uma contagem de 3s para o usuario posicionar o mouse sobre o item desejado no inventario aberto do jogo.
-4. `SendCtrlLeftClickAtCursor` envia `LeftControl + clique esquerdo`, que corresponde ao `MoveToStash` encontrado no dump do jogo.
+4. `SendCtrlRightClickAtCursor` envia `LeftControl + clique direito`, que corresponde ao `MoveToStash` encontrado no dump do jogo.
 5. O jogo decide o slot final do storage; o agente nao escreve no save.
 
 Limitacoes intencionais desta etapa:
