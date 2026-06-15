@@ -8,10 +8,11 @@ O codigo continua sendo a fonte final. Antes de editar qualquer rotina, abra os 
 
 1. Leia `README.md` para contexto de build, release, mapa IL2CPP e export de assets.
 2. Leia este arquivo ate a secao do dominio afetado.
-3. Abra `src/main.cpp` ou o script relevante antes de editar.
-4. Use a skill operacional correspondente.
-5. Rode o harness indicado.
-6. Se uma regra importante for descoberta, atualize esta documentacao.
+3. Para automacao de inventario -> storage, leia tambem `docs/INVENTORY_STORAGE_AUTOMATION_PLAN.md`.
+4. Abra `src/main.cpp` ou o script relevante antes de editar.
+5. Use a skill operacional correspondente.
+6. Rode o harness indicado.
+7. Se uma regra importante for descoberta, atualize esta documentacao.
 
 ## Resumo executivo
 
@@ -94,6 +95,9 @@ Campos importantes:
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
 
 ### Automacao local inventario -> storage
+
+Plano vivo da tarefa: `docs/INVENTORY_STORAGE_AUTOMATION_PLAN.md`.
+Harness de investigacao: `scripts/probe_live_slots.py`.
 
 O botao `Mover p/ bau` na UI Win32 do agente e uma automacao local e guardada para mover um item do inventario para o storage sem editar o save.
 
@@ -182,6 +186,15 @@ Fluxo:
 3. `LoadSaveRoot` parseia JSON.
 4. `BuildSaveSummaryJson` extrai dados relevantes.
 5. `SaveSummary` guarda JSON serializado e campos usados pelo worker.
+
+Comportamento do save oficial do jogo, confirmado no dump IL2CPP 1.00.12:
+
+- O gerenciador de save do jogo e a classe obfuscada `bal`.
+- `bal.<AutoSaveAsync>d__57.MoveNext` chama `SaveAsync` e depois agenda `UniTask.Delay(TimeSpan.FromSeconds(180), ..., PlayerLoopTiming.Update, cancellationToken, ...)`.
+- O autosave periodico so chama `SaveAsync` quando `UnityEngine.Time.timeScale > 0`; se o jogo estiver pausado/timeScale zero, o loop segue para o delay.
+- `OnApplicationPause(true)` dispara `SaveAsync` fire-and-forget.
+- `OnApplicationQuit` cancela os tokens de autosave, tenta adquirir o `SemaphoreSlim` por `3000 ms`, executa a rotina sincronizada de escrita e libera o semaforo.
+- O companion nao escreve o save oficial; `RefreshSaveCache` observa apenas `mtime`. Portanto e esperado o arquivo ficar sem alteracao por mais de 1 minuto, especialmente entre ciclos de autosave de 180s ou quando a escrita esta aguardando semaforo/cancelamento/validacao.
 
 Dados extraidos:
 
