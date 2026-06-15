@@ -185,6 +185,10 @@ Regras:
 
 O agente nao varre heap para achar logs. Ele le diretamente a `List<LogData>` do singleton `LogManager` usando offsets extraidos por versao do jogo.
 
+O RVA `kLogManagerTypeInfoRva` aponta para o TypeInfo do singleton base generico de `TaskbarHero.Log.LogManager`, nao necessariamente para um simbolo literal fixo. O obfuscator pode mudar o prefixo entre builds (`nn<LogManager>_TypeInfo`, `np<LogManager>_TypeInfo`, etc.); `scripts/refresh_il2cpp_map.py` deve ler a heranca da classe no `dump.cs` e resolver o candidato correspondente em `script.json`.
+
+Se o jogo estiver aberto mas a lista de logs ainda estiver vazia, o refresh deve aceitar a cadeia viva `static_fields/list` e preservar `kLogDataTextOffset`/`kLogDataClockOffset` atuais. Nao falhar apenas por `size=0`; isso pode acontecer em menu ou logo apos abrir o jogo.
+
 Bloco sensivel:
 
 ```cpp

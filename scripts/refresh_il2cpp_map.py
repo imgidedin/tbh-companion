@@ -7,7 +7,7 @@ List<LogData> do LogManager mudam. Este script:
   1. Localiza a instalacao do jogo (Steam) e a versao.
   2. Baixa/usa o Il2CppDumper e gera o dump (dump.cs + script.json).
   3. Extrai do dump TODOS os valores que o agente precisa:
-       - RVA de nn<LogManager>_TypeInfo
+       - RVA do TypeInfo do singleton base de LogManager
        - offsets de LogManager (List<LogData>) e LogData (texto/relogio/DateTime)
        - offsets de BoxOpenLog (itemStringKey + EGradeType)
        - o enum EGradeType (nomes das raridades, em ordem)
@@ -202,24 +202,60 @@ def parse_enum(src: str, name: str) -> list[str]:
     return [pairs[i] for i in range(max(pairs) + 1) if i in pairs]
 
 
-def find_typeinfo_rva(script_json: Path, name: str) -> int:
+def log_manager_typeinfo_candidates(log_manager_body: str) -> list[str]:
+    candidates: list[str] = []
+    header = log_manager_body.splitlines()[1] if len(log_manager_body.splitlines()) > 1 else ""
+    m = re.search(r"\bclass\s+LogManager\s*:\s*([A-Za-z_]\w*)<LogManager>", header)
+    if m:
+        candidates.append(f"{m.group(1)}<LogManager>_TypeInfo")
+
+    # Fallbacks for older dumps and for future obfuscator renames where the
+    # generic singleton prefix changes but script.json still keeps a useful name.
+    candidates.extend([
+        "nn<LogManager>_TypeInfo",
+        "np<LogManager>_TypeInfo",
+        "TaskbarHero.Log.LogManager_TypeInfo",
+        "LogManager_TypeInfo",
+    ])
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def find_typeinfo_rva(script_json: Path, names: list[str]) -> tuple[int, str]:
     data = json.loads(script_json.read_text(encoding="utf-8"))
+    metadata = data.get("ScriptMetadata", [])
+    wanted = set(names)
+    for entry in metadata:
+        if entry.get("Name") in wanted:
+            return int(entry["Address"]), str(entry["Name"])
+
     for entry in data.get("ScriptMetadata", []):
-        if entry.get("Name") == name:
-            return int(entry["Address"])
-    raise SystemExit(f"{name} nao encontrado em script.json (ScriptMetadata).")
+        entry_name = str(entry.get("Name", ""))
+        if entry_name.endswith("<LogManager>_TypeInfo"):
+            return int(entry["Address"]), entry_name
+
+    raise SystemExit(
+        "TypeInfo de LogManager nao encontrado em script.json (ScriptMetadata). "
+        f"Candidatos: {', '.join(names)}"
+    )
 
 
 def extract_map(dump_dir: Path) -> dict:
     src = (dump_dir / "dump.cs").read_text(encoding="utf-8", errors="ignore")
     info: dict = {}
 
-    info["typeinfo_rva"] = find_typeinfo_rva(dump_dir / "script.json", "nn<LogManager>_TypeInfo")
-
     # LogManager: primeiro campo List<LogData> = log completo em ordem de insercao.
     lm = class_body(src, "LogManager")
     if not lm:
         raise SystemExit("classe LogManager nao encontrada.")
+    info["typeinfo_rva"], info["typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        log_manager_typeinfo_candidates(lm),
+    )
     lists = [off for (t, _n, off) in fields_of(lm) if t == "List<LogData>"]
     if not lists:
         raise SystemExit("LogManager nao tem campo List<LogData>.")
@@ -352,6 +388,7 @@ def verify_live(info: dict) -> dict:
 
     # 1) Descobre static_fields + qual List<LogData> da o log completo.
     best = None  # (static_off, list_off, items_ptr, size)
+    empty_best = None  # (static_off, list_off)
     for soff in STATIC_FIELDS_CANDIDATES:
         statics = r.rptr(klass + soff)
         instance = r.rptr(statics)
@@ -363,7 +400,11 @@ def verify_live(info: dict) -> dict:
                 continue
             items = r.rptr(lst + 0x10)
             size = r.rint(lst + 0x18)
-            if not items or size is None or size <= 0 or size > 4000:
+            if not items or size is None or size < 0 or size > 4000:
+                continue
+            if size == 0:
+                if empty_best is None:
+                    empty_best = (soff, loff)
                 continue
             # valida: primeiro item parece um objeto gerenciado com classe nomeada
             obj0 = r.rptr(items + 0x20)
@@ -372,6 +413,13 @@ def verify_live(info: dict) -> dict:
                 if best is None or size > best[3]:
                     best = (soff, loff, items, size)
     if not best:
+        if empty_best:
+            soff, loff = empty_best
+            info["static_fields_offset"] = soff
+            info["list_offset"] = loff
+            print(f"[*] Cadeia resolvida ao vivo: static_fields=0x{soff:X} list=0x{loff:X} size=0")
+            print("[!] Lista de logs vazia — offsets de texto/relogio serao mantidos do main.cpp atual.")
+            return info
         raise SystemExit("Nao consegui resolver a cadeia LogManager ao vivo (offsets mudaram demais?).")
     soff, loff, items, size = best
     info["static_fields_offset"] = soff
@@ -538,7 +586,8 @@ def main() -> int:
     dumper = ensure_dumper()
     dump_dir = run_dumper(dumper, game_dir)
     info = extract_map(dump_dir)
-    print(f"[*] Extraido do dump: TypeInfo RVA=0x{info['typeinfo_rva']:X} "
+    print(f"[*] Extraido do dump: TypeInfo {info.get('typeinfo_name', '?')} "
+          f"RVA=0x{info['typeinfo_rva']:X} "
           f"listas={[hex(x) for x in info['list_offsets']]} "
           f"strings={[hex(x) for x in info['string_offsets']]} "
           f"datetime=0x{info['datetime_offset']:X} "
