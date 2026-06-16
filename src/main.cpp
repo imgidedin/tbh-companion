@@ -1001,8 +1001,8 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.12) =====
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E1BF28;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.13) =====
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E0CBC8;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;

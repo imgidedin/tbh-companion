@@ -42,6 +42,8 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | Release | `scripts/release.ps1` | Recalcula mapa, compila, commita, push e publica GitHub Release. |
 | Assets Unity | `scripts/export_unity_assets.ps1`, `scripts/extract_unity_localization.py`, `exported-assets/` | Organiza AssetRipper export em `frontend-pack`. |
 | Frontend pack | `exported-assets/TaskBarHero-<versao>/frontend-pack/` | Fonte para rebuild do frontend. |
+| Referencia de batalha | `scripts/extract_battle_reference.py`, `docs/battle-reference-<versao>.*` | Cruza AssetRipper, CSVs, prefabs, AnimationClips e dump IL2CPP para features visuais de combate. |
+| Ghidra IL2CPP | `scripts/run-ghidra-il2cpp-headless.ps1`, `scripts/run-ghidra-combat-decompile.ps1`, `scripts/ghidra/` | Importa `GameAssembly.dll`, aplica labels do Il2CppDumper e exporta pseudocodigo de combate via Ghidra headless. |
 
 ## Arquitetura operacional
 
@@ -181,6 +183,15 @@ Comportamento do save oficial do jogo, confirmado no dump IL2CPP 1.00.12:
 - O autosave periodico so chama `SaveAsync` quando `UnityEngine.Time.timeScale > 0`; se o jogo estiver pausado/timeScale zero, o loop segue para o delay.
 - `OnApplicationPause(true)` dispara `SaveAsync` fire-and-forget.
 - `OnApplicationQuit` cancela os tokens de autosave, tenta adquirir o `SemaphoreSlim` por `3000 ms`, executa a rotina sincronizada de escrita e libera o semaforo.
+- Chamadas extras para `SaveAsync` passam principalmente por `bal.mbn()` em eventos de gameplay/inicializacao: `StageManager` (spawn/recompensas/progresso), `vb.Cube` (alchemy/cube) e `vb.uj.uh` (mail/claim). Isso explica saves em menos de 180s quando o jogador recebe/claim itens, troca estado de stage ou usa sistemas que alteram inventario.
+- Nao ha evidencia de UnityEvent serializado chamando diretamente os wrappers publicos de save (`dgy`, `frn`, `ljj`, `mbn`, `muj`) nos YAMLs de scene/prefab/asset do dump 1.00.12.
+- No build Windows 1.00.12, `ProjectSettings.runInBackground = 1`; teste local minimizando/restaurando a janela do jogo nao mudou o `mtime` do save em 30s, entao foco/minimize nao deve ser tratado como gatilho confiavel para `OnApplicationPause(true)`.
+- O caminho local `bal.SaveAsync`/`OnApplicationPause(true)` nao mostrou chamadas diretas para a pilha de backend/Steam inventory (`qj`, `wy`, `TaskbarHero.InventoryUploadToSteam*` ou `vb.Cube.Try*Backend`) na disassembly nativa. A escrita local parece ficar no ES3 protegido por `SemaphoreSlim`.
+- A sincronizacao/upload de inventario/backend parece separada e concentrada em `qj.OnSteamInventoryUpdated`, `qj.SynchronizeInventoryByBackendData`, `wy.HandleBackendInventoryUpdate`, `TaskbarHero.InventoryUploadToSteam*` e nos metodos `vb.Cube.Try*Backend`. Acoes de Cube/recompensas podem acionar essa pilha por alterarem inventario; forcar apenas `OnApplicationPause(true)` deveria acionar so o save local, sem upload direto pelo jogo.
+- Ressalva: Steam Cloud/cliente Steam pode sincronizar arquivos modificados fora do codigo do jogo. Isso e diferente de uma chamada de backend feita pela rotina `SaveAsync`. O manifesto local `appmanifest_3678970.acf` identifica o app como `TBH: Task Bar Hero`, mas a pasta instalada nao contem `steam_autocloud.vdf`; nao ha evidencia local de regra AutoCloud junto do build instalado.
+- `scripts/test_pause_window_signals.ps1` e um harness nao invasivo para testar sinais de janela/OS (`WM_ACTIVATEAPP`, minimize/restore e opcionalmente `WM_POWERBROADCAST`) e medir se o `mtime` do save muda. Ele nao chama IL2CPP, nao injeta codigo e nao escreve memoria do processo; portanto nao equivale a chamar diretamente `bal.OnApplicationPause(bool)`.
+- Teste manual do harness de sinais de janela/OS nao disparou alteracao do save. Tratamos `OnApplicationPause(true)` como inacessivel por mensagens normais de janela no Windows neste build; chamar diretamente exigiria patch/injecao/chamada interna IL2CPP.
+- Varredura estatica por funcao no `GameAssembly.dll` confirmou 16 xrefs diretos para `bal.mbn()`: `StageManager.<SpawnFriendlyUnitAsync>d__115.MoveNext`, quatro callbacks `StageManager.rm` (`cxp`, `ew`, `gbt`, `ibr`), `StageManager.ru.MoveNext`, `StageManager.ry.MoveNext`, `vb.Cube.<TriggerCurrentRecipeLogic>d__138.MoveNext`, `vb.uj.uh.<TryClaimItem>d__19.MoveNext`, tres helpers de mail/claim (`dsn`, `iyo`, `kcj`) e quatro metodos de inicializacao `qi` (`ehk`, `hdi`, `ihv`, `mrj`). Nao houve xrefs diretos para `bal.dgy`, `bal.frn`, `bal.ljj` ou `bal.muj`.
 - O companion nao escreve o save oficial; `RefreshSaveCache` observa apenas `mtime`. Portanto e esperado o arquivo ficar sem alteracao por mais de 1 minuto, especialmente entre ciclos de autosave de 180s ou quando a escrita esta aguardando semaforo/cancelamento/validacao.
 
 Dados extraidos:
@@ -409,6 +420,78 @@ Regra:
 - Assets do jogo podem ser usados no companion como fan-made; nao incluir segredos ou arquivos pessoais.
 - O frontend nao deve depender da wiki se o pack contem o dado.
 - Mudancas no formato do pack devem ser coordenadas com `tbh-farm-local-frontend/scripts/rebuild-from-agent-pack.ps1`.
+
+## Referencia estatica de batalha
+
+Objetivo:
+
+- alimentar features visuais, como easter egg de arena no frontend, com dados extraidos do jogo em vez de heuristicas;
+- manter uma base reaproveitavel para sprites, animacoes, anchors de prefab, skills, stages e classes IL2CPP relacionadas a combate.
+
+Comando principal:
+
+```powershell
+py scripts\extract_battle_reference.py --version <versao>
+```
+
+Entradas:
+
+- `exported-assets\TaskBarHero-<versao>\frontend-pack\manifest.json`;
+- `ExportedProject` apontado pelo manifest;
+- `scripts\.cache\dump\dump.cs` e `scripts\.cache\dump\script.json` gerados por `scripts\refresh_il2cpp_map.py`;
+- CSVs de `Assets\TextAsset`: `HeroInfoData`, `MonsterInfoData`, `SkillInfoData`, `StageInfoData`;
+- YAMLs Unity de `AnimationClip`, `AnimatorController`, `AnimatorOverrideController`, `GameObject` e `Sprite`.
+
+Saidas:
+
+- `docs\battle-reference-<versao>.json`: referencia estruturada para codigo;
+- `docs\battle-reference-<versao>.md`: resumo legivel da extracao.
+
+Referencia atual gerada:
+
+```text
+docs\battle-reference-1.00.13.json
+docs\battle-reference-1.00.13.md
+```
+
+Regras:
+
+- Este fluxo e read-only: nao injeta, nao chama IL2CPP e nao escreve memoria do processo do jogo.
+- Para fidelidade visual, usar `HeroInfoData`/`MonsterInfoData` para prefab e animator, `SkillInfoData` para range/delivery/clips, `StageInfoData` para inimigos do stage, `UnitBaseAnimator.controller` + override controllers para estados e clips, e anchors de prefab para posicoes.
+- Nao inverter sprites por suposicao; usar a escala/posicao do prefab, especialmente o objeto `View`, e os frames extraidos dos clips como referencia de orientacao.
+- O C# exportado pelo AssetRipper em IL2CPP tem corpos stubados. Target selection, timing exato e fluxo interno de movimento/ataque exigem Ghidra/IDA no `GameAssembly.dll` com nomes/RVAs do Il2CppDumper.
+- Para Ghidra, preferir adicionar a pasta `scripts\ghidra` no Script Manager e rodar `apply_il2cppdumper_labels.py`; o script original em `.cache\il2cppdumper\ghidra.py` pode nao aparecer porque nao tem metadados de categoria do Ghidra.
+
+### Ghidra CLI IL2CPP
+
+Fluxo preferido para evitar passos manuais no Ghidra:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-ghidra-il2cpp-headless.ps1 -Fresh
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-ghidra-combat-decompile.ps1 -MaxMethods 2000
+```
+
+Arquivos envolvidos:
+
+- `scripts\ghidra\ApplyIl2CppDumperLabelsHeadless.java`: importa `script.json` e aplica labels no projeto Ghidra.
+- `scripts\ghidra\DecompileIl2CppCombatTargets.java`: decompila alvos filtrados de combate.
+- `scripts\ghidra-projects-cache\TaskBarHero-Il2Cpp-1.00.13.gpr`: projeto Ghidra gerado localmente e ignorado pelo Git.
+- `scripts\ghidra-projects-cache\TaskBarHero-Il2Cpp-1.00.13-report.md`: resumo de labels/RVAs.
+- `scripts\ghidra-projects-cache\decompiled-combat\`: pseudocodigo C exportado por grupo (`StageManager.c`, `UnitHero.c`, `Monster.c`, `ActiveSkill.c`, `Projectiles.c`, `MonsterSpawnManager.c`).
+
+Ultima execucao validada para `1.00.13`:
+
+- Labels aplicados: `484257`.
+- Falhas de label: `0`.
+- Metodos de combate selecionados: `509`.
+- Metodos de combate decompilados: `509`.
+- Falhas de decompilacao: `0`.
+
+Observacoes:
+
+- `-Fresh` no wrapper nao passa `-deleteProject` ao Ghidra; essa flag do Ghidra cria projeto temporario e apaga no fim.
+- O wrapper resolve `JAVA_HOME` automaticamente para `C:\Program Files\Eclipse Adoptium\jdk-*` quando o terminal nao tem `java` no `PATH`.
+- A pasta `scripts\ghidra-projects-cache\` nao pode ficar dentro de `scripts\.cache\`, porque o Ghidra headless rejeita path com elemento iniciado por ponto.
 
 ## Atualizacao do mapa IL2CPP
 

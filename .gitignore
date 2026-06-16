@@ -1,6 +1,7 @@
 build/
 dist/
 scripts/.cache/
+scripts/ghidra-projects-cache/
 scripts/__pycache__/
 exported-assets/
 scripts/exported-assets/
