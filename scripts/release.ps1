@@ -106,7 +106,7 @@ try {
   # Encerra uma instancia de dev rodando a partir do proprio build\ (senao o
   # linker falha com LNK1104). Nao mexe em exes instalados em outro lugar.
   StopCompanion
-  Exec { & cmd.exe /c "call `"$BuildBat`" --no-restart" }
+  Exec { & cmd.exe /c "call `"$BuildBat`" --no-restart --release" }
   if ($LASTEXITCODE -ne 0) { Fail "build.bat falhou." }
   if (-not (Test-Path $ExePath)) { Fail "Executavel nao encontrado: $ExePath" }
   Write-Host ("    OK: {0} ({1:N0} bytes)" -f $ExePath, (Get-Item $ExePath).Length)

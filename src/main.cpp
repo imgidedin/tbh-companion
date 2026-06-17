@@ -28,6 +28,10 @@
 
 namespace {
 
+#ifndef TBH_DEVELOPMENT_MODE
+#define TBH_DEVELOPMENT_MODE 1
+#endif
+
 constexpr int IDC_SERVER = 1001;
 constexpr int IDC_TOKEN = 1002;
 constexpr int IDC_STEAM = 1003;
@@ -43,6 +47,8 @@ constexpr int IDM_TRAY_WEB = 2002;
 constexpr int IDM_TRAY_EXIT = 2003;
 constexpr int IDM_TRAY_TOGGLE_TBH = 2004;
 constexpr int IDM_TRAY_MINIMIZE_TO_TASKBAR = 2005;
+constexpr int IDM_TRAY_EXPORT_DEV_RUNTIME = 2006;
+constexpr bool kDevelopmentMode = TBH_DEVELOPMENT_MODE != 0;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
@@ -250,6 +256,9 @@ void ShowTrayMenu(HWND hwnd) {
               game_visible ? L"Esconder TBH" : L"Mostrar TBH");
   AppendMenuW(menu, MF_STRING | (config.minimize_to_taskbar ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar");
+  if (kDevelopmentMode) {
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXPORT_DEV_RUNTIME, L"Atualizar save local");
+  }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Sair");
   SetMenuDefaultItem(menu, IDM_TRAY_OPEN, FALSE);
@@ -3502,7 +3511,17 @@ bool WriteDevRuntimeFiles(const SaveSummary& save,
          WriteDevRuntimeJson(runtime_dir, L"watcher-status.json", memory.watcher_json, error);
 }
 
+std::wstring WriteDevRuntimeSnapshot(const SaveSummary& save, const MemorySnapshot& memory) {
+  std::wstring runtime_dir = DevRuntimeDir();
+  std::wstring error;
+  if (!WriteDevRuntimeFiles(save, memory, runtime_dir, error)) return error;
+  return L"OK: runtime dev atualizado em " + runtime_dir + L" (" +
+         std::to_wstring(memory.events.size()) + L" evento(s)).";
+}
+
 std::wstring ExportDevRuntimeSnapshot() {
+  if (!kDevelopmentMode) return L"Export dev indisponível neste build.";
+
   SaveSummary summary;
   if (!ReadSaveSummary(summary)) return L"Falha: não foi possível ler o save do jogo.";
 
@@ -3527,12 +3546,27 @@ std::wstring ExportDevRuntimeSnapshot() {
       WatcherStatusJson(state.memory.pid ? "manual dev export from live game" : "manual dev export from cached history");
   SaveMemoryHistoryCache(state.memory);
 
-  std::wstring runtime_dir = DevRuntimeDir();
-  std::wstring error;
-  if (!WriteDevRuntimeFiles(state.save, state.memory, runtime_dir, error)) return error;
+  return WriteDevRuntimeSnapshot(state.save, state.memory);
+}
 
-  return L"OK: runtime dev atualizado em " + runtime_dir + L" (" +
-         std::to_wstring(state.memory.events.size()) + L" evento(s)).";
+void AutoExportDevRuntimeSnapshot(const WorkerState& state, bool changed) {
+  if (!kDevelopmentMode || !changed || !state.has_save) return;
+  if (state.memory.history_json == "null" || state.memory.clears_json == "null") return;
+  static std::string last_signature;
+  const std::vector<MemoryEvent>& events = state.memory.events;
+  std::string signature = Fnv1aHash(state.save.summary_json + "|" +
+                                    std::to_string(events.size()) + "|" +
+                                    (events.empty() ? "" : events.back().id) + "|" +
+                                    state.memory.clears_json + "|" +
+                                    state.memory.history_json);
+  if (signature == last_signature) return;
+  std::wstring result = WriteDevRuntimeSnapshot(state.save, state.memory);
+  if (result.rfind(L"OK:", 0) == 0) {
+    last_signature = signature;
+    PostStatus(L"Save local dev atualizado (" + std::to_wstring(events.size()) + L" evento(s)).");
+  } else {
+    PostStatus(result);
+  }
 }
 
 bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
@@ -3621,8 +3655,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
   while (WaitForSingleObject(g_worker_stop, 1000) == WAIT_TIMEOUT) {
     Config config = LoadConfig();
-    bool changed = false;
-    changed = RefreshSaveCache(state) || changed;
+    bool save_changed = RefreshSaveCache(state);
+    bool changed = save_changed;
 
     if (!game_ready) {
       game_ready = EnsureGameRunning();
@@ -3658,8 +3692,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
       state.last_sync_config_signature = sync_config_signature;
     }
 
-    changed = RefreshMemoryCache(state) || changed;
-    if (changed) {
+    bool memory_changed = RefreshMemoryCache(state);
+    changed = memory_changed || changed;
+    AutoExportDevRuntimeSnapshot(state, save_changed || memory_changed);
+    if (memory_changed) {
       SyncCachedPayload(config, state);
     }
   }
@@ -3763,7 +3799,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 220, 24, font);
 
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
-      AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 290, 150, 34, font);
+      if (kDevelopmentMode) {
+        AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 290, 150, 34, font);
+      }
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                24, 350, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
@@ -3811,6 +3849,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         config.minimize_to_taskbar = !config.minimize_to_taskbar;
         SaveConfig(config);
         SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
+      } else if (id == IDM_TRAY_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
+        SaveConfig(ReadConfigFromUi());
+        SetStatus(L"Atualizando save local...");
+        SetStatus(ExportDevRuntimeSnapshot());
       } else if (id == IDM_TRAY_EXIT) {
         DestroyWindow(hwnd);
       }

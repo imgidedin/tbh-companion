@@ -13,9 +13,16 @@ set ITEMS_HEADER=%ROOT%src\generated_items.h
 set PROCESS_SCRIPT=%ROOT%scripts\companion_process.ps1
 set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 set RESTART=1
+set DEVELOPMENT_MODE=1
 
+:parse_args
+if "%~1"=="" goto args_done
 if /I "%~1"=="--no-restart" set RESTART=0
 if /I "%~1"=="/norestart" set RESTART=0
+if /I "%~1"=="--release" set DEVELOPMENT_MODE=0
+shift
+goto parse_args
+:args_done
 
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%ROOT%res" mkdir "%ROOT%res"
@@ -32,7 +39,7 @@ if errorlevel 1 exit /b 1
 rc /nologo /fo "%RC_OUT%" "%RC_SRC%"
 if errorlevel 1 exit /b 1
 
-cl /nologo /std:c++17 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE "%SRC%" ^
+cl /nologo /std:c++17 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE /DTBH_DEVELOPMENT_MODE=%DEVELOPMENT_MODE% "%SRC%" ^
   "%RC_OUT%" ^
   /Fe:"%EXE%" ^
   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib winhttp.lib shell32.lib advapi32.lib bcrypt.lib

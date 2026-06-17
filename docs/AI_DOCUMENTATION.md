@@ -73,7 +73,8 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 6. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
 7. Eventos novos sao adicionados com `index` monotonicamente crescente.
 8. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
-9. O loop para quando a janela/tray manda encerrar.
+9. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ou historico tambem atualizam automaticamente o runtime local do frontend.
+10. O loop para quando a janela/tray manda encerrar.
 
 ### Configuracao local
 
@@ -111,6 +112,7 @@ Regras:
 - O agente cria icone na bandeja e continua rodando quando a janela e fechada.
 - Minimizar esconde o agente na bandeja por padrao; o menu de contexto da bandeja tem `Minimizar para taskbar` para alternar o comportamento e persistir em `config.ini`.
 - O menu da bandeja inclui `Esconder TBH`/`Mostrar TBH`, que alterna a visibilidade da janela principal de `TaskBarHero.exe`; o processo do jogo continua rodando e o worker segue lendo save/memoria normalmente.
+- Em build de desenvolvimento, a janela mostra `Atualizar dev` e o menu da bandeja mostra `Atualizar save local`; ambos exportam `save-summary.json`, `clears.json`, `log-history.json` e `watcher-status.json` para o runtime local. Esses controles nao existem em release.
 - O label de status e um controle `STATIC` com fundo solido; ao atualizar texto menor que o anterior, force repaint para evitar sobra visual.
 
 ### Arquivos de cache/local runtime
@@ -346,7 +348,7 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 Etapas:
 
 1. Recalcula mapa IL2CPP para a versao atual do jogo.
-2. Compila `build\TBH_Companion.exe`.
+2. Compila `build\TBH_Companion.exe` via `build.bat --no-restart --release`, desligando `TBH_DEVELOPMENT_MODE`.
 3. Detecta versao do jogo e escolhe tag.
 4. Commita e faz push do agente.
 5. Cria GitHub Release com `.exe` e `.zip`.

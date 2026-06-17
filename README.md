@@ -72,8 +72,10 @@ ganhar um grade novo, o script avisa para preencher a traducao PT em `GRADE_PT`.
 
 ## Atualizar runtime local do frontend
 
-Na janela do `TBH_Companion.exe`, o botao **Atualizar dev** exporta os dados
-locais usados pelo frontend em modo dev e substitui os arquivos:
+Em builds locais de desenvolvimento, a janela do `TBH_Companion.exe` mostra o
+botao **Atualizar dev** e o menu de bandeja mostra **Atualizar save local**.
+Essas opcoes exportam os dados locais usados pelo frontend em modo dev e
+substituem os arquivos:
 
 - `save-summary.json`
 - `clears.json`
@@ -92,6 +94,11 @@ A mesma rotina pode ser chamada por terminal com:
 ```bat
 build\TBH_Companion.exe --export-dev-runtime
 ```
+
+Em builds de desenvolvimento, o worker tambem atualiza esses arquivos
+automaticamente quando detecta mudanca no save ou novos eventos de historico.
+Builds gerados por `scripts\release.ps1` desligam esse modo e nao exibem esses
+controles.
 
 Se nao houver historico vivo nem cache valido, a rotina falha sem sobrescrever a
 runtime com `null`.
