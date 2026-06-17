@@ -2845,10 +2845,18 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
                              const std::map<std::string, const JsonValue*>& item_by_uid,
                              double& exp_bonus,
                              double& gold_bonus,
-                             JsonValue& bonus_sources) {
+                             JsonValue& bonus_sources,
+                             bool accumulate_bonuses) {
   JsonValue equipped = JsonValue::Array();
   const JsonValue* equipped_ids = ObjectGet(hero, "equippedItemIds");
   if (!equipped_ids || equipped_ids->type != JsonValue::Type::Array) return equipped;
+
+  double ignored_exp_bonus = 0;
+  double ignored_gold_bonus = 0;
+  JsonValue ignored_bonus_sources = JsonValue::Array();
+  double* target_exp_bonus = accumulate_bonuses ? &exp_bonus : &ignored_exp_bonus;
+  double* target_gold_bonus = accumulate_bonuses ? &gold_bonus : &ignored_gold_bonus;
+  JsonValue* target_bonus_sources = accumulate_bonuses ? &bonus_sources : &ignored_bonus_sources;
 
   for (const auto& unique_id : equipped_ids->array) {
     if (IsZeroNumber(&unique_id)) continue;
@@ -2858,13 +2866,14 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
     const JsonValue* item_key = ObjectGet(*saved_item, "ItemKey");
     const JsonValue* item = ItemByKey(JsonNumberKey(item_key));
     if (!item) continue;
-    equipped.array.push_back(BuildSavedItemSummary(*saved_item, item, item_key, hero, exp_bonus, gold_bonus,
-                                                   bonus_sources));
+    equipped.array.push_back(BuildSavedItemSummary(*saved_item, item, item_key, hero, *target_exp_bonus,
+                                                   *target_gold_bonus, *target_bonus_sources));
   }
   return equipped;
 }
 
 JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
+                           bool accumulate_equipment_bonuses,
                            const std::map<std::string, const JsonValue*>& item_by_uid,
                            double& exp_bonus,
                            double& gold_bonus,
@@ -2878,7 +2887,8 @@ JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
   ObjectSet(out, "equippedSkillKey", CopyOrEmptyArray(ObjectGet(hero, "equippedSKillKey")));
   if (include_equipment) {
     ObjectSet(out, "equippedItemIds", CopyOrEmptyArray(ObjectGet(hero, "equippedItemIds")));
-    ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
+    ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, exp_bonus, gold_bonus, bonus_sources,
+                                                       accumulate_equipment_bonuses));
   }
   return out;
 }
@@ -3068,7 +3078,8 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
     for (const auto& hero_key : arranged->array) {
       auto it = hero_by_key.find(JsonNumberKey(&hero_key));
       if (it != hero_by_key.end()) {
-        party.array.push_back(BuildHeroSummary(*it->second, true, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
+        party.array.push_back(BuildHeroSummary(*it->second, true, true, item_by_uid, exp_bonus, gold_bonus,
+                                               bonus_sources));
       }
     }
   }
@@ -3077,7 +3088,8 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   if (heroes && heroes->type == JsonValue::Type::Array) {
     for (const auto& hero : heroes->array) {
       if (JsonBool(ObjectGet(hero, "IsUnLock"))) {
-        unlocked.array.push_back(BuildHeroSummary(hero, false, item_by_uid, exp_bonus, gold_bonus, bonus_sources));
+        unlocked.array.push_back(BuildHeroSummary(hero, true, false, item_by_uid, exp_bonus, gold_bonus,
+                                                 bonus_sources));
       }
     }
   }

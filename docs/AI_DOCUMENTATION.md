@@ -201,7 +201,7 @@ Dados extraidos:
 - gold moeda `100001`
 - stage atual e max stage
 - herois e equipe ativa
-- equipamentos e stats dos herois
+- equipamentos e stats dos herois; `partyHeroLevels[].equippedItems` e `unlockedHeroes[].equippedItems` incluem os itens equipados para permitir comparacao de composicao no frontend
 - inventario, storage e stash de troca (`inventorySaveDatas`, `stashSaveDatas`, `tradingStashSaveDatas`) com slots desbloqueados, vazios e itens resolvidos por `itemSaveDatas`
 - pets e estados de unlock/viewed
 - runas e niveis
@@ -213,6 +213,7 @@ Regras:
 - Se o frontend precisa de novo dado do save, implementar no C++ e validar com `--dump-save-summary`.
 - Evitar parsing por string quando o `JsonValue` ja permite navegar com chaves.
 - Se extrair novo array/objeto grande, considerar impacto no payload e no Postgres.
+- `equipmentBonuses` agrega somente os equipamentos da equipe ativa (`partyHeroLevels`); equipamentos serializados em `unlockedHeroes` nao devem somar bonus global para evitar duplicacao e incluir herois fora da composicao atual.
 
 ## Leitura de memoria / LogManager / IL2CPP
 
