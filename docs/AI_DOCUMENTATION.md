@@ -90,6 +90,7 @@ Campos importantes:
 - `steam_id`: opcional; se vazio, o agente tenta ler do save.
 - `pairing_secret`: senha local usada para parear browsers.
 - autostart no registro do Windows.
+- `app.minimize_to_taskbar`: opcional; `0` por padrao minimiza o agent para a bandeja, `1` mantem minimizacao normal na taskbar.
 
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
 
@@ -102,8 +103,15 @@ Regras:
 - nao simular mouse, teclado ou comandos de UI do jogo;
 - nao editar save oficial;
 - nao mover itens, equipar, comprar, vender ou executar qualquer acao no jogo;
-- pode ler o save oficial, ler eventos vivos de memoria e exportar snapshots de desenvolvimento;
+- pode ler o save oficial, ler eventos vivos de memoria, exportar snapshots de desenvolvimento e esconder/mostrar a janela do jogo com `ShowWindow(SW_HIDE/SW_SHOW)` pelo menu da bandeja;
 - qualquer feature nova que exija interacao ativa com o jogo deve ser recusada ou redefinida como visual/read-only antes de implementacao.
+
+### UI/tray
+
+- O agente cria icone na bandeja e continua rodando quando a janela e fechada.
+- Minimizar esconde o agente na bandeja por padrao; o menu de contexto da bandeja tem `Minimizar para taskbar` para alternar o comportamento e persistir em `config.ini`.
+- O menu da bandeja inclui `Esconder TBH`/`Mostrar TBH`, que alterna a visibilidade da janela principal de `TaskBarHero.exe`; o processo do jogo continua rodando e o worker segue lendo save/memoria normalmente.
+- O label de status e um controle `STATIC` com fundo solido; ao atualizar texto menor que o anterior, force repaint para evitar sobra visual.
 
 ### Arquivos de cache/local runtime
 

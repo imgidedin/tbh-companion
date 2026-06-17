@@ -41,6 +41,8 @@ constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr int IDM_TRAY_OPEN = 2001;
 constexpr int IDM_TRAY_WEB = 2002;
 constexpr int IDM_TRAY_EXIT = 2003;
+constexpr int IDM_TRAY_TOGGLE_TBH = 2004;
+constexpr int IDM_TRAY_MINIMIZE_TO_TASKBAR = 2005;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
 constexpr char DEFAULT_ES3_KEY[] = "emuMqG3bLYJ938ZDCfieWJ";
@@ -65,6 +67,7 @@ UINT g_taskbar_created_msg = 0;
 
 std::string Utf8(const std::wstring& text);
 std::wstring CompanionDir();
+DWORD FindProcessIdByName(const wchar_t* process_name);
 
 struct Config {
   std::wstring server = L"https://tbh.gided.in";
@@ -72,7 +75,10 @@ struct Config {
   std::wstring steam_id;
   std::wstring pairing_secret;
   bool auto_start = false;
+  bool minimize_to_taskbar = false;
 };
+
+Config LoadConfig();
 
 struct SaveSummary {
   std::string steam_id;
@@ -200,11 +206,50 @@ void ShowTrayBalloon(const std::wstring& title, const std::wstring& text) {
   Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
+struct GameWindowSearch {
+  DWORD pid = 0;
+  HWND visible = nullptr;
+  HWND hidden = nullptr;
+};
+
+BOOL CALLBACK FindGameWindowProc(HWND window, LPARAM param) {
+  auto* search = reinterpret_cast<GameWindowSearch*>(param);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(window, &pid);
+  if (pid != search->pid) return TRUE;
+  if (GetWindow(window, GW_OWNER)) return TRUE;
+  LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+  if (style & WS_CHILD) return TRUE;
+  RECT rect{};
+  if (!GetWindowRect(window, &rect) || rect.right <= rect.left || rect.bottom <= rect.top) return TRUE;
+  if (IsWindowVisible(window)) {
+    search->visible = window;
+    return FALSE;
+  }
+  if (!search->hidden) search->hidden = window;
+  return TRUE;
+}
+
+HWND FindGameWindow() {
+  GameWindowSearch search;
+  search.pid = FindProcessIdByName(L"TaskBarHero.exe");
+  if (!search.pid) return nullptr;
+  EnumWindows(FindGameWindowProc, reinterpret_cast<LPARAM>(&search));
+  return search.visible ? search.visible : search.hidden;
+}
+
 void ShowTrayMenu(HWND hwnd) {
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
+  Config config = LoadConfig();
+  HWND game_window = FindGameWindow();
+  bool game_visible = game_window && IsWindowVisible(game_window);
   AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Configurações");
   AppendMenuW(menu, MF_STRING, IDM_TRAY_WEB, L"Abrir painel web");
+  AppendMenuW(menu, MF_STRING | (game_window ? 0 : MF_GRAYED), IDM_TRAY_TOGGLE_TBH,
+              game_visible ? L"Esconder TBH" : L"Mostrar TBH");
+  AppendMenuW(menu, MF_STRING | (config.minimize_to_taskbar ? MF_CHECKED : MF_UNCHECKED),
+              IDM_TRAY_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Sair");
   SetMenuDefaultItem(menu, IDM_TRAY_OPEN, FALSE);
@@ -216,8 +261,28 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 void SetStatus(const std::wstring& text) {
-  SetWindowTextW(g_status, text.c_str());
+  if (g_status) {
+    SetWindowTextW(g_status, text.c_str());
+    InvalidateRect(g_status, nullptr, TRUE);
+    UpdateWindow(g_status);
+  }
   UpdateTrayTip(text);
+}
+
+void ToggleGameWindowVisibility() {
+  HWND game_window = FindGameWindow();
+  if (!game_window) {
+    SetStatus(L"TaskBarHero.exe não encontrado.");
+    return;
+  }
+  if (IsWindowVisible(game_window)) {
+    ShowWindow(game_window, SW_HIDE);
+    SetStatus(L"TBH escondido. O jogo continua rodando em segundo plano.");
+  } else {
+    ShowWindow(game_window, SW_RESTORE);
+    SetForegroundWindow(game_window);
+    SetStatus(L"TBH mostrado.");
+  }
 }
 
 void PostStatus(const std::wstring& text) {
@@ -388,6 +453,7 @@ Config LoadConfig() {
   config.pairing_secret = Trim(buffer);
 
   config.auto_start = IsAutoStartEnabled();
+  config.minimize_to_taskbar = GetPrivateProfileIntW(L"app", L"minimize_to_taskbar", 0, path.c_str()) != 0;
 
   return config;
 }
@@ -399,6 +465,7 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"player", L"steam_id", config.steam_id.c_str(), path.c_str());
   WritePrivateProfileStringW(L"player", L"pairing_secret", config.pairing_secret.c_str(), path.c_str());
   WritePrivateProfileStringW(L"app", L"auto_start", config.auto_start ? L"1" : L"0", path.c_str());
+  WritePrivateProfileStringW(L"app", L"minimize_to_taskbar", config.minimize_to_taskbar ? L"1" : L"0", path.c_str());
   SetAutoStart(config.auto_start);
 }
 
@@ -409,6 +476,7 @@ Config ReadConfigFromUi() {
   config.steam_id = GetWindowTextString(g_steam);
   config.pairing_secret = GetWindowTextString(g_pairing_secret);
   config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  config.minimize_to_taskbar = LoadConfig().minimize_to_taskbar;
   return config;
 }
 
@@ -3668,6 +3736,7 @@ void OpenWebUi(const Config& config) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
   static HFONT font = nullptr;
   static HFONT title_font = nullptr;
+  static HBRUSH bg_brush = nullptr;
 
   switch (message) {
     case WM_CREATE: {
@@ -3731,10 +3800,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SaveConfig(config);
         SetStatus(config.auto_start ? L"Inicialização com Windows ativada." : L"Inicialização com Windows desativada.");
       } else if (id == IDM_TRAY_OPEN) {
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
       } else if (id == IDM_TRAY_WEB) {
         OpenWebUi(LoadConfig());
+      } else if (id == IDM_TRAY_TOGGLE_TBH) {
+        ToggleGameWindowVisibility();
+      } else if (id == IDM_TRAY_MINIMIZE_TO_TASKBAR) {
+        Config config = LoadConfig();
+        config.minimize_to_taskbar = !config.minimize_to_taskbar;
+        SaveConfig(config);
+        SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
       } else if (id == IDM_TRAY_EXIT) {
         DestroyWindow(hwnd);
       }
@@ -3752,18 +3828,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       HDC dc = reinterpret_cast<HDC>(wparam);
       SetTextColor(dc, RGB(225, 232, 228));
       SetBkColor(dc, RGB(23, 26, 29));
-      return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+      if (!bg_brush) bg_brush = CreateSolidBrush(RGB(23, 26, 29));
+      return reinterpret_cast<LRESULT>(bg_brush);
     }
     case WM_APP_TRAY: {
       UINT event = static_cast<UINT>(LOWORD(lparam));
       if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK) {
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
       } else if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
         ShowTrayMenu(hwnd);
       }
       return 0;
     }
+    case WM_SIZE:
+      if (wparam == SIZE_MINIMIZED && !LoadConfig().minimize_to_taskbar) {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+      }
+      break;
     case WM_CLOSE: {
       // Fechar a janela apenas esconde; o worker continua na bandeja.
       static bool hint_shown = false;
@@ -3779,6 +3862,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       StopWorker();
       if (font) DeleteObject(font);
       if (title_font) DeleteObject(title_font);
+      if (bg_brush) DeleteObject(bg_brush);
       g_main_window = nullptr;
       PostQuitMessage(0);
       return 0;
@@ -3858,7 +3942,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     HWND existing = FindWindowW(APP_WINDOW_CLASS, nullptr);
     if (existing) {
-      ShowWindow(existing, SW_SHOW);
+      ShowWindow(existing, SW_RESTORE);
       SetForegroundWindow(existing);
     }
     CloseHandle(instance_mutex);
