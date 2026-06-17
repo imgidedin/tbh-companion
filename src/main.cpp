@@ -104,6 +104,7 @@ struct SaveSummary {
 struct MemoryEvent {
   std::string type;
   std::string label;
+  std::string difficulty;
   int seconds = 0;
   std::string progress;
   std::string item;
@@ -1643,6 +1644,7 @@ JsonValue EventJson(const MemoryEvent& event) {
   JsonValue out = JsonValue::Object();
   ObjectSet(out, "type", JsonValue::String(event.type));
   if (!event.label.empty()) ObjectSet(out, "label", JsonValue::String(event.label));
+  if (!event.difficulty.empty()) ObjectSet(out, "difficulty", JsonValue::String(event.difficulty));
   if (event.type == "clear") ObjectSet(out, "seconds", JsonValue::Number(static_cast<long long>(event.seconds)));
   if (!event.progress.empty()) ObjectSet(out, "progress", JsonValue::String(event.progress));
   if (!event.item.empty()) ObjectSet(out, "item", JsonValue::String(event.item));
@@ -1677,6 +1679,21 @@ bool StageLabelLess(const std::string& a, const std::string& b) {
   return StageParts(a) < StageParts(b);
 }
 
+int DifficultyRank(const std::string& difficulty) {
+  if (difficulty == "NORMAL") return 0;
+  if (difficulty == "NIGHTMARE") return 1;
+  if (difficulty == "HELL") return 2;
+  if (difficulty == "TORMENT") return 3;
+  return 9;
+}
+
+std::string DifficultyByRank(int rank) {
+  if (rank <= 0) return "NORMAL";
+  if (rank == 1) return "NIGHTMARE";
+  if (rank == 2) return "HELL";
+  return "TORMENT";
+}
+
 std::string DifficultyFromStageKey(long long stage_key) {
   long long tier = stage_key / 1000;
   if (tier == 4) return "TORMENT";
@@ -1685,9 +1702,93 @@ std::string DifficultyFromStageKey(long long stage_key) {
   return "NORMAL";
 }
 
+long long SaveMaxCompletedStage(const SaveSummary& save) {
+  if (save.max_completed_stage > 0) return save.max_completed_stage;
+  JsonValue root;
+  if (ParseJson(save.summary_json, root)) {
+    return static_cast<long long>(JsonNumberDouble(ObjectGet(root, "maxCompletedStage")));
+  }
+  return 0;
+}
+
+std::string MaxSaveDifficulty(const SaveSummary& save) {
+  std::string current = DifficultyFromStageKey(save.current_stage_key);
+  std::string completed = DifficultyFromStageKey(SaveMaxCompletedStage(save));
+  return DifficultyRank(completed) > DifficultyRank(current) ? completed : current;
+}
+
+bool IsStageEvent(const MemoryEvent& event) {
+  return event.type == "clear" || event.type == "failure";
+}
+
+std::string EventDifficulty(const MemoryEvent& event, const std::string& fallback) {
+  return event.difficulty.empty() ? fallback : event.difficulty;
+}
+
+void ApplyDifficultyToStageEvents(std::vector<MemoryEvent>& events, const std::string& difficulty) {
+  for (auto& event : events) {
+    if (IsStageEvent(event) && event.difficulty.empty()) event.difficulty = difficulty;
+  }
+}
+
+int StageOrdinal(const std::string& label) {
+  std::vector<int> parts = StageParts(label);
+  if (parts.size() < 2) return 0;
+  return (parts[0] - 1) * 10 + parts[1];
+}
+
+int StageOrdinalFromStageKey(long long stage_key) {
+  int act = static_cast<int>((stage_key % 1000) / 100);
+  int slot = static_cast<int>(stage_key % 100);
+  if (act <= 0 || slot <= 0) return 0;
+  return (act - 1) * 10 + slot;
+}
+
+bool LooksLikeDifficultyWrap(int previous, int current) {
+  return previous >= 25 && current > 0 && current <= 5;
+}
+
+int StageDifficultyWrapCount(const std::vector<MemoryEvent>& events) {
+  int wraps = 0;
+  int previous = 0;
+  for (const auto& event : events) {
+    if (!IsStageEvent(event)) continue;
+    int ordinal = StageOrdinal(event.label);
+    if (LooksLikeDifficultyWrap(previous, ordinal)) ++wraps;
+    if (ordinal > 0) previous = ordinal;
+  }
+  return wraps;
+}
+
+void InferLegacyStageDifficulties(
+    std::vector<MemoryEvent>& events,
+    const std::string& current_difficulty,
+    int max_current_difficulty_ordinal = 30,
+    bool overwrite = false) {
+  int current_rank = DifficultyRank(current_difficulty);
+  if (current_rank == 9) current_rank = 0;
+  int wraps = StageDifficultyWrapCount(events);
+  int previous = 0;
+  int rank = (std::max)(0, current_rank - wraps);
+  previous = 0;
+  for (auto& event : events) {
+    if (!IsStageEvent(event)) continue;
+    int ordinal = StageOrdinal(event.label);
+    if (LooksLikeDifficultyWrap(previous, ordinal) && rank < current_rank) ++rank;
+    int event_rank = rank;
+    if (event_rank == current_rank && current_rank > 0 && ordinal > max_current_difficulty_ordinal) {
+      event_rank = current_rank - 1;
+    }
+    if (overwrite || event.difficulty.empty()) event.difficulty = DifficultyByRank(event_rank);
+    if (ordinal > 0) previous = ordinal;
+  }
+}
+
 JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::string& difficulty,
                            int events_from_index = -1) {
   struct StageGroup {
+    std::string label;
+    std::string difficulty;
     std::vector<MemoryEvent> clears;
     std::vector<MemoryEvent> failures;
   };
@@ -1713,10 +1814,20 @@ JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::st
   for (const auto& event : events) {
     if (event.type == "clear") {
       ++total_clears;
-      by_stage[event.label].clears.push_back(event);
+      std::string event_difficulty = EventDifficulty(event, difficulty);
+      std::string key = event_difficulty + "|" + event.label;
+      StageGroup& group = by_stage[key];
+      group.label = event.label;
+      group.difficulty = event_difficulty;
+      group.clears.push_back(event);
     } else if (event.type == "failure") {
       ++total_failures;
-      by_stage[event.label].failures.push_back(event);
+      std::string event_difficulty = EventDifficulty(event, difficulty);
+      std::string key = event_difficulty + "|" + event.label;
+      StageGroup& group = by_stage[key];
+      group.label = event.label;
+      group.difficulty = event_difficulty;
+      group.failures.push_back(event);
     } else if (event.type == "death") {
       ++total_deaths;
       std::string key = event.hero + "|" + event.enemy;
@@ -1732,18 +1843,23 @@ JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::st
     }
   }
 
-  std::vector<std::string> labels;
-  for (const auto& item : by_stage) labels.push_back(item.first);
-  std::sort(labels.begin(), labels.end(), StageLabelLess);
+  std::vector<const StageGroup*> stage_groups;
+  for (const auto& item : by_stage) stage_groups.push_back(&item.second);
+  std::sort(stage_groups.begin(), stage_groups.end(), [](const StageGroup* a, const StageGroup* b) {
+    int a_rank = DifficultyRank(a->difficulty);
+    int b_rank = DifficultyRank(b->difficulty);
+    if (a_rank != b_rank) return a_rank < b_rank;
+    return StageLabelLess(a->label, b->label);
+  });
 
   JsonValue stage_summaries = JsonValue::Array();
-  for (const std::string& label : labels) {
-    const StageGroup& group = by_stage[label];
+  for (const StageGroup* group_ptr : stage_groups) {
+    const StageGroup& group = *group_ptr;
     std::vector<int> clear_seconds;
     for (const auto& event : group.clears) clear_seconds.push_back(event.seconds);
     JsonValue row = JsonValue::Object();
-    ObjectSet(row, "label", JsonValue::String(label));
-    ObjectSet(row, "difficulty", JsonValue::String(difficulty));
+    ObjectSet(row, "label", JsonValue::String(group.label));
+    ObjectSet(row, "difficulty", JsonValue::String(group.difficulty));
     ObjectSet(row, "clears", JsonValue::Number(static_cast<long long>(group.clears.size())));
     ObjectSet(row, "failures", JsonValue::Number(static_cast<long long>(group.failures.size())));
     ObjectSet(row, "attempts", JsonValue::Number(static_cast<long long>(group.clears.size() + group.failures.size())));
@@ -1836,20 +1952,35 @@ JsonValue BuildHistoryJson(const std::vector<MemoryEvent>& events, const std::st
 }
 
 JsonValue BuildClearsJson(const std::vector<MemoryEvent>& events, const std::string& difficulty) {
-  std::map<std::string, std::vector<int>> by_stage;
+  struct ClearGroup {
+    std::string label;
+    std::string difficulty;
+    std::vector<int> values;
+  };
+  std::map<std::string, ClearGroup> by_stage;
   const MemoryEvent* last_clear = nullptr;
   for (const auto& event : events) {
     if (event.type != "clear") continue;
-    by_stage[event.label].push_back(event.seconds);
+    std::string event_difficulty = EventDifficulty(event, difficulty);
+    std::string key = event_difficulty + "|" + event.label;
+    ClearGroup& group = by_stage[key];
+    group.label = event.label;
+    group.difficulty = event_difficulty;
+    group.values.push_back(event.seconds);
     last_clear = &event;
   }
-  std::vector<std::string> labels;
-  for (const auto& item : by_stage) labels.push_back(item.first);
-  std::sort(labels.begin(), labels.end(), StageLabelLess);
+  std::vector<const ClearGroup*> groups;
+  for (const auto& item : by_stage) groups.push_back(&item.second);
+  std::sort(groups.begin(), groups.end(), [](const ClearGroup* a, const ClearGroup* b) {
+    int a_rank = DifficultyRank(a->difficulty);
+    int b_rank = DifficultyRank(b->difficulty);
+    if (a_rank != b_rank) return a_rank < b_rank;
+    return StageLabelLess(a->label, b->label);
+  });
 
   JsonValue averages = JsonValue::Array();
-  for (const auto& label : labels) {
-    const std::vector<int>& values = by_stage[label];
+  for (const ClearGroup* group : groups) {
+    const std::vector<int>& values = group->values;
     if (values.empty()) continue;
     size_t start = values.size() > 10 ? values.size() - 10 : 0;
     int sum = 0;
@@ -1859,8 +1990,8 @@ JsonValue BuildClearsJson(const std::vector<MemoryEvent>& events, const std::str
       recent.array.push_back(JsonValue::Number(static_cast<long long>(values[i])));
     }
     JsonValue row = JsonValue::Object();
-    ObjectSet(row, "label", JsonValue::String(label));
-    ObjectSet(row, "difficulty", JsonValue::String(difficulty));
+    ObjectSet(row, "label", JsonValue::String(group->label));
+    ObjectSet(row, "difficulty", JsonValue::String(group->difficulty));
     ObjectSet(row, "average", JsonValue::Number(static_cast<double>(sum) / (values.size() - start)));
     ObjectSet(row, "samples", JsonValue::Number(static_cast<long long>(values.size() - start)));
     ObjectSet(row, "lastTime", JsonValue::Number(static_cast<long long>(values.back())));
@@ -1922,6 +2053,7 @@ MemorySnapshot ReadMemorySnapshot(const std::string& difficulty = "NORMAL",
   }
   snapshot.events = ScanMemoryEvents(process, cached_regions, discover_regions, 64ULL * 1024ULL * 1024ULL, 4096,
                                      cached_region_limit);
+  ApplyDifficultyToStageEvents(snapshot.events, difficulty);
   CloseHandle(process);
   ObjectSet(watcher, "message", JsonValue::String("memory snapshot pid=" + std::to_string(snapshot.pid) + "; events=" +
                                                   std::to_string(snapshot.events.size()) + "; regions=" +
@@ -2052,6 +2184,7 @@ bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
   event.type = JsonStringValue(ObjectGet(value, "type"));
   if (event.type.empty()) return false;
   event.label = JsonStringValue(ObjectGet(value, "label"));
+  event.difficulty = JsonStringValue(ObjectGet(value, "difficulty"));
   event.seconds = static_cast<int>(JsonNumberDouble(ObjectGet(value, "seconds")));
   event.progress = JsonStringValue(ObjectGet(value, "progress"));
   event.item = JsonStringValue(ObjectGet(value, "item"));
@@ -2070,19 +2203,57 @@ bool MemoryEventFromJson(const JsonValue& value, MemoryEvent& event) {
   return true;
 }
 
-bool LoadMemoryHistoryCache(MemorySnapshot& snapshot, const std::string& difficulty) {
+bool LoadMemoryHistoryCache(MemorySnapshot& snapshot, const std::string& difficulty, long long max_completed_stage_key = 0) {
   std::string text;
   if (!ReadTextFile(MemoryHistoryPath(), text)) return false;
   JsonValue root;
   if (!ParseJson(text, root)) return false;
+  std::string cached_difficulty = JsonStringValue(ObjectGet(root, "difficulty"));
+  if (cached_difficulty.empty()) cached_difficulty = difficulty;
   const JsonValue* events = ObjectGet(root, "events");
   if (!events || events->type != JsonValue::Type::Array) return false;
   std::vector<MemoryEvent> loaded;
+  bool has_stage_difficulty = false;
+  bool missing_stage_difficulty = false;
+  bool mixed_stage_difficulty = false;
+  bool has_impossible_max_difficulty_stage = false;
+  int uniform_stage_rank = -1;
+  int max_difficulty_rank = DifficultyRank(difficulty);
+  int max_difficulty_ordinal = StageOrdinalFromStageKey(max_completed_stage_key);
+  if (max_difficulty_ordinal <= 0) max_difficulty_ordinal = 30;
   for (const auto& item : events->array) {
     MemoryEvent event;
-    if (MemoryEventFromJson(item, event)) loaded.push_back(std::move(event));
+    if (MemoryEventFromJson(item, event)) {
+      if (IsStageEvent(event)) {
+        if (event.difficulty.empty()) missing_stage_difficulty = true;
+        else {
+          has_stage_difficulty = true;
+          int rank = DifficultyRank(event.difficulty);
+          if (uniform_stage_rank < 0) uniform_stage_rank = rank;
+          else if (rank != uniform_stage_rank) mixed_stage_difficulty = true;
+          if (rank == max_difficulty_rank && max_difficulty_rank > 0 && StageOrdinal(event.label) > max_difficulty_ordinal) {
+            has_impossible_max_difficulty_stage = true;
+          }
+        }
+      }
+      loaded.push_back(std::move(event));
+    }
   }
   if (loaded.empty()) return false;
+  if (missing_stage_difficulty && !has_stage_difficulty) {
+    InferLegacyStageDifficulties(loaded, difficulty, max_difficulty_ordinal);
+  } else if (
+      has_stage_difficulty &&
+      !missing_stage_difficulty &&
+      !mixed_stage_difficulty &&
+      uniform_stage_rank >= 0 &&
+      uniform_stage_rank < DifficultyRank(difficulty) &&
+      StageDifficultyWrapCount(loaded) > 0) {
+    InferLegacyStageDifficulties(loaded, difficulty, max_difficulty_ordinal, true);
+  } else if (has_impossible_max_difficulty_stage && StageDifficultyWrapCount(loaded) > 0) {
+    InferLegacyStageDifficulties(loaded, difficulty, max_difficulty_ordinal, true);
+  }
+  ApplyDifficultyToStageEvents(loaded, cached_difficulty);
   snapshot.events = UniqueEvents(loaded);
   RebuildMemorySnapshotJson(snapshot, difficulty);
   return true;
@@ -3422,10 +3593,14 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
   std::string difficulty = state.has_save ? DifficultyFromStageKey(state.save.current_stage_key) : "NORMAL";
   bool process_changed = pid != state.memory_pid;
+  bool loaded_cache = false;
   if (process_changed) {
     state.memory_pid = pid;
     state.memory_seen.clear();
-    if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, difficulty)) {
+    std::string cache_difficulty = state.has_save ? MaxSaveDifficulty(state.save) : difficulty;
+    long long max_completed_stage = state.has_save ? SaveMaxCompletedStage(state.save) : 0;
+    if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, cache_difficulty, max_completed_stage)) {
+      loaded_cache = true;
       PostStatus(L"Historico local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
     }
     for (const auto& event : state.memory.events) state.memory_seen.insert(event.id);
@@ -3450,11 +3625,12 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   size_t added = 0;
   for (auto& event : scanned) {
     if (!state.memory_seen.insert(event.id).second) continue;
+    if (IsStageEvent(event) && event.difficulty.empty()) event.difficulty = difficulty;
     event.index = static_cast<int>(state.memory.events.size());
     state.memory.events.push_back(std::move(event));
     ++added;
   }
-  bool changed = false;
+  bool changed = loaded_cache;
   if (added > 0 || state.memory.history_json == "null") {
     RebuildMemorySnapshotJson(state.memory, difficulty);
     SaveMemoryHistoryCache(state.memory);
@@ -3535,7 +3711,7 @@ std::wstring ExportDevRuntimeSnapshot() {
   std::string difficulty = DifficultyFromStageKey(state.save.current_stage_key);
   if (state.memory.history_json == "null" || state.memory.clears_json == "null") {
     MemorySnapshot cached;
-    if (LoadMemoryHistoryCache(cached, difficulty)) state.memory = std::move(cached);
+    if (LoadMemoryHistoryCache(cached, MaxSaveDifficulty(state.save), SaveMaxCompletedStage(state.save))) state.memory = std::move(cached);
   }
 
   if (state.memory.history_json == "null" || state.memory.clears_json == "null") {

@@ -162,6 +162,7 @@ Regras:
 - `history.partial` significa "apenas eventos novos"; servidor mescla sem apagar.
 - `EventId` precisa ser estavel. Mudar isso pode duplicar ou apagar historico.
 - `event.index` define ordem; nao reordenar historico sem resetar sync.
+- Eventos `clear`/`failure` devem carregar `difficulty` por evento, e `stageSummaries`/`clears.averages` devem ser agrupados por `difficulty + label`. Nao aplicar a dificuldade atual do save a todo o historico, porque ao trocar de dificuldade isso reclassifica clears antigos como se fossem da dificuldade nova.
 - Se schema do payload mudar, atualizar tambem `tbh-farm-local-frontend/docs/AI_DOCUMENTATION.md`.
 
 ## Leitura do save ES3
