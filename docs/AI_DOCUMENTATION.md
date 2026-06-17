@@ -212,7 +212,7 @@ Dados extraidos:
 - gold moeda `100001`
 - stage atual e max stage
 - herois e equipe ativa
-- equipamentos e stats dos herois; `partyHeroLevels[].equippedItems` e `unlockedHeroes[].equippedItems` incluem os itens equipados para permitir comparacao de composicao no frontend
+- equipamentos e stats dos herois; `partyHeroLevels[].equippedItems` e `unlockedHeroes[].equippedItems` incluem os itens equipados para permitir comparacao de composicao no frontend; itens devem preservar `uniqueMod` para tooltips exibirem Stats Unicas de raridades altas
 - inventario, storage e stash de troca (`inventorySaveDatas`, `stashSaveDatas`, `tradingStashSaveDatas`) com slots desbloqueados, vazios e itens resolvidos por `itemSaveDatas`
 - pets e estados de unlock/viewed
 - runas e niveis

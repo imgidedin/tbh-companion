@@ -3048,6 +3048,7 @@ JsonValue BuildSavedItemSummary(const JsonValue& saved_item,
   ObjectSet(out, "icon", item ? CopyOrNull(ObjectGet(*item, "icon")) : JsonValue::Null());
   ObjectSet(out, "level", item ? CopyOrNull(ObjectGet(*item, "level")) : JsonValue::Null());
   ObjectSet(out, "variant", item ? CopyOrNull(ObjectGet(*item, "variant")) : JsonValue::Null());
+  ObjectSet(out, "uniqueMod", item ? CopyOrNull(ObjectGet(*item, "uniqueMod")) : JsonValue::Null());
   ObjectSet(out, "slotCapacity", item ? CopyOrNull(ObjectGet(*item, "slots")) : JsonValue::Null());
   ObjectSet(out, "enchantSlots", std::move(enchant_slots));
   ObjectSet(out, "stats", std::move(all_stats));
