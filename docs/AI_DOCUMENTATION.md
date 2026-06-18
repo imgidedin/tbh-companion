@@ -591,6 +591,7 @@ Arquivos envolvidos:
 
 - `scripts\ghidra\ApplyIl2CppDumperLabelsHeadless.java`: importa `script.json` e aplica labels no projeto Ghidra.
 - `scripts\ghidra\DecompileIl2CppCombatTargets.java`: decompila alvos filtrados de combate.
+- `scripts\ghidra\DecompileIl2CppNamedTargets.java`: decompila alvos IL2CPP por substrings de nome passadas via `-postScript` para investigacoes pontuais fora de combate.
 - `scripts\ghidra-projects-cache\TaskBarHero-Il2Cpp-1.00.13.gpr`: projeto Ghidra gerado localmente e ignorado pelo Git.
 - `scripts\ghidra-projects-cache\TaskBarHero-Il2Cpp-1.00.13-report.md`: resumo de labels/RVAs.
 - `scripts\ghidra-projects-cache\decompiled-combat\`: pseudocodigo C exportado por grupo (`StageManager.c`, `UnitHero.c`, `Monster.c`, `ActiveSkill.c`, `Projectiles.c`, `MonsterSpawnManager.c`).
@@ -608,6 +609,7 @@ Observacoes:
 - `-Fresh` no wrapper nao passa `-deleteProject` ao Ghidra; essa flag do Ghidra cria projeto temporario e apaga no fim.
 - O wrapper resolve `JAVA_HOME` automaticamente para `C:\Program Files\Eclipse Adoptium\jdk-*` quando o terminal nao tem `java` no `PATH`.
 - A pasta `scripts\ghidra-projects-cache\` nao pode ficar dentro de `scripts\.cache\`, porque o Ghidra headless rejeita path com elemento iniciado por ponto.
+- Para pesquisa pontual, chame `DecompileIl2CppNamedTargets.java` com `OUT=<arquivo>` e substrings de nomes como `vb.Cube.` ou `TaskbarHero.Data.bbq`; ele reutiliza o projeto rotulado e grava um unico arquivo C no cache ignorado.
 
 ## Atualizacao do mapa IL2CPP
 
