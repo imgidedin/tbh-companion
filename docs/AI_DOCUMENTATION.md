@@ -62,7 +62,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
 | Historico/clears | `BuildHistoryJson`, `BuildClearsJson`, caches locais. |
 | Sync | `CachedPayload`, `PostJsonPayload`, `SyncCachedPayload`, sync incremental. |
-| Harness CLI | `--compare`, `--dump-save-summary`, `--memory-save-scan`, `--memory-scan`. |
+| Harness CLI | `--compare`, `--dump-save-summary`, `--memory-save-scan`, `--memory-stage-scan`, `--memory-scan`. |
 
 ### Loop do worker
 
@@ -71,7 +71,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 3. `EnsureGameRunning` abre o TaskBarHero via Steam se o processo nao existir.
 4. `RefreshLiveSaveCache` tenta ler o snapshot vivo do save em `bal` a cada ~500ms; se validar, promove `saveSource=memory`; se falhar, volta para o snapshot ES3 inteiro.
 5. Se SteamID estiver vazio no config e o save ativo tiver SteamID, o agente salva automaticamente.
-6. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda ou quando o save ativo muda.
+6. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda; mudancas estruturais do save ativo enviam imediatamente, e mudancas metricas pendentes sao enviadas no tick de ~10s para alimentar snapshots.
 7. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
 8. Eventos novos sao adicionados com `index` monotonicamente crescente.
 9. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
@@ -133,7 +133,7 @@ Arquivos relevantes:
 | `sync-state.json` | Progresso de sync incremental. Apagar forca reenvio completo. |
 | cache de memory history | Historico local de eventos para sobreviver a reinicio. |
 | cache de items extraidos | `items.json` extraido de `items.zip` embutido quando necessario. |
-| arquivos temporarios de harness | Resultado de `--compare`, `--memory-save-scan`, `--memory-scan` e dump de save. |
+| arquivos temporarios de harness | Resultado de `--compare`, `--memory-save-scan`, `--memory-stage-scan`, `--memory-scan` e dump de save. |
 
 ## Contrato com o frontend
 
@@ -218,6 +218,10 @@ O agente prefere ler o save vivo do singleton obfuscado `bal : np<bal>`:
 
 `ReadLiveSaveSummary` monta um `JsonValue` com a mesma forma que `LoadSaveRoot` produz para o ES3 e chama o mesmo `BuildSaveSummaryJson`. Isso evita regras paralelas para equipamentos, inventario, enchants, bonuses, runas e kills.
 
+Importante: `ReadLiveSaveSummary` le o modelo de save vivo (`bal.bgaw/bgax`) para estrutura, mas gold/EXP e o stage recem-entrado podem ficar parados ali ate o jogo comitar autosave. Por isso, antes de chamar `BuildSaveSummaryJson`, o agente aplica dados quentes de runtime sobre o root vivo: `MonsterSpawnManager.MonsterList`/`SummonedMonsterList` atualiza `CommonSaveData.currentStageKey` pelo stage carregado nos monstros vivos, `vb.tp/vb.tq` atualiza `CurrencySaveData.Quantity` do gold e `vb.tz`/`vd.beuv` atualiza `HeroSaveData.HeroExp` por `heroKey`. O ES3 continua sendo fallback inteiro quando a leitura viva nao esta disponivel. Use `--memory-stage-scan` para comparar managers runtime contra o save vivo: ele amostra `runtimeStageKey`, `DeadMonsterUnit -> Monster.cache -> MonsterInfoData`, `runtimeGold`, `runtimeHeroExp`, `saveGold` e `savePartyHeroLevels`.
+
+Validacao local de 2026-06-18: durante 8s em combate, `runtimeGold` subiu 1444 e EXP runtime do Knight subiu 6382 enquanto `saveGold` e `savePartyHeroLevels` ficaram parados. Em seguida, `--memory-save-scan` confirmou que o resumo `memory` ja saiu com `goldDelta=5774` e EXP dos herois acima do ES3, provando que snapshots de 10s passam a ter delta real sem esperar autosave.
+
 Validacao minima:
 
 - processo e `GameAssembly.dll` encontrados;
@@ -242,8 +246,12 @@ O contrato remoto continua aceitando `save` como snapshot completo. Nao existe `
 
 Para reduzir banda sem criar outro protocolo, o agente envia:
 
-- `save` completo no primeiro sync, quando o save ativo muda ou quando o sync e forcado por mudanca de config;
+- `save` completo no primeiro sync, quando uma mudanca estrutural do save ativo ocorre, quando o sync e forcado por mudanca de config, ou no tick metrico de ~10s quando houver delta de save pendente;
 - `save: null` quando apenas eventos de historico mudaram. O backend preserva `tbh_current_state.save` via `coalesce(excluded.save, tbh_current_state.save)`.
+
+Mudancas metricas continuas sao `gold`, `playTime`, `currentStageWave`, `monsterKills` e `exp` dos herois. Elas alimentam snapshots de EXP/Ouro sem transformar cada tick da memoria em POST imediato; o envio metrico e consolidado em ~10s. Mudancas estruturais continuam imediatas: stage key/max stage, inventario/storage/trade, equipamentos, skills equipadas, runas, pets, atributos e demais campos do save normalizado.
+
+O tick de ~10s garante tentativa de envio com `save` completo apenas quando houver delta pendente. Para gold/EXP, o resumo vivo ja usa os caches runtime validados (`runtimeGold` e `runtimeHeroExp`), entao kills durante a stage geram hash novo mesmo quando o ES3 e o modelo `bal.bgaw/bgax` ainda nao foram comitados pelo autosave. Se o jogador estiver parado e o resumo efetivo for identico, o worker nao forca POST repetido so pelo tempo.
 
 Nao enviar delta parcial de save sem antes implementar merge server-side e broadcast compatível. Varios recursos comparam save anterior vs novo (`rune alerts`, pet unlock, inventario cheio, snapshots e derived stats), entao patch parcial seria mais arriscado que economico enquanto o `save` completo ainda estiver pequeno.
 
@@ -297,6 +305,11 @@ Classes/eventos importantes:
 | Classe/Tipo | Uso |
 | --- | --- |
 | `LogManager` | Singleton que segura lista de logs. |
+| `StageManager` | Singleton runtime de stage; `--memory-stage-scan` amostra estado, inicio da stage e campos/listas runtime. |
+| `MonsterSpawnManager` | Singleton runtime de monstros; `--memory-stage-scan` amostra listas de monstros vivos/mortos/summoned e usa monstros vivos/summoned para identificar o stage atual sem esperar autosave. |
+| `Monster` / `MonsterInfoData` | `--memory-stage-scan` le os ultimos mortos via `DeadMonsterUnit`, incluindo `MonsterKey`, `RewardGold`, `RewardExp` base e o stage runtime carregado no monstro. |
+| `vb.tp` / `vb.tq` | Cache runtime de currencies; `--memory-stage-scan` le `runtimeCurrencies` e `runtimeGold` sem esperar commit no save. |
+| `vb.tz` / `vd` | Cache runtime de herois; `--memory-stage-scan` le `runtimeHeroExp` de `vd.beuv` sem esperar commit no save. |
 | `LogData` | Texto, relogio e DateTime de cada evento. |
 | `BoxOpenLog` | Item obtido; contem `ItemName_<key>` e `EGradeType`. |
 | `GetBoxLog` | Bau obtido. |
@@ -345,11 +358,12 @@ Estado:
 
 Logica:
 
-1. `SyncCachedPayload` calcula assinatura com save, quantidade de eventos, ultimo event id e pairing hash.
+1. `SyncCachedPayload` calcula assinatura do payload efetivo enviado: save completo quando permitido, ou `save:null` quando o envio e apenas de historico.
 2. Se assinatura nao mudou e nao e force sync, nao envia.
 3. Se historico local continua com mesmo primeiro evento, envia de `synced_index + 1` em diante.
 4. Se historico foi resetado/reordenado, reenvia tudo.
 5. Ao receber HTTP 200/201, atualiza `synced_index`, `synced_first_id` e `last_payload_hash`.
+6. Quando um save completo e aceito, atualiza tambem `last_synced_save_hash`, `last_synced_save_structural_hash` e o tick do ultimo sync de save. O hash estrutural ignora apenas campos metricos continuos para decidir se deve furar o throttle de 10s; o tick metrico so envia quando `save_pending` indica que o JSON efetivo mudou.
 
 Quando forcar reenvio:
 
@@ -590,7 +604,7 @@ O script:
 2. Detecta versao.
 3. Baixa/usa Il2CppDumper.
 4. Gera `dump.cs` e `script.json`.
-5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog` e enum `EGradeType`.
+5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog`, save vivo (`bal`), `StageManager`, `MonsterSpawnManager` e enum `EGradeType`.
 6. Com jogo aberto, valida na memoria viva.
 7. Patcha:
    - `src/main.cpp`
@@ -635,6 +649,12 @@ Comparar save vivo em memoria contra ES3:
 build\TBH_Companion.exe --memory-save-scan C:\temp\tbh-memory-save-scan.json
 ```
 
+Scan runtime de stage/monstros contra save vivo:
+
+```powershell
+build\TBH_Companion.exe --memory-stage-scan "$env:TEMP\tbh-memory-stage-scan.json" 30
+```
+
 Scan de memoria:
 
 ```powershell
@@ -677,8 +697,9 @@ Validar:
 
 ```powershell
 build\TBH_Companion.exe --compare
-build\TBH_Companion.exe --dump-save-summary C:\temp\tbh-save-summary.json
-build\TBH_Companion.exe --memory-save-scan C:\temp\tbh-memory-save-scan.json
+build\TBH_Companion.exe --dump-save-summary "$env:TEMP\tbh-save-summary.json"
+build\TBH_Companion.exe --memory-save-scan "$env:TEMP\tbh-memory-save-scan.json"
+build\TBH_Companion.exe --memory-stage-scan "$env:TEMP\tbh-memory-stage-scan.json" 30
 ```
 
 Validar:
@@ -688,6 +709,7 @@ Validar:
 - `ownerSteamId`/`playerId` esperado.
 - `currentStageKey`, `maxStageKey`, gold, herois, runas, pets e monster kills aparecem.
 - Com jogo aberto, `--memory-save-scan` deve retornar `liveOk=true`; diferencas pontuais podem ser esperadas quando a memoria ja tem mudancas que o ES3 ainda nao salvou.
+- `--memory-stage-scan` deve retornar amostras com ponteiros de `StageManager`/`MonsterSpawnManager`, contagens de listas de monstros, `runtimeStageKey`, `deadMonsterRewardTotals`, `recentDeadMonsters`, `runtimeGold`, `runtimeHeroExp` e, no mesmo sample, `saveGold`/`savePartyHeroLevels`. Use este harness para provar se runtime muda antes do save vivo.
 - Se uma feature frontend depende de novo campo, confirmar o campo no dump.
 
 ### Harness de memoria/log
@@ -722,6 +744,10 @@ Validar:
 - Dump gera offsets.
 - Verificacao viva mostra amostras de eventos.
 - Saida do script mostra `Save manager: TypeInfo np<bal>_TypeInfo`.
+- Saida do script mostra `Runtime stage` com TypeInfos de `StageManager` e `MonsterSpawnManager`.
+- Saida do script mostra `Runtime rewards` com offsets de `Monster.cache`, `MonsterInfoData.RewardGold` e `MonsterInfoData.RewardExp`.
+- Saida do script mostra `Runtime currency` com TypeInfo de `vb.tp`, offset da lista de currencies e offset do `ObscuredLong` usado por `vb.tq`.
+- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offset do `ObscuredFloat` usado por `vd.beuv`.
 - `src/main.cpp` foi patchado dentro dos marcadores.
 - Frontend `server.js` e `public/calculator.js` recebem mapa de raridade se mudou.
 
@@ -805,7 +831,7 @@ Validar:
 1. Rode `py scripts\refresh_il2cpp_map.py --dry-run`.
 2. Rode sem dry-run com jogo aberto.
 3. Build com `build.bat`.
-4. Rode `--memory-save-scan` e `--memory-scan`.
+4. Rode `--memory-save-scan`, `--memory-stage-scan` e `--memory-scan`.
 5. Se grade novo aparecer, atualize traducoes no script e no frontend.
 6. Reinicie agente.
 7. Se necessario, apague `sync-state.json` para reenvio completo.

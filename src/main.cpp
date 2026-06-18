@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "generated_items.h"
@@ -59,6 +60,7 @@ constexpr wchar_t APP_WINDOW_CLASS[] = L"TBHCompanionAgentWindow";
 constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\TBHCompanionAgentSingleInstance";
 constexpr DWORD kLiveSavePollMs = 500;
 constexpr DWORD kLogMemoryPollMs = 2000;
+constexpr DWORD kMetricSaveSyncMs = 10000;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -171,6 +173,8 @@ struct WorkerState {
   DWORD last_region_discovery = 0;
   std::string last_payload_hash;
   std::string last_synced_save_hash;
+  std::string last_synced_save_structural_hash;
+  DWORD last_save_sync_tick = 0;
   std::string last_sync_config_signature;
   std::set<std::string> memory_seen;     // ids ja vistos (historico + baseline)
   bool memory_baseline_ready = false;    // primeira leitura vira baseline e e ignorada
@@ -595,6 +599,14 @@ JsonValue* ObjectGet(JsonValue& object, const std::string& key) {
     if (item.first == key) return &item.second;
   }
   return nullptr;
+}
+
+void ObjectErase(JsonValue& object, const std::string& key) {
+  if (object.type != JsonValue::Type::Object) return;
+  object.object.erase(
+      std::remove_if(object.object.begin(), object.object.end(),
+                     [&](const auto& item) { return item.first == key; }),
+      object.object.end());
 }
 
 bool JsonBool(const JsonValue* value, bool fallback = false) {
@@ -1103,6 +1115,10 @@ constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
 constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0D958;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E0D290;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E0CDB8;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D95D50;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D95F38;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1126,6 +1142,37 @@ constexpr uintptr_t kPlayerSaveStashOffset = 0x70;
 constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x78;
 constexpr uintptr_t kPlayerSaveItemsOffset = 0x90;
 constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x98;
+constexpr uintptr_t kStageManagerStageStateOffset = 0x78;
+constexpr uintptr_t kStageManagerStageStartedOffset = 0x98;
+constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x110;
+constexpr uintptr_t kStageManagerRuntimeIntOffset = 0x138;
+constexpr uintptr_t kStageManagerRuntimeListAOffset = 0xE0;
+constexpr uintptr_t kStageManagerRuntimeListBOffset = 0xE8;
+constexpr uintptr_t kMonsterSpawnManagerMonsterListOffset = 0x28;
+constexpr uintptr_t kMonsterSpawnManagerDeadMonsterListOffset = 0x30;
+constexpr uintptr_t kMonsterSpawnManagerSummonedMonsterListOffset = 0x38;
+constexpr uintptr_t kMonsterSpawnManagerForceBossWaveOffset = 0x40;
+constexpr uintptr_t kMonsterCacheOffset = 0x3B0;
+constexpr uintptr_t kMonsterTypeOffset = 0x3B8;
+constexpr uintptr_t kMonsterRuntimeIntAOffset = 0x3BC;
+constexpr uintptr_t kMonsterRuntimeIntBOffset = 0x3C0;
+constexpr uintptr_t kMonsterRuntimeFloatOffset = 0x3C4;
+constexpr uintptr_t kMonsterStageTypeOffset = 0x3C8;
+constexpr uintptr_t kMonsterRuntimeIntCOffset = 0x3CC;
+constexpr uintptr_t kMonsterCacheInfoDataOffset = 0x30;
+constexpr uintptr_t kMonsterInfoMonsterKeyOffset = 0x30;
+constexpr uintptr_t kMonsterInfoMonsterTypeOffset = 0x40;
+constexpr uintptr_t kMonsterInfoRewardGoldOffset = 0x44;
+constexpr uintptr_t kMonsterInfoRewardExpOffset = 0x48;
+constexpr uintptr_t kRuntimeCurrencyManagerListOffset = 0x0;
+constexpr uintptr_t kRuntimeCurrencyInfoOffset = 0x10;
+constexpr uintptr_t kRuntimeCurrencyAmountOffset = 0x28;
+constexpr uintptr_t kRuntimeCurrencyAltAmountOffset = 0x48;
+constexpr uintptr_t kCurrencyInfoKeyOffset = 0x30;
+constexpr uintptr_t kRuntimeHeroDictionaryOffset = 0x20;
+constexpr uintptr_t kRuntimeHeroInfoOffset = 0x30;
+constexpr uintptr_t kRuntimeHeroExpOffset = 0x10C;
+constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x30;
 static const char* const kGradeNames[] = {
     "COMMON", "UNCOMMON", "RARE", "LEGENDARY", "IMMORTAL",
     "ARCANA", "BEYOND", "CELESTIAL", "DIVINE", "COSMIC",
@@ -3591,6 +3638,402 @@ bool ReadLiveObjectList(HANDLE process, uintptr_t list, int max_count, const cha
   return true;
 }
 
+uintptr_t ResolveSingletonInstance(HANDLE process, uintptr_t module_base, uintptr_t typeinfo_rva) {
+  uintptr_t klass = ReadPtr(process, module_base + typeinfo_rva);
+  if (!klass) return 0;
+  uintptr_t statics = ReadPtr(process, klass + kKlassStaticFieldsOffset);
+  return ReadPtr(process, statics);
+}
+
+int ReadIl2CppListCount(HANDLE process, uintptr_t list, int max_count) {
+  if (!list) return -1;
+  uintptr_t items = ReadPtr(process, list + 0x10);
+  int size = 0;
+  if (!items || !ReadInt32(process, list + 0x18, size) || size < 0 || size > max_count) return -1;
+  return size;
+}
+
+bool ReadIl2CppListPointers(HANDLE process, uintptr_t list, int max_count, std::vector<uintptr_t>& pointers,
+                            std::string* error = nullptr, const char* label = "list") {
+  pointers.clear();
+  if (!list) {
+    if (error) *error = std::string("lista nula: ") + label;
+    return false;
+  }
+  uintptr_t items = ReadPtr(process, list + 0x10);
+  int size = 0;
+  if (!items || !ReadInt32(process, list + 0x18, size) || size < 0 || size > max_count) {
+    if (error) *error = std::string("lista invalida: ") + label;
+    return false;
+  }
+  pointers.resize(static_cast<size_t>(size));
+  SIZE_T read = 0;
+  if (size > 0 && (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(items + 0x20), pointers.data(),
+                                      pointers.size() * sizeof(uintptr_t), &read) ||
+                   read != pointers.size() * sizeof(uintptr_t))) {
+    if (error) *error = std::string("falha lendo lista: ") + label;
+    return false;
+  }
+  return true;
+}
+
+bool ReadIl2CppDictionaryIntPtr(HANDLE process, uintptr_t dictionary, int max_count,
+                                std::vector<std::pair<int, uintptr_t>>& values,
+                                std::string* error = nullptr, const char* label = "dictionary") {
+  values.clear();
+  if (!dictionary) {
+    if (error) *error = std::string("dicionario nulo: ") + label;
+    return false;
+  }
+  uintptr_t entries = ReadPtr(process, dictionary + 0x18);
+  int count = 0;
+  int free_count = 0;
+  if (!entries || !ReadInt32(process, dictionary + 0x20, count) || count < 0 || count > max_count ||
+      !ReadInt32(process, dictionary + 0x2C, free_count) || free_count < 0 || free_count > count) {
+    if (error) *error = std::string("dicionario invalido: ") + label;
+    return false;
+  }
+
+  int array_length = 0;
+  if (!ReadInt32(process, entries + 0x18, array_length) || array_length < count || array_length > max_count) {
+    if (error) *error = std::string("array de entries invalido: ") + label;
+    return false;
+  }
+
+  constexpr uintptr_t kEntryStart = 0x20;
+  constexpr uintptr_t kEntrySize = 0x18;
+  constexpr uintptr_t kEntryHashOffset = 0x0;
+  constexpr uintptr_t kEntryKeyOffset = 0x8;
+  constexpr uintptr_t kEntryValueOffset = 0x10;
+  values.reserve(static_cast<size_t>(count - free_count));
+  for (int i = 0; i < count; ++i) {
+    uintptr_t entry = entries + kEntryStart + static_cast<uintptr_t>(i) * kEntrySize;
+    int hash = -1;
+    int key = 0;
+    uintptr_t value = 0;
+    if (!ReadScalar(process, entry + kEntryHashOffset, hash) || hash < 0) continue;
+    if (!ReadScalar(process, entry + kEntryKeyOffset, key)) continue;
+    value = ReadPtr(process, entry + kEntryValueOffset);
+    if (!value) continue;
+    values.emplace_back(key, value);
+  }
+  return true;
+}
+
+JsonValue JsonAddress(uintptr_t address) {
+  std::ostringstream out;
+  out << "0x" << std::hex << std::uppercase << address;
+  return JsonValue::String(out.str());
+}
+
+long long DecodeObscuredLong(HANDLE process, uintptr_t address, JsonValue* raw = nullptr) {
+  int hash = 0;
+  long long hidden = 0;
+  long long key = 0;
+  long long fake = 0;
+  ReadScalar(process, address + 0x0, hash);
+  ReadScalar(process, address + 0x8, hidden);
+  ReadScalar(process, address + 0x10, key);
+  ReadScalar(process, address + 0x18, fake);
+  long long xor_decoded = hidden ^ key;
+  long long value = fake != 0 ? fake : xor_decoded;
+  if (raw) {
+    *raw = JsonValue::Object();
+    ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
+    ObjectSet(*raw, "hiddenValue", JsonValue::Number(hidden));
+    ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(key));
+    ObjectSet(*raw, "fakeValue", JsonValue::Number(fake));
+    ObjectSet(*raw, "xorDecoded", JsonValue::Number(xor_decoded));
+    ObjectSet(*raw, "value", JsonValue::Number(value));
+  }
+  return value;
+}
+
+int DecodeObscuredInt(HANDLE process, uintptr_t address, JsonValue* raw = nullptr) {
+  int hash = 0;
+  int hidden = 0;
+  int key = 0;
+  int fake = 0;
+  ReadScalar(process, address + 0x0, hash);
+  ReadScalar(process, address + 0x4, hidden);
+  ReadScalar(process, address + 0x8, key);
+  ReadScalar(process, address + 0xC, fake);
+  int value = hidden ^ key;
+  if (raw) {
+    *raw = JsonValue::Object();
+    ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
+    ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
+    ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
+    ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<long long>(fake)));
+    ObjectSet(*raw, "decoded", JsonValue::Number(static_cast<long long>(value)));
+  }
+  return value;
+}
+
+float FloatFromBits(int bits) {
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+float DecodeObscuredFloat(HANDLE process, uintptr_t address, JsonValue* raw = nullptr) {
+  int hash = 0;
+  int hidden = 0;
+  int key = 0;
+  float fake = 0.0f;
+  ReadScalar(process, address + 0x0, hash);
+  ReadScalar(process, address + 0x4, hidden);
+  ReadScalar(process, address + 0x8, key);
+  ReadScalar(process, address + 0xC, fake);
+  float xor_decoded = FloatFromBits(hidden ^ key);
+  float value = std::isfinite(fake) ? fake : xor_decoded;
+  if (raw) {
+    *raw = JsonValue::Object();
+    ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
+    ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
+    ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
+    ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<double>(fake)));
+    ObjectSet(*raw, "xorDecoded", JsonValue::Number(static_cast<double>(xor_decoded)));
+    ObjectSet(*raw, "value", JsonValue::Number(static_cast<double>(value)));
+  }
+  return value;
+}
+
+uintptr_t ResolveStaticFields(HANDLE process, uintptr_t module_base, uintptr_t typeinfo_rva) {
+  uintptr_t klass = ReadPtr(process, module_base + typeinfo_rva);
+  if (!klass) return 0;
+  return ReadPtr(process, klass + kKlassStaticFieldsOffset);
+}
+
+bool ReadRuntimeCurrencies(HANDLE process, uintptr_t module_base, JsonValue& currencies, JsonValue& gold,
+                           std::string* error = nullptr) {
+  currencies = JsonValue::Array();
+  gold = JsonValue::Null();
+
+  uintptr_t statics = ResolveStaticFields(process, module_base, kRuntimeCurrencyManagerTypeInfoRva);
+  if (!statics) {
+    if (error) *error = "static_fields de runtime currency nulo";
+    return false;
+  }
+  uintptr_t list = ReadPtr(process, statics + kRuntimeCurrencyManagerListOffset);
+  std::vector<uintptr_t> entries;
+  if (!ReadIl2CppListPointers(process, list, 128, entries, error, "RuntimeCurrencyData")) return false;
+
+  for (uintptr_t entry : entries) {
+    if (!entry) continue;
+    uintptr_t info = ReadPtr(process, entry + kRuntimeCurrencyInfoOffset);
+    int key = 0;
+    ReadScalar(process, info + kCurrencyInfoKeyOffset, key);
+    JsonValue raw_amount;
+    JsonValue raw_alt;
+    long long amount = DecodeObscuredLong(process, entry + kRuntimeCurrencyAmountOffset, &raw_amount);
+    int alt_amount = DecodeObscuredInt(process, entry + kRuntimeCurrencyAltAmountOffset, &raw_alt);
+
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "address", JsonAddress(entry));
+    ObjectSet(row, "info", JsonAddress(info));
+    ObjectSet(row, "key", JsonValue::Number(static_cast<long long>(key)));
+    ObjectSet(row, "amount", JsonValue::Number(amount));
+    ObjectSet(row, "altAmount", JsonValue::Number(static_cast<long long>(alt_amount)));
+    ObjectSet(row, "rawAmount", std::move(raw_amount));
+    ObjectSet(row, "rawAltAmount", std::move(raw_alt));
+    if (key == 0x186A1) gold = row;
+    currencies.array.push_back(std::move(row));
+  }
+
+  return true;
+}
+
+bool ReadRuntimeHeroExp(HANDLE process, uintptr_t module_base, JsonValue& heroes, std::string* error = nullptr) {
+  heroes = JsonValue::Array();
+
+  uintptr_t statics = ResolveStaticFields(process, module_base, kRuntimeHeroManagerTypeInfoRva);
+  if (!statics) {
+    if (error) *error = "static_fields de runtime hero nulo";
+    return false;
+  }
+  uintptr_t dictionary = ReadPtr(process, statics + kRuntimeHeroDictionaryOffset);
+  std::vector<std::pair<int, uintptr_t>> entries;
+  if (!ReadIl2CppDictionaryIntPtr(process, dictionary, 128, entries, error, "RuntimeHeroData")) return false;
+
+  for (const auto& entry : entries) {
+    int dictionary_key = entry.first;
+    uintptr_t hero = entry.second;
+    uintptr_t info = ReadPtr(process, hero + kRuntimeHeroInfoOffset);
+    int hero_key = 0;
+    if (info) ReadScalar(process, info + kHeroInfoHeroKeyOffset, hero_key);
+    if (hero_key <= 0) hero_key = dictionary_key;
+
+    JsonValue raw_exp;
+    float exp = DecodeObscuredFloat(process, hero + kRuntimeHeroExpOffset, &raw_exp);
+
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "address", JsonAddress(hero));
+    ObjectSet(row, "info", JsonAddress(info));
+    ObjectSet(row, "dictionaryKey", JsonValue::Number(static_cast<long long>(dictionary_key)));
+    ObjectSet(row, "heroKey", JsonValue::Number(static_cast<long long>(hero_key)));
+    ObjectSet(row, "exp", JsonValue::Number(static_cast<double>(exp)));
+    ObjectSet(row, "rawExp", std::move(raw_exp));
+    heroes.array.push_back(std::move(row));
+  }
+
+  return !heroes.array.empty();
+}
+
+bool IsPlausibleRuntimeStageKey(int stage_key) {
+  int difficulty = stage_key / 1000;
+  int act = (stage_key % 1000) / 100;
+  int stage_no = stage_key % 100;
+  return difficulty >= 1 && difficulty <= 4 && act >= 1 && act <= 9 && stage_no >= 1 && stage_no <= 99;
+}
+
+bool ReadStageKeyFromMonsterList(HANDLE process, uintptr_t list, int& stage_key, std::string* source,
+                                 const char* source_name) {
+  std::vector<uintptr_t> monsters;
+  if (!ReadIl2CppListPointers(process, list, 8192, monsters, nullptr, source_name)) return false;
+  for (uintptr_t monster : monsters) {
+    int candidate = 0;
+    if (ReadScalar(process, monster + kMonsterRuntimeIntCOffset, candidate) && IsPlausibleRuntimeStageKey(candidate)) {
+      stage_key = candidate;
+      if (source) *source = source_name;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ReadRuntimeStageKey(HANDLE process, uintptr_t module_base, int& stage_key, std::string* source = nullptr) {
+  uintptr_t monsters = ResolveSingletonInstance(process, module_base, kMonsterSpawnManagerTypeInfoRva);
+  if (!monsters) return false;
+
+  if (ReadStageKeyFromMonsterList(process, ReadPtr(process, monsters + kMonsterSpawnManagerMonsterListOffset),
+                                  stage_key, source, "MonsterList")) {
+    return true;
+  }
+  if (ReadStageKeyFromMonsterList(process, ReadPtr(process, monsters + kMonsterSpawnManagerSummonedMonsterListOffset),
+                                  stage_key, source, "SummonedMonsterList")) {
+    return true;
+  }
+  return false;
+}
+
+bool ApplyRuntimeGoldToSaveRoot(JsonValue& root, const JsonValue& runtime_gold) {
+  const JsonValue* amount = ObjectGet(runtime_gold, "amount");
+  if (!amount || amount->type != JsonValue::Type::Number) return false;
+  JsonValue* player = ObjectGet(root, "PlayerSaveData");
+  JsonValue* currencies = player ? ObjectGet(*player, "currenySaveDatas") : nullptr;
+  JsonValue* gold = currencies ? const_cast<JsonValue*>(FindByNumberKey(currencies, "Key", "100001")) : nullptr;
+  JsonValue* quantity = gold ? ObjectGet(*gold, "Quantity") : nullptr;
+  if (!quantity) return false;
+  *quantity = CopyOrNull(amount);
+  return true;
+}
+
+int ApplyRuntimeHeroExpToSaveRoot(JsonValue& root, const JsonValue& runtime_heroes) {
+  if (runtime_heroes.type != JsonValue::Type::Array) return 0;
+  JsonValue* player = ObjectGet(root, "PlayerSaveData");
+  JsonValue* heroes = player ? ObjectGet(*player, "heroSaveDatas") : nullptr;
+  if (!heroes || heroes->type != JsonValue::Type::Array) return 0;
+
+  int patched = 0;
+  for (JsonValue& hero : heroes->array) {
+    std::string hero_key = JsonNumberKey(ObjectGet(hero, "heroKey"));
+    if (hero_key.empty() || hero_key == "0") continue;
+    const JsonValue* runtime = FindByNumberKey(&runtime_heroes, "heroKey", hero_key);
+    const JsonValue* exp = runtime ? ObjectGet(*runtime, "exp") : nullptr;
+    JsonValue* hero_exp = exp ? ObjectGet(hero, "HeroExp") : nullptr;
+    if (!hero_exp || exp->type != JsonValue::Type::Number) continue;
+    *hero_exp = CopyOrNull(exp);
+    ++patched;
+  }
+  return patched;
+}
+
+bool ApplyRuntimeStageToSaveRoot(JsonValue& root, int stage_key) {
+  if (!IsPlausibleRuntimeStageKey(stage_key)) return false;
+  JsonValue* player = ObjectGet(root, "PlayerSaveData");
+  JsonValue* common = player ? ObjectGet(*player, "commonSaveData") : nullptr;
+  JsonValue* current_stage_key = common ? ObjectGet(*common, "currentStageKey") : nullptr;
+  if (!current_stage_key) return false;
+  *current_stage_key = JsonValue::Number(static_cast<long long>(stage_key));
+  return true;
+}
+
+void ApplyRuntimeMetricsToSaveRoot(HANDLE process, uintptr_t module_base, JsonValue& root) {
+  int runtime_stage_key = 0;
+  if (ReadRuntimeStageKey(process, module_base, runtime_stage_key)) {
+    ApplyRuntimeStageToSaveRoot(root, runtime_stage_key);
+  }
+
+  JsonValue runtime_currencies;
+  JsonValue runtime_gold;
+  std::string currency_error;
+  if (ReadRuntimeCurrencies(process, module_base, runtime_currencies, runtime_gold, &currency_error)) {
+    ApplyRuntimeGoldToSaveRoot(root, runtime_gold);
+  }
+
+  JsonValue runtime_heroes;
+  std::string hero_error;
+  if (ReadRuntimeHeroExp(process, module_base, runtime_heroes, &hero_error)) {
+    ApplyRuntimeHeroExpToSaveRoot(root, runtime_heroes);
+  }
+}
+
+bool ReadDeadMonsterReward(HANDLE process, uintptr_t monster, JsonValue* row, long long* reward_gold,
+                           long long* reward_exp) {
+  if (reward_gold) *reward_gold = 0;
+  if (reward_exp) *reward_exp = 0;
+  if (!monster) return false;
+
+  uintptr_t cache = ReadPtr(process, monster + kMonsterCacheOffset);
+  uintptr_t info = cache ? ReadPtr(process, cache + kMonsterCacheInfoDataOffset) : 0;
+  int monster_key = 0;
+  int monster_type = 0;
+  int info_monster_type = 0;
+  int reward_gold_value = 0;
+  int reward_exp_value = 0;
+  int runtime_int_a = 0;
+  int runtime_int_b = 0;
+  int runtime_int_c = 0;
+  int stage_type = 0;
+  float runtime_float = 0;
+
+  bool ok = info &&
+            ReadScalar(process, info + kMonsterInfoMonsterKeyOffset, monster_key) &&
+            ReadScalar(process, monster + kMonsterTypeOffset, monster_type) &&
+            ReadScalar(process, info + kMonsterInfoMonsterTypeOffset, info_monster_type) &&
+            ReadScalar(process, info + kMonsterInfoRewardGoldOffset, reward_gold_value) &&
+            ReadScalar(process, info + kMonsterInfoRewardExpOffset, reward_exp_value);
+  ReadScalar(process, monster + kMonsterRuntimeIntAOffset, runtime_int_a);
+  ReadScalar(process, monster + kMonsterRuntimeIntBOffset, runtime_int_b);
+  ReadScalar(process, monster + kMonsterRuntimeFloatOffset, runtime_float);
+  ReadScalar(process, monster + kMonsterStageTypeOffset, stage_type);
+  ReadScalar(process, monster + kMonsterRuntimeIntCOffset, runtime_int_c);
+
+  if (row) {
+    *row = JsonValue::Object();
+    ObjectSet(*row, "address", JsonAddress(monster));
+    ObjectSet(*row, "cache", JsonAddress(cache));
+    ObjectSet(*row, "monsterInfoData", JsonAddress(info));
+    ObjectSet(*row, "readOk", JsonValue::Bool(ok));
+    ObjectSet(*row, "monsterKey", JsonValue::Number(static_cast<long long>(monster_key)));
+    ObjectSet(*row, "monsterType", JsonValue::Number(static_cast<long long>(monster_type)));
+    ObjectSet(*row, "infoMonsterType", JsonValue::Number(static_cast<long long>(info_monster_type)));
+    ObjectSet(*row, "rewardGold", JsonValue::Number(static_cast<long long>(reward_gold_value)));
+    ObjectSet(*row, "rewardExp", JsonValue::Number(static_cast<long long>(reward_exp_value)));
+    ObjectSet(*row, "runtimeInt_0x3BC", JsonValue::Number(static_cast<long long>(runtime_int_a)));
+    ObjectSet(*row, "runtimeInt_0x3C0", JsonValue::Number(static_cast<long long>(runtime_int_b)));
+    ObjectSet(*row, "runtimeFloat_0x3C4", JsonValue::Number(static_cast<double>(runtime_float)));
+    ObjectSet(*row, "stageType_0x3C8", JsonValue::Number(static_cast<long long>(stage_type)));
+    ObjectSet(*row, "runtimeInt_0x3CC", JsonValue::Number(static_cast<long long>(runtime_int_c)));
+  }
+
+  if (!ok) return false;
+  if (reward_gold) *reward_gold = reward_gold_value;
+  if (reward_exp) *reward_exp = reward_exp_value;
+  return true;
+}
+
 bool BuildLiveSaveRoot(HANDLE process, uintptr_t save_manager, JsonValue& root, std::string* error) {
   uintptr_t account_ptr = ReadPtr(process, save_manager + kSaveManagerAccountSaveOffset);
   uintptr_t player_ptr = ReadPtr(process, save_manager + kSaveManagerPlayerSaveOffset);
@@ -3759,6 +4202,150 @@ bool BuildLiveSaveRoot(HANDLE process, uintptr_t save_manager, JsonValue& root, 
   return true;
 }
 
+bool ReadLiveStageMetrics(DWORD pid, JsonValue& out, std::string* error = nullptr) {
+  auto fail = [&](const char* why) {
+    if (error) *error = why;
+    return false;
+  };
+  out = JsonValue::Object();
+  if (!pid) return fail("jogo nao esta rodando");
+  uintptr_t module_base = FindModuleBase(pid, L"GameAssembly.dll");
+  if (!module_base) return fail("GameAssembly.dll nao encontrada");
+  HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (!process) return fail("sem acesso ao processo");
+
+  bool ok = false;
+  do {
+    uintptr_t stage = ResolveSingletonInstance(process, module_base, kStageManagerTypeInfoRva);
+    uintptr_t monsters = ResolveSingletonInstance(process, module_base, kMonsterSpawnManagerTypeInfoRva);
+    uintptr_t save_manager = ResolveSingletonInstance(process, module_base, kSaveManagerTypeInfoRva);
+
+    ObjectSet(out, "stageManager", JsonAddress(stage));
+    ObjectSet(out, "monsterSpawnManager", JsonAddress(monsters));
+    ObjectSet(out, "saveManager", JsonAddress(save_manager));
+
+    if (!stage) { fail("singleton StageManager ainda nao criado"); break; }
+    if (!monsters) { fail("singleton MonsterSpawnManager ainda nao criado"); break; }
+
+    int stage_state = 0;
+    int runtime_int = 0;
+    float runtime_float = 0;
+    unsigned char stage_started = 0;
+    unsigned char force_boss_wave = 0;
+    ReadScalar(process, stage + kStageManagerStageStateOffset, stage_state);
+    ReadScalar(process, stage + kStageManagerStageStartedOffset, stage_started);
+    ReadScalar(process, stage + kStageManagerRuntimeFloatOffset, runtime_float);
+    ReadScalar(process, stage + kStageManagerRuntimeIntOffset, runtime_int);
+    ReadScalar(process, monsters + kMonsterSpawnManagerForceBossWaveOffset, force_boss_wave);
+
+    ObjectSet(out, "stageState", JsonValue::Number(static_cast<long long>(stage_state)));
+    ObjectSet(out, "stageStarted", JsonValue::Bool(stage_started != 0));
+    ObjectSet(out, "stageRuntimeFloat_0x110", JsonValue::Number(static_cast<double>(runtime_float)));
+    ObjectSet(out, "stageRuntimeInt_0x138", JsonValue::Number(static_cast<long long>(runtime_int)));
+    ObjectSet(out, "stageRuntimeListA_0xE0Count",
+              JsonValue::Number(static_cast<long long>(
+                  ReadIl2CppListCount(process, ReadPtr(process, stage + kStageManagerRuntimeListAOffset), 4096))));
+    ObjectSet(out, "stageRuntimeListB_0xE8Count",
+              JsonValue::Number(static_cast<long long>(
+                  ReadIl2CppListCount(process, ReadPtr(process, stage + kStageManagerRuntimeListBOffset), 4096))));
+    ObjectSet(out, "monsterListCount",
+              JsonValue::Number(static_cast<long long>(ReadIl2CppListCount(
+                  process, ReadPtr(process, monsters + kMonsterSpawnManagerMonsterListOffset), 8192))));
+
+    uintptr_t dead_monster_list = ReadPtr(process, monsters + kMonsterSpawnManagerDeadMonsterListOffset);
+    std::vector<uintptr_t> dead_monsters;
+    std::string dead_error;
+    bool dead_read_ok = ReadIl2CppListPointers(process, dead_monster_list, 16384, dead_monsters, &dead_error,
+                                               "DeadMonsterUnit");
+    ObjectSet(out, "deadMonsterListCount",
+              JsonValue::Number(static_cast<long long>(dead_read_ok ? dead_monsters.size() : -1)));
+    if (!dead_read_ok) ObjectSet(out, "deadMonsterReadError", JsonValue::String(dead_error));
+
+    long long dead_reward_gold_sum = 0;
+    long long dead_reward_exp_sum = 0;
+    long long dead_reward_ok = 0;
+    long long dead_reward_invalid = 0;
+    for (uintptr_t monster : dead_monsters) {
+      long long reward_gold = 0;
+      long long reward_exp = 0;
+      if (ReadDeadMonsterReward(process, monster, nullptr, &reward_gold, &reward_exp)) {
+        dead_reward_gold_sum += reward_gold;
+        dead_reward_exp_sum += reward_exp;
+        ++dead_reward_ok;
+      } else {
+        ++dead_reward_invalid;
+      }
+    }
+    JsonValue reward_totals = JsonValue::Object();
+    ObjectSet(reward_totals, "readOk", JsonValue::Number(dead_reward_ok));
+    ObjectSet(reward_totals, "invalid", JsonValue::Number(dead_reward_invalid));
+    ObjectSet(reward_totals, "baseGold", JsonValue::Number(dead_reward_gold_sum));
+    ObjectSet(reward_totals, "baseExp", JsonValue::Number(dead_reward_exp_sum));
+    ObjectSet(out, "deadMonsterRewardTotals", std::move(reward_totals));
+
+    JsonValue recent_dead = JsonValue::Array();
+    size_t recent_start = dead_monsters.size() > 12 ? dead_monsters.size() - 12 : 0;
+    for (size_t index = recent_start; index < dead_monsters.size(); ++index) {
+      JsonValue row;
+      long long reward_gold = 0;
+      long long reward_exp = 0;
+      ReadDeadMonsterReward(process, dead_monsters[index], &row, &reward_gold, &reward_exp);
+      ObjectSet(row, "listIndex", JsonValue::Number(static_cast<long long>(index)));
+      recent_dead.array.push_back(std::move(row));
+    }
+    ObjectSet(out, "recentDeadMonsters", std::move(recent_dead));
+
+    ObjectSet(out, "summonedMonsterListCount",
+              JsonValue::Number(static_cast<long long>(ReadIl2CppListCount(
+                  process, ReadPtr(process, monsters + kMonsterSpawnManagerSummonedMonsterListOffset), 8192))));
+    ObjectSet(out, "forceBossWave", JsonValue::Bool(force_boss_wave != 0));
+
+    int runtime_stage_key = 0;
+    std::string runtime_stage_source;
+    if (ReadRuntimeStageKey(process, module_base, runtime_stage_key, &runtime_stage_source)) {
+      ObjectSet(out, "runtimeStageKey", JsonValue::Number(static_cast<long long>(runtime_stage_key)));
+      ObjectSet(out, "runtimeStageSource", JsonValue::String(runtime_stage_source));
+    }
+
+    JsonValue runtime_currencies;
+    JsonValue runtime_gold;
+    std::string currency_error;
+    if (ReadRuntimeCurrencies(process, module_base, runtime_currencies, runtime_gold, &currency_error)) {
+      ObjectSet(out, "runtimeCurrencies", std::move(runtime_currencies));
+      ObjectSet(out, "runtimeGold", std::move(runtime_gold));
+    } else {
+      ObjectSet(out, "runtimeCurrencyError", JsonValue::String(currency_error));
+    }
+
+    JsonValue runtime_hero_exp;
+    std::string hero_exp_error;
+    if (ReadRuntimeHeroExp(process, module_base, runtime_hero_exp, &hero_exp_error)) {
+      ObjectSet(out, "runtimeHeroExp", std::move(runtime_hero_exp));
+    } else {
+      ObjectSet(out, "runtimeHeroExpError", JsonValue::String(hero_exp_error));
+    }
+
+    if (save_manager) {
+      JsonValue root;
+      std::string save_error;
+      if (BuildLiveSaveRoot(process, save_manager, root, &save_error)) {
+        JsonValue summary = BuildSaveSummaryJson(root);
+        ObjectSet(out, "saveStageKey", CopyOrNull(ObjectGet(summary, "currentStageKey")));
+        ObjectSet(out, "saveStageWave", CopyOrNull(ObjectGet(summary, "currentStageWave")));
+        ObjectSet(out, "saveGold", CopyOrNull(ObjectGet(summary, "gold")));
+        ObjectSet(out, "savePartyHeroLevels", CopyOrEmptyArray(ObjectGet(summary, "partyHeroLevels")));
+      } else {
+        ObjectSet(out, "saveError", JsonValue::String(save_error));
+      }
+    }
+
+    ok = true;
+  } while (false);
+
+  CloseHandle(process);
+  return ok;
+}
+
 bool FillSaveSummaryFromRoot(const JsonValue& save, const std::string& source, SaveSummary& summary) {
   JsonValue full_summary = BuildSaveSummaryJson(save);
   summary = SaveSummary();
@@ -3805,6 +4392,7 @@ bool ReadLiveSaveSummary(DWORD pid, SaveSummary& summary, std::string* error = n
 
     JsonValue root;
     if (!BuildLiveSaveRoot(process, instance, root, error)) break;
+    ApplyRuntimeMetricsToSaveRoot(process, module_base, root);
     if (!FillSaveSummaryFromRoot(root, "memory", summary)) {
       fail("snapshot vivo sem SteamID valido");
       break;
@@ -3865,6 +4453,26 @@ bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason
   if (ReadLiveSaveSummary(pid, summary, &live_error)) return true;
   if (fallback_reason) *fallback_reason = live_error;
   return ReadSaveSummary(summary);
+}
+
+void StripHeroMetricFields(JsonValue& root, const std::string& key) {
+  JsonValue* heroes = ObjectGet(root, key);
+  if (!heroes || heroes->type != JsonValue::Type::Array) return;
+  for (JsonValue& hero : heroes->array) {
+    ObjectErase(hero, "exp");
+  }
+}
+
+std::string SaveStructuralHash(const SaveSummary& summary) {
+  JsonValue root;
+  if (!ParseJson(summary.summary_json, root)) return Fnv1aHash(summary.summary_json);
+  ObjectErase(root, "gold");
+  ObjectErase(root, "playTime");
+  ObjectErase(root, "currentStageWave");
+  ObjectErase(root, "monsterKills");
+  StripHeroMetricFields(root, "partyHeroLevels");
+  StripHeroMetricFields(root, "unlockedHeroes");
+  return Fnv1aHash(JsonSerialize(root));
 }
 
 std::string SavePayload(const Config& config) {
@@ -4237,15 +4845,15 @@ void AutoExportDevRuntimeSnapshot(const WorkerState& state, bool changed) {
   }
 }
 
-bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false) {
+bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = false, bool allow_save = true) {
   const std::vector<MemoryEvent>& events = state.memory.events;
   // Assinatura estavel do conteudo (sem updatedAt): so envia quando o save
   // muda ou quando ha eventos novos.
   std::string steam_raw = EffectiveSteamId(config, state);
   std::string pairing_hash = PairingHash(config, steam_raw);
   std::string save_hash = state.has_save ? Fnv1aHash(state.save.summary_json) : "null";
-  bool include_save = state.has_save && (force || save_hash != state.last_synced_save_hash);
-  std::string signature = Fnv1aHash((state.has_save ? state.save.summary_json : "null") + "|" +
+  bool include_save = allow_save && state.has_save && (force || save_hash != state.last_synced_save_hash);
+  std::string signature = Fnv1aHash((include_save ? state.save.summary_json : "null") + "|" +
                                     std::to_string(events.size()) + "|" +
                                     (events.empty() ? "" : events.back().id) + "|" +
                                     pairing_hash);
@@ -4273,7 +4881,11 @@ bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = fa
   std::wstring result = PostJsonPayload(config, payload);
   if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
     state.last_payload_hash = signature;
-    if (include_save) state.last_synced_save_hash = save_hash;
+    if (include_save) {
+      state.last_synced_save_hash = save_hash;
+      state.last_synced_save_structural_hash = SaveStructuralHash(state.save);
+      state.last_save_sync_tick = GetTickCount();
+    }
     state.synced_index = events.empty() ? -1 : events.back().index;
     state.synced_first_id = events.empty() ? "" : events.front().id;
     SaveSyncState(state);
@@ -4364,17 +4976,34 @@ DWORD WINAPI WorkerProc(LPVOID) {
     std::string sync_config_signature = SyncConfigSignature(config, state);
     bool sync_config_changed = first_sync_done && sync_config_signature != state.last_sync_config_signature;
 
-    if (!first_sync_done || changed || sync_config_changed) {
-      first_sync_done = true;
-      SyncCachedPayload(config, state, true);
-      state.last_sync_config_signature = sync_config_signature;
+    std::string save_hash = Fnv1aHash(state.save.summary_json);
+    std::string save_structural_hash = SaveStructuralHash(state.save);
+    bool sync_ready = !config.server.empty() && !config.token.empty();
+    bool save_pending = save_hash != state.last_synced_save_hash;
+    bool structural_save_pending = save_pending && save_structural_hash != state.last_synced_save_structural_hash;
+    DWORD now = GetTickCount();
+    bool metric_save_due = sync_ready && state.has_save &&
+                           (state.last_save_sync_tick == 0 ||
+                            now - state.last_save_sync_tick >= kMetricSaveSyncMs);
+    bool observed_save_changed = save_changed || live_save_changed;
+
+    if (!first_sync_done || sync_config_changed) {
+      bool synced = SyncCachedPayload(config, state, true, true);
+      if (synced || !sync_ready) {
+        first_sync_done = true;
+        state.last_sync_config_signature = sync_config_signature;
+      }
+    } else if (observed_save_changed && structural_save_pending) {
+      SyncCachedPayload(config, state, false, true);
+    } else if (metric_save_due && save_pending) {
+      SyncCachedPayload(config, state, false, true);
     }
 
     bool memory_changed = RefreshMemoryCache(state);
     changed = memory_changed || changed;
     AutoExportDevRuntimeSnapshot(state, save_changed || live_save_changed || memory_changed);
     if (memory_changed) {
-      SyncCachedPayload(config, state);
+      SyncCachedPayload(config, state, false, false);
     }
   }
   PostStatus(L"Worker parado.");
@@ -4595,6 +5224,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
   return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
+bool IsWideUnsignedInteger(const wchar_t* text) {
+  if (!text || !*text) return false;
+  for (const wchar_t* p = text; *p; ++p) {
+    if (*p < L'0' || *p > L'9') return false;
+  }
+  return true;
+}
+
+bool WriteMemoryStageScan(const std::wstring& output, int seconds) {
+  if (seconds < 1) seconds = 1;
+  if (seconds > 300) seconds = 300;
+
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  JsonValue root = JsonValue::Object();
+  ObjectSet(root, "pid", JsonValue::Number(static_cast<long long>(pid)));
+  ObjectSet(root, "seconds", JsonValue::Number(static_cast<long long>(seconds)));
+  ObjectSet(root, "intervalMs", JsonValue::Number(1000LL));
+
+  JsonValue samples = JsonValue::Array();
+  DWORD start = GetTickCount();
+  for (int index = 0; index <= seconds; ++index) {
+    JsonValue sample;
+    std::string error;
+    bool ok = ReadLiveStageMetrics(pid, sample, &error);
+    ObjectSet(sample, "ok", JsonValue::Bool(ok));
+    ObjectSet(sample, "sampleIndex", JsonValue::Number(static_cast<long long>(index)));
+    ObjectSet(sample, "elapsedMs", JsonValue::Number(static_cast<long long>(GetTickCount() - start)));
+    ObjectSet(sample, "unixTime", JsonValue::Number(static_cast<double>(time(nullptr))));
+    if (!ok) ObjectSet(sample, "error", JsonValue::String(error));
+    samples.array.push_back(std::move(sample));
+    if (index < seconds) Sleep(1000);
+  }
+
+  ObjectSet(root, "samples", std::move(samples));
+  return WriteUtf8TextFileAtomic(output, JsonSerialize(root));
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
@@ -4634,6 +5300,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
         return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--memory-stage-scan") == 0) {
+        std::wstring output = TempComparePath();
+        int seconds = 30;
+        if (i + 1 < argc && argv[i + 1][0] != L'-') {
+          if (IsWideUnsignedInteger(argv[i + 1])) {
+            seconds = _wtoi(argv[++i]);
+          } else {
+            output = argv[++i];
+          }
+        }
+        if (i + 1 < argc && argv[i + 1][0] != L'-' && IsWideUnsignedInteger(argv[i + 1])) {
+          seconds = _wtoi(argv[++i]);
+        }
+        bool ok = WriteMemoryStageScan(output, seconds);
+        if (!ok) WriteTextFile(TempComparePath(), L"FAIL: não foi possível exportar o scan runtime de stage.");
+        LocalFree(argv);
+        return ok ? 0 : 2;
       }
       if (wcscmp(argv[i], L"--memory-save-scan") == 0) {
         SaveSummary live;

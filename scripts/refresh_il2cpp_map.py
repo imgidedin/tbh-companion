@@ -10,6 +10,7 @@ List<LogData> do LogManager mudam. Este script:
        - RVA do TypeInfo do singleton base de LogManager
        - offsets de LogManager (List<LogData>) e LogData (texto/relogio/DateTime)
        - offsets de BoxOpenLog (itemStringKey + EGradeType)
+      - TypeInfos/offsets de StageManager, MonsterSpawnManager, MonsterInfoData e runtime currency para diagnostico runtime
        - o enum EGradeType (nomes das raridades, em ordem)
   4. VERIFICA na memoria do jogo vivo (rotina de leitura dos logs de eventos):
      resolve a cadeia de ponteiros, descobre o offset de static_fields por forca
@@ -333,6 +334,87 @@ def extract_map(dump_dir: Path) -> dict:
     info["player_items_offset"] = field_offset(player, "itemSaveDatas", "PlayerSaveData")
     info["player_aggregates_offset"] = field_offset(player, "aggregateSaveDatas", "PlayerSaveData")
 
+    stage_manager = require_class(src, "StageManager")
+    monster_spawn_manager = require_class(src, "MonsterSpawnManager")
+    monster = require_class(src, "Monster")
+    monster_cache = require_class(src, "vb.ul")
+    monster_info = require_class(src, "MonsterInfoData")
+    runtime_currency_manager_name = "vb.tp" if class_body(src, "vb.tp") else "ue.su"
+    runtime_currency_name = "vb.tq" if class_body(src, "vb.tq") else "ue.sv"
+    runtime_currency_manager = require_class(src, runtime_currency_manager_name)
+    runtime_currency = require_class(src, runtime_currency_name)
+    currency_info = require_class(src, "CurrencyInfoData")
+    runtime_hero_manager = require_class(src, "vb.tz")
+    runtime_hero = require_class(src, "vd")
+    hero_info = require_class(src, "HeroInfoData")
+    info["stage_manager_typeinfo_rva"], info["stage_manager_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        singleton_typeinfo_candidates(stage_manager, "StageManager", ["np<StageManager>_TypeInfo"]),
+        "StageManager",
+    )
+    info["monster_spawn_manager_typeinfo_rva"], info["monster_spawn_manager_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        singleton_typeinfo_candidates(monster_spawn_manager, "MonsterSpawnManager", ["np<MonsterSpawnManager>_TypeInfo"]),
+        "MonsterSpawnManager",
+    )
+    info["stage_manager_stage_state_offset"] = field_offset(stage_manager, "stageState", "StageManager")
+    info["stage_manager_stage_started_offset"] = field_offset(stage_manager, "b_StageStart", "StageManager")
+    info["stage_manager_runtime_float_offset"] = field_offset(stage_manager, "bdha", "StageManager")
+    info["stage_manager_runtime_int_offset"] = field_offset(stage_manager, "bdhc", "StageManager")
+    info["stage_manager_runtime_list_a_offset"] = field_offset(stage_manager, "bdgx", "StageManager")
+    info["stage_manager_runtime_list_b_offset"] = field_offset(stage_manager, "bdgy", "StageManager")
+    info["monster_spawn_manager_monster_list_offset"] = field_offset(monster_spawn_manager, "MonsterList", "MonsterSpawnManager")
+    info["monster_spawn_manager_dead_monster_list_offset"] = field_offset(monster_spawn_manager, "DeadMonsterUnit", "MonsterSpawnManager")
+    info["monster_spawn_manager_summoned_monster_list_offset"] = field_offset(monster_spawn_manager, "SummonedMonsterList", "MonsterSpawnManager")
+    info["monster_spawn_manager_force_boss_wave_offset"] = field_offset(monster_spawn_manager, "IsForceEnterBossWave", "MonsterSpawnManager")
+    info["monster_cache_offset"] = field_offset(monster, "cache", "Monster")
+    info["monster_type_offset"] = field_offset(monster, "MonsterType", "Monster")
+    info["monster_runtime_int_a_offset"] = field_offset(monster, "bcqr", "Monster")
+    info["monster_runtime_int_b_offset"] = field_offset(monster, "bcqs", "Monster")
+    info["monster_runtime_float_offset"] = field_offset(monster, "bcqt", "Monster")
+    info["monster_stage_type_offset"] = field_offset(monster, "bcqu", "Monster")
+    info["monster_runtime_int_c_offset"] = field_offset(monster, "bcqv", "Monster")
+    info["monster_cache_info_data_offset"] = field_offset(monster_cache, "bepe", "vb.ul")
+    info["monster_info_monster_key_offset"] = field_offset(monster_info, "MonsterKey", "MonsterInfoData")
+    info["monster_info_monster_type_offset"] = field_offset(monster_info, "MONSTERTYPE", "MonsterInfoData")
+    info["monster_info_reward_gold_offset"] = field_offset(monster_info, "RewardGold", "MonsterInfoData")
+    info["monster_info_reward_exp_offset"] = field_offset(monster_info, "RewardExp", "MonsterInfoData")
+    info["runtime_currency_manager_typeinfo_rva"], info["runtime_currency_manager_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        [f"{runtime_currency_manager_name}_TypeInfo"],
+        runtime_currency_manager_name,
+    )
+    info["runtime_currency_manager_list_offset"] = field_offset(
+        runtime_currency_manager,
+        "belo" if runtime_currency_manager_name == "vb.tp" else "bdxd",
+        runtime_currency_manager_name,
+    )
+    info["runtime_currency_info_offset"] = field_offset(
+        runtime_currency,
+        "belq" if runtime_currency_name == "vb.tq" else "bdxf",
+        runtime_currency_name,
+    )
+    info["runtime_currency_amount_offset"] = field_offset(
+        runtime_currency,
+        "belt" if runtime_currency_name == "vb.tq" else "bdxi",
+        runtime_currency_name,
+    )
+    info["runtime_currency_alt_amount_offset"] = field_offset(
+        runtime_currency,
+        "belu" if runtime_currency_name == "vb.tq" else "bdxj",
+        runtime_currency_name,
+    )
+    info["currency_info_key_offset"] = field_offset(currency_info, "CurrencyKey", "CurrencyInfoData")
+    info["runtime_hero_manager_typeinfo_rva"], info["runtime_hero_manager_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        ["vb.tz_TypeInfo"],
+        "vb.tz",
+    )
+    info["runtime_hero_dictionary_offset"] = field_offset(runtime_hero_manager, "bemh", "vb.tz")
+    info["runtime_hero_info_offset"] = field_offset(runtime_hero, "bety", "vd")
+    info["runtime_hero_exp_offset"] = field_offset(runtime_hero, "beuv", "vd")
+    info["hero_info_hero_key_offset"] = field_offset(hero_info, "HeroKey", "HeroInfoData")
+
     return info
 
 
@@ -564,6 +646,10 @@ constexpr uintptr_t kLogDataDateTimeOffset = 0x{info['datetime_offset']:X};
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x{info['box_item_key_offset']:X};
 constexpr uintptr_t kBoxOpenGradeOffset = 0x{info['box_grade_offset']:X};
 constexpr uintptr_t kSaveManagerTypeInfoRva = 0x{info['save_typeinfo_rva']:X};
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x{info['stage_manager_typeinfo_rva']:X};
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x{info['monster_spawn_manager_typeinfo_rva']:X};
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x{info['runtime_currency_manager_typeinfo_rva']:X};
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x{info['runtime_hero_manager_typeinfo_rva']:X};
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x{info['save_manager_account_offset']:X};
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x{info['save_manager_player_offset']:X};
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x{info['account_player_id_offset']:X};
@@ -587,6 +673,37 @@ constexpr uintptr_t kPlayerSaveStashOffset = 0x{info['player_stash_offset']:X};
 constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x{info['player_trade_stash_offset']:X};
 constexpr uintptr_t kPlayerSaveItemsOffset = 0x{info['player_items_offset']:X};
 constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x{info['player_aggregates_offset']:X};
+constexpr uintptr_t kStageManagerStageStateOffset = 0x{info['stage_manager_stage_state_offset']:X};
+constexpr uintptr_t kStageManagerStageStartedOffset = 0x{info['stage_manager_stage_started_offset']:X};
+constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x{info['stage_manager_runtime_float_offset']:X};
+constexpr uintptr_t kStageManagerRuntimeIntOffset = 0x{info['stage_manager_runtime_int_offset']:X};
+constexpr uintptr_t kStageManagerRuntimeListAOffset = 0x{info['stage_manager_runtime_list_a_offset']:X};
+constexpr uintptr_t kStageManagerRuntimeListBOffset = 0x{info['stage_manager_runtime_list_b_offset']:X};
+constexpr uintptr_t kMonsterSpawnManagerMonsterListOffset = 0x{info['monster_spawn_manager_monster_list_offset']:X};
+constexpr uintptr_t kMonsterSpawnManagerDeadMonsterListOffset = 0x{info['monster_spawn_manager_dead_monster_list_offset']:X};
+constexpr uintptr_t kMonsterSpawnManagerSummonedMonsterListOffset = 0x{info['monster_spawn_manager_summoned_monster_list_offset']:X};
+constexpr uintptr_t kMonsterSpawnManagerForceBossWaveOffset = 0x{info['monster_spawn_manager_force_boss_wave_offset']:X};
+constexpr uintptr_t kMonsterCacheOffset = 0x{info['monster_cache_offset']:X};
+constexpr uintptr_t kMonsterTypeOffset = 0x{info['monster_type_offset']:X};
+constexpr uintptr_t kMonsterRuntimeIntAOffset = 0x{info['monster_runtime_int_a_offset']:X};
+constexpr uintptr_t kMonsterRuntimeIntBOffset = 0x{info['monster_runtime_int_b_offset']:X};
+constexpr uintptr_t kMonsterRuntimeFloatOffset = 0x{info['monster_runtime_float_offset']:X};
+constexpr uintptr_t kMonsterStageTypeOffset = 0x{info['monster_stage_type_offset']:X};
+constexpr uintptr_t kMonsterRuntimeIntCOffset = 0x{info['monster_runtime_int_c_offset']:X};
+constexpr uintptr_t kMonsterCacheInfoDataOffset = 0x{info['monster_cache_info_data_offset']:X};
+constexpr uintptr_t kMonsterInfoMonsterKeyOffset = 0x{info['monster_info_monster_key_offset']:X};
+constexpr uintptr_t kMonsterInfoMonsterTypeOffset = 0x{info['monster_info_monster_type_offset']:X};
+constexpr uintptr_t kMonsterInfoRewardGoldOffset = 0x{info['monster_info_reward_gold_offset']:X};
+constexpr uintptr_t kMonsterInfoRewardExpOffset = 0x{info['monster_info_reward_exp_offset']:X};
+constexpr uintptr_t kRuntimeCurrencyManagerListOffset = 0x{info['runtime_currency_manager_list_offset']:X};
+constexpr uintptr_t kRuntimeCurrencyInfoOffset = 0x{info['runtime_currency_info_offset']:X};
+constexpr uintptr_t kRuntimeCurrencyAmountOffset = 0x{info['runtime_currency_amount_offset']:X};
+constexpr uintptr_t kRuntimeCurrencyAltAmountOffset = 0x{info['runtime_currency_alt_amount_offset']:X};
+constexpr uintptr_t kCurrencyInfoKeyOffset = 0x{info['currency_info_key_offset']:X};
+constexpr uintptr_t kRuntimeHeroDictionaryOffset = 0x{info['runtime_hero_dictionary_offset']:X};
+constexpr uintptr_t kRuntimeHeroInfoOffset = 0x{info['runtime_hero_info_offset']:X};
+constexpr uintptr_t kRuntimeHeroExpOffset = 0x{info['runtime_hero_exp_offset']:X};
+constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x{info['hero_info_hero_key_offset']:X};
 static const char* const kGradeNames[] = {{
 {grades_inner},
 }};
@@ -663,6 +780,22 @@ def main() -> int:
           f"RVA=0x{info['save_typeinfo_rva']:X} "
           f"account=0x{info['save_manager_account_offset']:X} "
           f"player=0x{info['save_manager_player_offset']:X}")
+    print(f"[*] Runtime stage: StageManager {info.get('stage_manager_typeinfo_name', '?')} "
+          f"RVA=0x{info['stage_manager_typeinfo_rva']:X}; "
+          f"MonsterSpawnManager {info.get('monster_spawn_manager_typeinfo_name', '?')} "
+          f"RVA=0x{info['monster_spawn_manager_typeinfo_rva']:X}")
+    print(f"[*] Runtime rewards: Monster.cache=0x{info['monster_cache_offset']:X} "
+          f"MonsterInfoData=0x{info['monster_cache_info_data_offset']:X} "
+          f"rewardGold=0x{info['monster_info_reward_gold_offset']:X} "
+          f"rewardExp=0x{info['monster_info_reward_exp_offset']:X}")
+    print(f"[*] Runtime currency: {info.get('runtime_currency_manager_typeinfo_name', '?')} "
+          f"RVA=0x{info['runtime_currency_manager_typeinfo_rva']:X} "
+          f"list=0x{info['runtime_currency_manager_list_offset']:X} "
+          f"amount=0x{info['runtime_currency_amount_offset']:X}")
+    print(f"[*] Runtime heroes: {info.get('runtime_hero_manager_typeinfo_name', '?')} "
+          f"RVA=0x{info['runtime_hero_manager_typeinfo_rva']:X} "
+          f"dict=0x{info['runtime_hero_dictionary_offset']:X} "
+          f"exp=0x{info['runtime_hero_exp_offset']:X}")
     print(f"[*] EGradeType: {info['grade_names']}")
 
     if not args.no_live:
