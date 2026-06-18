@@ -550,6 +550,28 @@ Regra:
 
 - Nao adicionar DPS autoritativo ao companion de producao sem decidir explicitamente se a postura read-only continua obrigatoria. Se continuar, nomear a feature como estimativa/inferencia e validar com harness controlado.
 
+## Movimento e ordem dos herois
+
+Fonte de verdade para `1.00.13`:
+
+- `scripts\.cache\dump\dump.cs` define `StatType.MovementSpeed = 7`, `StatType.AreaOfEffect = 8`, `StatType.BaseAttackCountReduction = 9` e `StatType.CooldownReduction = 10`. O agent deve manter `StatTypeName()` nessa mesma ordem.
+- `HeroInfoData.MovementSpeed @0x78` e `MonsterInfoData.MovementSpeed @0x64` sao os valores base vindos dos CSVs/dados do jogo.
+- No decompilado, `Hero.gqp` e `Monster` chamam `yt.kkf(cache, 7, 0)` e gravam o resultado em `Unit + 0x154..0x164`; `Unit.gsn` le exatamente esse `ObscuredFloat`.
+- `StageManager.iel` percorre `StageManager.HeroList @0x30`, calcula o maior `Unit.gsn()` visto e o menor `Unit.gsn()` entre herois elegiveis, e grava a velocidade efetiva do grupo em `StageManager.bdgo @0xA0`; `StageManager.idw` e o getter direto desse campo.
+
+Regra observada em `StageManager.iel`:
+
+- fluxo normal: usa o menor `MovementSpeed` entre os herois elegiveis/vivos;
+- excecao: se algum heroi satisfaz a checagem virtual com argumento `0xF4242`, ou se todos os herois ativos satisfazem a checagem virtual sem argumento, o valor efetivo vira o maior `MovementSpeed` do grupo;
+- o decompilado nao nomeia essas chamadas virtuais (`vtable + 0x328`), entao trate a semantica exata como pendente ate mapear o metodo C# correspondente; a regra min/max acima e a parte comprovada pelo fluxo.
+
+Ordem dos personagens:
+
+- `CommonSaveData.arrangedHeroKey @0x48` e a ordem persistida.
+- `StageManager.<SpawnFriendlyUnitAsync>d__115.MoveNext` itera `vb.tz.irq/irp` por indice, instancia o heroi com `StageManager.ifn`, grava em `HeroList[indice]`, chama `Hero.gpu(heroCache, indice)` e passa `HeroList` para `FollowCamera.eet`.
+- `StageManager.ifx` troca duas entradas de `HeroList`, atualiza o indice interno do heroi (`Hero + 0x3D0`) e troca arrays auxiliares de posicao/estado (`0x148`, `0x150`, `0x158`, `0x160`).
+- Conclusao: mudar a ordem muda slot, posicao horizontal, camera/UI/listas auxiliares e pode mudar indiretamente a velocidade se trocar quais herois estao ativos/elegiveis. A ordem por si so nao pesa no calculo de `MovementSpeed`; `StageManager.iel` agrega por min/max dos valores dos herois presentes.
+
 ### Ghidra CLI IL2CPP
 
 Fluxo preferido para evitar passos manuais no Ghidra:

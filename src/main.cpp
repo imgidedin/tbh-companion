@@ -2904,10 +2904,10 @@ const char* StatTypeName(long long type) {
     case 4: return "CriticalDamage";
     case 5: return "MaxHp";
     case 6: return "Armor";
-    case 7: return "CooldownReduction";
-    case 8: return "MovementSpeed";
-    case 9: return "AreaOfEffect";
-    case 10: return "BaseAttackCountReduction";
+    case 7: return "MovementSpeed";
+    case 8: return "AreaOfEffect";
+    case 9: return "BaseAttackCountReduction";
+    case 10: return "CooldownReduction";
     case 11: return "SkillRangeExpansion";
     case 12: return "FireResistance";
     case 13: return "ColdResistance";
