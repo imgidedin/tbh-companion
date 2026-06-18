@@ -29,6 +29,9 @@
 .PARAMETER DryRun
   Faz tudo localmente (mapa, build, tag) mas NAO commita, envia nem publica.
 
+.PARAMETER LogPath
+  Caminho do log/transcript do release. Se omitido, grava em dist\release-<timestamp>.log.
+
 .EXAMPLE
   pwsh scripts\release.ps1                 # release normal (jogo aberto)
   pwsh scripts\release.ps1 -SkipMap        # so build + release
@@ -40,12 +43,14 @@ param(
   [switch]$SkipMap,
   [switch]$NoLive,
   [switch]$Draft,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$LogPath
 )
 
 $ErrorActionPreference = "Stop"
 
 $RepoUrl = "https://github.com/imgidedin/tbh-companion.git"
+$RepoSlug = "imgidedin/tbh-companion"
 $AgentDir = Split-Path -Parent $PSScriptRoot         # raiz do repo do agente
 $ExePath = Join-Path $AgentDir "build\TBH_Companion.exe"
 $DistDir = Join-Path $AgentDir "dist"
@@ -55,7 +60,7 @@ $ProcessScript = Join-Path $PSScriptRoot "companion_process.ps1"
 $Git = @("-C", $AgentDir)                            # roda git sempre no repo do agente
 
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
-function Fail($msg) { Write-Host "ERRO: $msg" -ForegroundColor Red; exit 1 }
+function Fail($msg) { throw $msg }
 # Roda um comando nativo sem que o stderr dele aborte o script (PS trata stderr
 # de exe como erro terminante quando ErrorActionPreference=Stop). Checa o exit code.
 function Exec([scriptblock]$cmd) {
@@ -72,13 +77,42 @@ function StartCompanion() {
   if ($LASTEXITCODE -ne 0) { Fail "nao foi possivel iniciar o TBH_Companion.exe local." }
 }
 
-Push-Location $AgentDir
+$script:ReleaseTranscriptStarted = $false
+if (-not $LogPath) {
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  $LogPath = Join-Path $DistDir "release-$stamp.log"
+}
+$LogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+
+function StartReleaseLog() {
+  $logDir = Split-Path -Parent $LogPath
+  if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+  try {
+    Start-Transcript -Path $LogPath -Append | Out-Null
+    $script:ReleaseTranscriptStarted = $true
+    Write-Host "Log do release: $LogPath"
+  } catch {
+    Write-Warning "Nao foi possivel iniciar transcript em '$LogPath': $($_.Exception.Message)"
+  }
+}
+
+function StopReleaseLog() {
+  if ($script:ReleaseTranscriptStarted) {
+    try { Stop-Transcript | Out-Null } catch { }
+  }
+}
+
+$pushedLocation = $false
+StartReleaseLog
 try {
+  Push-Location $AgentDir
+  $pushedLocation = $true
+
   # --- pre-requisitos -------------------------------------------------------
   foreach ($tool in @("git", "gh", "py")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { Fail "'$tool' nao encontrado no PATH." }
   }
-  gh auth status 1>$null 2>$null
+  Exec { & gh auth status 1>$null 2>$null }
   if ($LASTEXITCODE -ne 0) { Fail "gh nao autenticado. Rode: gh auth login" }
 
   $gameArg = @()
@@ -97,7 +131,10 @@ try {
 
   # --- 2) versao do jogo ----------------------------------------------------
   Step "Detectando a versao do jogo..."
-  $version = (Exec { & py $MapScript @gameArg --print-version } 2>$null | Select-Object -Last 1).Trim()
+  $versionOutput = @(Exec { & py $MapScript @gameArg --print-version } 2>$null)
+  if ($LASTEXITCODE -ne 0) { Fail "refresh_il2cpp_map.py --print-version falhou." }
+  $version = ($versionOutput | Where-Object { $_ } | Select-Object -Last 1)
+  if ($version) { $version = $version.Trim() }
   if (-not $version) { Fail "Nao consegui detectar a versao do jogo." }
   Write-Host "    versao do jogo: $version"
 
@@ -123,7 +160,8 @@ try {
   $existing = @()
   $existing += (Exec { & git @Git tag --list })
   # A lista de releases vem do GitHub via --repo (funciona mesmo sem remote local).
-  $relList = Exec { & gh release list --repo $RepoUrl --limit 200 --json tagName --jq '.[].tagName' 2>$null }
+  $relList = Exec { & gh release list --repo $RepoSlug --limit 200 --json tagName --jq '.[].tagName' 2>$null }
+  if ($LASTEXITCODE -ne 0) { Fail "gh release list falhou para $RepoSlug." }
   if ($relList) { $existing += $relList }
   $existing = $existing | Where-Object { $_ } | Sort-Object -Unique
 
@@ -160,7 +198,8 @@ Gerado por ``scripts\release.ps1``.
     Step "DryRun: pronto. NAO commitei/enviei/publiquei."
     Write-Host "    tag:     $tag"
     Write-Host "    assets:  $exeAsset ; $zipAsset"
-    Write-Host "    repo:    $RepoUrl"
+    Write-Host "    repo:    $RepoSlug"
+    Write-Host "    log:     $LogPath"
     Step "Iniciando o companion local atualizado..."
     StartCompanion
     return
@@ -184,7 +223,7 @@ Gerado por ``scripts\release.ps1``.
   $relArgs = @(
     "release", "create", $tag,
     $exeAsset, $zipAsset,
-    "--repo", $RepoUrl,
+    "--repo", $RepoSlug,
     "--title", "TBH Companion $tag",
     "--notes", $notes,
     "--target", $branch
@@ -198,7 +237,16 @@ Gerado por ``scripts\release.ps1``.
 
   Step "Concluido!"
   Write-Host "    Release: https://github.com/imgidedin/tbh-companion/releases/tag/$tag" -ForegroundColor Green
+  Write-Host "    Log: $LogPath"
+} catch {
+  Write-Host "ERRO: $($_.Exception.Message)" -ForegroundColor Red
+  if ($_.ScriptStackTrace) {
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+  }
+  Write-Host "Log: $LogPath" -ForegroundColor Yellow
+  exit 1
 }
 finally {
-  Pop-Location
+  if ($pushedLocation) { Pop-Location }
+  StopReleaseLog
 }

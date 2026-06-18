@@ -40,7 +40,9 @@ O `release.ps1`:
 
 Flags: `-SkipMap` (so build+release), `-NoLive` (nao le a memoria do jogo),
 `-Draft` (release como rascunho), `-DryRun` (faz tudo local sem commitar/enviar/publicar),
-`-GameDir "caminho\TaskbarHero"`. Requer `git`, `gh` (autenticado: `gh auth login`) e `py` no PATH.
+`-GameDir "caminho\TaskbarHero"` e `-LogPath "caminho\release.log"`.
+Sem `-LogPath`, o script grava um transcript em `dist\release-<timestamp>.log`.
+Requer `git`, `gh` (autenticado: `gh auth login`) e `py` no PATH.
 
 ## Atualizar o mapa IL2CPP (versao nova do jogo)
 

@@ -417,6 +417,12 @@ Flags:
 - `-Draft`: cria release como rascunho.
 - `-DryRun`: nao commita, nao envia e nao publica.
 - `-GameDir`: caminho do TaskBarHero.
+- `-LogPath`: caminho opcional do transcript; por padrao o script grava `dist\release-<timestamp>.log`.
+
+Regras:
+
+- `scripts\release.ps1` deve iniciar transcript antes dos pre-requisitos e imprimir o caminho do log em sucesso ou falha.
+- Use `imgidedin/tbh-companion` para comandos `gh --repo`; a URL `.git` fica reservada ao remote Git.
 
 Pre-requisitos:
 
@@ -824,6 +830,7 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 Validar:
 
 - `gh auth status` OK.
+- Log em `dist\release-<timestamp>.log` criado, ou warning explicito se transcript nao puder iniciar.
 - Mapa atualizado.
 - Build OK.
 - Tag calculada.
