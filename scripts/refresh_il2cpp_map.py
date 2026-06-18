@@ -159,13 +159,14 @@ def run_dumper(dumper: Path, game_dir: Path) -> Path:
 # --------------------------------------------------------------------------- #
 def class_body(src: str, name: str) -> str | None:
     m = re.search(
-        r"// Namespace:[^\n]*\n(?:\[[^\n]*\]\n)*public (?:abstract |sealed )*class " + re.escape(name) + r"\b.*?\n\}",
+        r"// Namespace:[^\n]*\n(?:\[[^\n]*\]\n)*(?:public|private) "
+        r"(?:(?:abstract|sealed|static)\s+)*class " + re.escape(name) + r"(?=\s|:).*?\n\}",
         src, re.S,
     )
     return m.group(0) if m else None
 
 
-def fields_of(body: str) -> list[tuple[str, str, int]]:
+def fields_of(body: str, include_static: bool = False) -> list[tuple[str, str, int]]:
     """Retorna [(tipo, nome, offset)] dos campos de instancia (com // 0xNN)."""
     out = []
     in_fields = False
@@ -182,13 +183,19 @@ def fields_of(body: str) -> list[tuple[str, str, int]]:
         if not m:
             continue
         decl, off = m.group(1), int(m.group(2), 16)
-        if " static " in f" {decl} " or "const " in decl:
+        if (not include_static and " static " in f" {decl} ") or "const " in decl:
             continue
         parts = decl.replace("readonly ", "").split()
-        # parts: [modifier, ..., TYPE, NAME]
+        # parts: [modifier, ..., TYPE..., NAME]. Tipos genericos podem conter
+        # espaco depois da virgula, ex.: Dictionary<int, vd>.
         if len(parts) < 2:
             continue
-        ftype, fname = parts[-2], parts[-1]
+        fname = parts[-1]
+        modifiers = {"private", "public", "protected", "internal", "static", "readonly"}
+        type_parts = [part for part in parts[:-1] if part not in modifiers]
+        if not type_parts:
+            continue
+        ftype = " ".join(type_parts)
         out.append((ftype, fname, off))
     return out
 
@@ -255,6 +262,33 @@ def field_offset(body: str, name: str, class_name: str) -> int:
     raise SystemExit(f"campo {class_name}.{name} nao encontrado no dump.")
 
 
+def field_offset_by_type(body: str, type_name: str, class_name: str) -> int:
+    matches = [(fname, off) for typ, fname, off in fields_of(body) if typ == type_name]
+    if not matches:
+        raise SystemExit(f"campo {class_name} com tipo {type_name} nao encontrado no dump.")
+    if len(matches) > 1:
+        names = ", ".join(f"{fname}@0x{off:X}" for fname, off in matches)
+        raise SystemExit(f"campo {class_name} com tipo {type_name} ambiguo no dump: {names}")
+    return matches[0][1]
+
+
+def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: str) -> int:
+    try:
+        return field_offset(body, name, class_name)
+    except SystemExit:
+        return field_offset_by_type(body, type_name, class_name)
+
+
+def static_field_offset_by_type(body: str, type_name: str, class_name: str) -> int:
+    matches = [(fname, off) for typ, fname, off in fields_of(body, include_static=True) if typ == type_name]
+    if not matches:
+        raise SystemExit(f"campo static {class_name} com tipo {type_name} nao encontrado no dump.")
+    if len(matches) > 1:
+        names = ", ".join(f"{fname}@0x{off:X}" for fname, off in matches)
+        raise SystemExit(f"campo static {class_name} com tipo {type_name} ambiguo no dump: {names}")
+    return matches[0][1]
+
+
 def extract_map(dump_dir: Path) -> dict:
     src = (dump_dir / "dump.cs").read_text(encoding="utf-8", errors="ignore")
     info: dict = {}
@@ -306,8 +340,8 @@ def extract_map(dump_dir: Path) -> dict:
         singleton_typeinfo_candidates(bal, "bal", ["bal_TypeInfo"]),
         "bal",
     )
-    info["save_manager_account_offset"] = field_offset(bal, "bgaw", "bal")
-    info["save_manager_player_offset"] = field_offset(bal, "bgax", "bal")
+    info["save_manager_account_offset"] = field_offset_name_or_type(bal, "bgaw", "AccountSaveData", "bal")
+    info["save_manager_player_offset"] = field_offset_name_or_type(bal, "bgax", "PlayerSaveData", "bal")
 
     account = require_class(src, "AccountSaveData")
     common = require_class(src, "CommonSaveData")
@@ -374,7 +408,7 @@ def extract_map(dump_dir: Path) -> dict:
     info["monster_runtime_float_offset"] = field_offset(monster, "bcqt", "Monster")
     info["monster_stage_type_offset"] = field_offset(monster, "bcqu", "Monster")
     info["monster_runtime_int_c_offset"] = field_offset(monster, "bcqv", "Monster")
-    info["monster_cache_info_data_offset"] = field_offset(monster_cache, "bepe", "vb.ul")
+    info["monster_cache_info_data_offset"] = field_offset_by_type(monster_cache, "MonsterInfoData", "vb.ul")
     info["monster_info_monster_key_offset"] = field_offset(monster_info, "MonsterKey", "MonsterInfoData")
     info["monster_info_monster_type_offset"] = field_offset(monster_info, "MONSTERTYPE", "MonsterInfoData")
     info["monster_info_reward_gold_offset"] = field_offset(monster_info, "RewardGold", "MonsterInfoData")
@@ -384,24 +418,24 @@ def extract_map(dump_dir: Path) -> dict:
         [f"{runtime_currency_manager_name}_TypeInfo"],
         runtime_currency_manager_name,
     )
-    info["runtime_currency_manager_list_offset"] = field_offset(
+    info["runtime_currency_manager_list_offset"] = static_field_offset_by_type(
         runtime_currency_manager,
-        "belo" if runtime_currency_manager_name == "vb.tp" else "bdxd",
+        f"List<{runtime_currency_name}>",
         runtime_currency_manager_name,
     )
-    info["runtime_currency_info_offset"] = field_offset(
+    info["runtime_currency_info_offset"] = field_offset_by_type(
         runtime_currency,
-        "belq" if runtime_currency_name == "vb.tq" else "bdxf",
+        "CurrencyInfoData",
         runtime_currency_name,
     )
-    info["runtime_currency_amount_offset"] = field_offset(
+    info["runtime_currency_amount_offset"] = field_offset_by_type(
         runtime_currency,
-        "belt" if runtime_currency_name == "vb.tq" else "bdxi",
+        "ObscuredLong",
         runtime_currency_name,
     )
-    info["runtime_currency_alt_amount_offset"] = field_offset(
+    info["runtime_currency_alt_amount_offset"] = field_offset_by_type(
         runtime_currency,
-        "belu" if runtime_currency_name == "vb.tq" else "bdxj",
+        "ObscuredInt",
         runtime_currency_name,
     )
     info["currency_info_key_offset"] = field_offset(currency_info, "CurrencyKey", "CurrencyInfoData")
@@ -410,9 +444,9 @@ def extract_map(dump_dir: Path) -> dict:
         ["vb.tz_TypeInfo"],
         "vb.tz",
     )
-    info["runtime_hero_dictionary_offset"] = field_offset(runtime_hero_manager, "bemh", "vb.tz")
-    info["runtime_hero_info_offset"] = field_offset(runtime_hero, "bety", "vd")
-    info["runtime_hero_exp_offset"] = field_offset(runtime_hero, "beuv", "vd")
+    info["runtime_hero_dictionary_offset"] = static_field_offset_by_type(runtime_hero_manager, "Dictionary<int, vd>", "vb.tz")
+    info["runtime_hero_info_offset"] = field_offset_by_type(runtime_hero, "HeroInfoData", "vd")
+    info["runtime_hero_exp_offset"] = field_offset_by_type(runtime_hero, "ObscuredFloat", "vd")
     info["hero_info_hero_key_offset"] = field_offset(hero_info, "HeroKey", "HeroInfoData")
 
     return info
@@ -556,6 +590,9 @@ def verify_live(info: dict) -> dict:
     # 2) Confirma texto vs relogio entre os offsets de string do LogData.
     sample = [r.rptr(items + 0x20 + i * 8) for i in range(max(0, size - 40), size)]
     sample = [o for o in sample if o]
+    if len(sample) < 3:
+        print("[!] Poucos eventos no LogManager para identificar texto/relogio — mantendo offsets atuais do main.cpp.")
+        return info
     # Pontua cada offset de string. O relogio casa [HH:MM]; o TEXTO renderizado
     # carrega markup <color=...> (mensagem do evento). A chave de formato
     # (ex.: "LogMessage_...") nao tem markup e e ignorada.

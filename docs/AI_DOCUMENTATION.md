@@ -626,7 +626,7 @@ O script:
 2. Detecta versao.
 3. Baixa/usa Il2CppDumper.
 4. Gera `dump.cs` e `script.json`.
-5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog`, save vivo (`bal`), `StageManager`, `MonsterSpawnManager` e enum `EGradeType`.
+5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog`, save vivo (`bal`), `StageManager`, `MonsterSpawnManager`, runtime currency/herois e enum `EGradeType`.
 6. Com jogo aberto, valida na memoria viva.
 7. Patcha:
    - `src/main.cpp`
@@ -638,6 +638,8 @@ Regra critica:
 - Se o enum `EGradeType` ganhar grade novo, atualizar `GRADE_PT` no script.
 - Nao aceitar offset novo sem harness quando o jogo esta aberto e a verificacao viva e possivel.
 - Se usar `--no-live`, registre o risco: offsets dependentes de memoria podem ter sido preservados da versao anterior.
+- Para classes obfuscadas, prefira resolver campos por tipo estavel (`AccountSaveData`, `PlayerSaveData`, `MonsterInfoData`, `CurrencyInfoData`, `ObscuredLong`, `ObscuredFloat`, `Dictionary<int, vd>`) antes de depender de nomes como `bgaw`, `bepe` ou `beuv`, porque esses nomes podem mudar entre versoes.
+- Se a verificacao viva do `LogManager` tiver menos de 3 eventos, o refresh deve preservar `kLogDataTextOffset`/`kLogDataClockOffset` atuais e avisar, nao abortar o release por falta de amostra.
 
 ## Ambiente e comandos
 
@@ -764,12 +766,12 @@ Validar:
 
 - Script detecta versao correta.
 - Dump gera offsets.
-- Verificacao viva mostra amostras de eventos.
+- Verificacao viva mostra amostras de eventos; se houver menos de 3 eventos, aceita o aviso de poucos eventos apenas quando os offsets atuais de texto/relogio forem preservados.
 - Saida do script mostra `Save manager: TypeInfo np<bal>_TypeInfo`.
 - Saida do script mostra `Runtime stage` com TypeInfos de `StageManager` e `MonsterSpawnManager`.
 - Saida do script mostra `Runtime rewards` com offsets de `Monster.cache`, `MonsterInfoData.RewardGold` e `MonsterInfoData.RewardExp`.
 - Saida do script mostra `Runtime currency` com TypeInfo de `vb.tp`, offset da lista de currencies e offset do `ObscuredLong` usado por `vb.tq`.
-- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offset do `ObscuredFloat` usado por `vd.beuv`.
+- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offset do campo `ObscuredFloat` de EXP em `vd`.
 - `src/main.cpp` foi patchado dentro dos marcadores.
 - Frontend `server.js` e `public/calculator.js` recebem mapa de raridade se mudou.
 
