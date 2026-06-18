@@ -33,16 +33,22 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 O `release.ps1`:
 
 1. Recalcula o mapa IL2CPP (`refresh_il2cpp_map.py`) para a versao atual do jogo.
-2. Fecha uma instancia de dev rodando em `build\`, compila o `TBH_Companion.exe` e relanca o executavel novo ao final.
-3. Descobre a versao do jogo e monta a tag: `<versao>`; se ja existir um release dessa versao, usa `<versao>-1`, `<versao>-2`, ...
-4. Commita as mudancas e envia para o `origin` (https://github.com/imgidedin/tbh-companion.git, adicionado automaticamente se faltar).
-5. Cria o **GitHub Release** na tag com `TBH_Companion.exe` e um `.zip` anexados para download.
+2. Garante que existe `exported-assets\TaskBarHero-<versao>\frontend-pack\`; se faltar, exige `-ExportedProject` para organizar o export do AssetRipper antes de continuar.
+3. Roda o rebuild do repo `tbh-farm-local-frontend`, commita e faz push das mudancas de dados/assets do jogo.
+4. Fecha uma instancia de dev rodando em `build\`, compila o `TBH_Companion.exe` e relanca o executavel novo ao final.
+5. Descobre a versao do jogo e monta a tag: `<versao>`; se ja existir um release dessa versao, usa `<versao>-1`, `<versao>-2`, ...
+6. Commita as mudancas e envia para o `origin` (https://github.com/imgidedin/tbh-companion.git, adicionado automaticamente se faltar).
+7. Cria o **GitHub Release** na tag com `TBH_Companion.exe` e um `.zip` anexados para download.
 
 Flags: `-SkipMap` (so build+release), `-NoLive` (nao le a memoria do jogo),
 `-Draft` (release como rascunho), `-DryRun` (faz tudo local sem commitar/enviar/publicar),
-`-GameDir "caminho\TaskbarHero"` e `-LogPath "caminho\release.log"`.
+`-GameDir "caminho\TaskbarHero"`, `-FrontendDir "caminho\tbh-farm-local-frontend"`,
+`-ExportedProject "caminho\ExportedProject"` quando o pack da versao ainda nao existe,
+`-ForceAssetExport` para recriar o pack, `-NoContactSheets`, `-SkipFrontend` para
+release apenas do agente, e `-LogPath "caminho\release.log"`.
 Sem `-LogPath`, o script grava um transcript em `dist\release-<timestamp>.log`.
-Requer `git`, `gh` (autenticado: `gh auth login`) e `py` no PATH.
+Requer `git`, `gh` (autenticado: `gh auth login`), `py`, Node/npm no PATH e o repo
+`tbh-farm-local-frontend` disponivel no caminho padrao ou em `-FrontendDir`.
 
 ## Atualizar o mapa IL2CPP (versao nova do jogo)
 
@@ -137,6 +143,11 @@ A trava para nao exportar duas vezes a mesma versao esta pronta, mas desligada
 por enquanto. Quando quiser validar esse comportamento, adicione
 `-EnforceVersionGuard`; se precisar sobrescrever uma exportacao existente, use
 tambem `-Force`.
+
+Durante `scripts\release.ps1`, este fluxo e chamado automaticamente quando o
+`frontend-pack` da versao atual ainda nao existe e `-ExportedProject` foi
+informado. Sem pack existente e sem `-ExportedProject`, o release falha antes de
+publicar para evitar agente e frontend fora de sincronia.
 
 Tambem existe um modo CLI experimental (`-Enable -ExporterExe ...`), mas o fluxo
 principal hoje e AssetRipper GUI + `-OrganizeExportedProject`.

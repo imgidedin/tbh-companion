@@ -1171,6 +1171,9 @@ constexpr uintptr_t kRuntimeCurrencyAltAmountOffset = 0x48;
 constexpr uintptr_t kCurrencyInfoKeyOffset = 0x30;
 constexpr uintptr_t kRuntimeHeroDictionaryOffset = 0x20;
 constexpr uintptr_t kRuntimeHeroInfoOffset = 0x30;
+constexpr uintptr_t kRuntimeHeroLevelOffset = 0xCC;
+constexpr uintptr_t kRuntimeHeroAbilityPointOffset = 0xEC;
+constexpr uintptr_t kRuntimeHeroAllocatedAbilityPointOffset = 0xFC;
 constexpr uintptr_t kRuntimeHeroExpOffset = 0x10C;
 constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x30;
 static const char* const kGradeNames[] = {
@@ -3770,6 +3773,29 @@ int DecodeObscuredInt(HANDLE process, uintptr_t address, JsonValue* raw = nullpt
   return value;
 }
 
+int DecodeRuntimeHeroObscuredInt(HANDLE process, uintptr_t address, JsonValue* raw = nullptr) {
+  int hash = 0;
+  int hidden = 0;
+  int key = 0;
+  int fake = 0;
+  bool has_fake = ReadScalar(process, address + 0xC, fake);
+  ReadScalar(process, address + 0x0, hash);
+  ReadScalar(process, address + 0x4, hidden);
+  ReadScalar(process, address + 0x8, key);
+  int xor_decoded = hidden ^ key;
+  int value = has_fake ? fake : xor_decoded;
+  if (raw) {
+    *raw = JsonValue::Object();
+    ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
+    ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
+    ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
+    ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<long long>(fake)));
+    ObjectSet(*raw, "xorDecoded", JsonValue::Number(static_cast<long long>(xor_decoded)));
+    ObjectSet(*raw, "value", JsonValue::Number(static_cast<long long>(value)));
+  }
+  return value;
+}
+
 float FloatFromBits(int bits) {
   float value = 0.0f;
   std::memcpy(&value, &bits, sizeof(value));
@@ -3844,7 +3870,7 @@ bool ReadRuntimeCurrencies(HANDLE process, uintptr_t module_base, JsonValue& cur
   return true;
 }
 
-bool ReadRuntimeHeroExp(HANDLE process, uintptr_t module_base, JsonValue& heroes, std::string* error = nullptr) {
+bool ReadRuntimeHeroMetrics(HANDLE process, uintptr_t module_base, JsonValue& heroes, std::string* error = nullptr) {
   heroes = JsonValue::Array();
 
   uintptr_t statics = ResolveStaticFields(process, module_base, kRuntimeHeroManagerTypeInfoRva);
@@ -3864,7 +3890,14 @@ bool ReadRuntimeHeroExp(HANDLE process, uintptr_t module_base, JsonValue& heroes
     if (info) ReadScalar(process, info + kHeroInfoHeroKeyOffset, hero_key);
     if (hero_key <= 0) hero_key = dictionary_key;
 
+    JsonValue raw_level;
+    JsonValue raw_ability_point;
+    JsonValue raw_allocated_ability_point;
     JsonValue raw_exp;
+    int level = DecodeRuntimeHeroObscuredInt(process, hero + kRuntimeHeroLevelOffset, &raw_level);
+    int ability_point = DecodeRuntimeHeroObscuredInt(process, hero + kRuntimeHeroAbilityPointOffset, &raw_ability_point);
+    int allocated_ability_point =
+        DecodeRuntimeHeroObscuredInt(process, hero + kRuntimeHeroAllocatedAbilityPointOffset, &raw_allocated_ability_point);
     float exp = DecodeObscuredFloat(process, hero + kRuntimeHeroExpOffset, &raw_exp);
 
     JsonValue row = JsonValue::Object();
@@ -3872,7 +3905,13 @@ bool ReadRuntimeHeroExp(HANDLE process, uintptr_t module_base, JsonValue& heroes
     ObjectSet(row, "info", JsonAddress(info));
     ObjectSet(row, "dictionaryKey", JsonValue::Number(static_cast<long long>(dictionary_key)));
     ObjectSet(row, "heroKey", JsonValue::Number(static_cast<long long>(hero_key)));
+    ObjectSet(row, "level", JsonValue::Number(static_cast<long long>(level)));
+    ObjectSet(row, "abilityPoint", JsonValue::Number(static_cast<long long>(ability_point)));
+    ObjectSet(row, "allocatedAbilityPoint", JsonValue::Number(static_cast<long long>(allocated_ability_point)));
     ObjectSet(row, "exp", JsonValue::Number(static_cast<double>(exp)));
+    ObjectSet(row, "rawLevel", std::move(raw_level));
+    ObjectSet(row, "rawAbilityPoint", std::move(raw_ability_point));
+    ObjectSet(row, "rawAllocatedAbilityPoint", std::move(raw_allocated_ability_point));
     ObjectSet(row, "rawExp", std::move(raw_exp));
     heroes.array.push_back(std::move(row));
   }
@@ -3929,7 +3968,15 @@ bool ApplyRuntimeGoldToSaveRoot(JsonValue& root, const JsonValue& runtime_gold) 
   return true;
 }
 
-int ApplyRuntimeHeroExpToSaveRoot(JsonValue& root, const JsonValue& runtime_heroes) {
+bool ApplyRuntimeHeroNumber(JsonValue& hero, const JsonValue& runtime, const char* runtime_key, const char* save_key) {
+  const JsonValue* value = ObjectGet(runtime, runtime_key);
+  JsonValue* target = value ? ObjectGet(hero, save_key) : nullptr;
+  if (!target || value->type != JsonValue::Type::Number) return false;
+  *target = CopyOrNull(value);
+  return true;
+}
+
+int ApplyRuntimeHeroMetricsToSaveRoot(JsonValue& root, const JsonValue& runtime_heroes) {
   if (runtime_heroes.type != JsonValue::Type::Array) return 0;
   JsonValue* player = ObjectGet(root, "PlayerSaveData");
   JsonValue* heroes = player ? ObjectGet(*player, "heroSaveDatas") : nullptr;
@@ -3940,11 +3987,13 @@ int ApplyRuntimeHeroExpToSaveRoot(JsonValue& root, const JsonValue& runtime_hero
     std::string hero_key = JsonNumberKey(ObjectGet(hero, "heroKey"));
     if (hero_key.empty() || hero_key == "0") continue;
     const JsonValue* runtime = FindByNumberKey(&runtime_heroes, "heroKey", hero_key);
-    const JsonValue* exp = runtime ? ObjectGet(*runtime, "exp") : nullptr;
-    JsonValue* hero_exp = exp ? ObjectGet(hero, "HeroExp") : nullptr;
-    if (!hero_exp || exp->type != JsonValue::Type::Number) continue;
-    *hero_exp = CopyOrNull(exp);
-    ++patched;
+    if (!runtime) continue;
+    bool changed = false;
+    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "level", "HeroLevel");
+    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "abilityPoint", "AbilityPoint");
+    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "allocatedAbilityPoint", "AllocatedHeroAbilityPoint");
+    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "exp", "HeroExp");
+    if (changed) ++patched;
   }
   return patched;
 }
@@ -3974,8 +4023,8 @@ void ApplyRuntimeMetricsToSaveRoot(HANDLE process, uintptr_t module_base, JsonVa
 
   JsonValue runtime_heroes;
   std::string hero_error;
-  if (ReadRuntimeHeroExp(process, module_base, runtime_heroes, &hero_error)) {
-    ApplyRuntimeHeroExpToSaveRoot(root, runtime_heroes);
+  if (ReadRuntimeHeroMetrics(process, module_base, runtime_heroes, &hero_error)) {
+    ApplyRuntimeHeroMetricsToSaveRoot(root, runtime_heroes);
   }
 }
 
@@ -4317,12 +4366,14 @@ bool ReadLiveStageMetrics(DWORD pid, JsonValue& out, std::string* error = nullpt
       ObjectSet(out, "runtimeCurrencyError", JsonValue::String(currency_error));
     }
 
-    JsonValue runtime_hero_exp;
-    std::string hero_exp_error;
-    if (ReadRuntimeHeroExp(process, module_base, runtime_hero_exp, &hero_exp_error)) {
-      ObjectSet(out, "runtimeHeroExp", std::move(runtime_hero_exp));
+    JsonValue runtime_hero_metrics;
+    std::string hero_metrics_error;
+    if (ReadRuntimeHeroMetrics(process, module_base, runtime_hero_metrics, &hero_metrics_error)) {
+      ObjectSet(out, "runtimeHeroMetrics", CopyOrNull(&runtime_hero_metrics));
+      ObjectSet(out, "runtimeHeroExp", std::move(runtime_hero_metrics));
     } else {
-      ObjectSet(out, "runtimeHeroExpError", JsonValue::String(hero_exp_error));
+      ObjectSet(out, "runtimeHeroMetricsError", JsonValue::String(hero_metrics_error));
+      ObjectSet(out, "runtimeHeroExpError", JsonValue::String(hero_metrics_error));
     }
 
     if (save_manager) {

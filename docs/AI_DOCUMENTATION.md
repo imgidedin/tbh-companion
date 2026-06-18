@@ -39,7 +39,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | Build | `build.bat`, `src/app.rc`, `src/resource.h`, `res/app.ico` | Compila com MSVC Build Tools e resource compiler. |
 | Items embutidos | `res/items.json`, `res/items.zip`, `src/generated_items.h`, `scripts/build_items.ps1` | `build.bat` gera zip e SHA1 antes do `cl`. |
 | IL2CPP map | `scripts/refresh_il2cpp_map.py`, bloco `IL2CPP MAP` em `src/main.cpp` | Recalcula offsets por versao do jogo e patcha frontend. |
-| Release | `scripts/release.ps1` | Recalcula mapa, compila, commita, push e publica GitHub Release. |
+| Release | `scripts/release.ps1` | Recalcula mapa, garante/rebuilda frontend com assets do jogo, compila, commita, push e publica GitHub Release. |
 | Assets Unity | `scripts/export_unity_assets.ps1`, `scripts/extract_unity_localization.py`, `exported-assets/` | Organiza AssetRipper export em `frontend-pack`. |
 | Frontend pack | `exported-assets/TaskBarHero-<versao>/frontend-pack/` | Fonte para rebuild do frontend. |
 | Referencia de batalha | `scripts/extract_battle_reference.py`, `docs/battle-reference-<versao>.*` | Cruza AssetRipper, CSVs, prefabs, AnimationClips e dump IL2CPP para features visuais de combate. |
@@ -218,7 +218,7 @@ O agente prefere ler o save vivo do singleton obfuscado `bal : np<bal>`:
 
 `ReadLiveSaveSummary` monta um `JsonValue` com a mesma forma que `LoadSaveRoot` produz para o ES3 e chama o mesmo `BuildSaveSummaryJson`. Isso evita regras paralelas para equipamentos, inventario, enchants, bonuses, runas e kills.
 
-Importante: `ReadLiveSaveSummary` le o modelo de save vivo (`bal.bgaw/bgax`) para estrutura, mas gold/EXP e o stage recem-entrado podem ficar parados ali ate o jogo comitar autosave. Por isso, antes de chamar `BuildSaveSummaryJson`, o agente aplica dados quentes de runtime sobre o root vivo: `MonsterSpawnManager.MonsterList`/`SummonedMonsterList` atualiza `CommonSaveData.currentStageKey` pelo stage carregado nos monstros vivos, `vb.tp/vb.tq` atualiza `CurrencySaveData.Quantity` do gold e `vb.tz`/`vd.beuv` atualiza `HeroSaveData.HeroExp` por `heroKey`. O ES3 continua sendo fallback inteiro quando a leitura viva nao esta disponivel. Use `--memory-stage-scan` para comparar managers runtime contra o save vivo: ele amostra `runtimeStageKey`, `DeadMonsterUnit -> Monster.cache -> MonsterInfoData`, `runtimeGold`, `runtimeHeroExp`, `saveGold` e `savePartyHeroLevels`.
+Importante: `ReadLiveSaveSummary` le o modelo de save vivo (`bal.bgaw/bgax`) para estrutura, mas gold/EXP, pontos de habilidade e o stage recem-entrado podem ficar parados ali ate o jogo comitar autosave. Por isso, antes de chamar `BuildSaveSummaryJson`, o agente aplica dados quentes de runtime sobre o root vivo: `MonsterSpawnManager.MonsterList`/`SummonedMonsterList` atualiza `CommonSaveData.currentStageKey` pelo stage carregado nos monstros vivos, `vb.tp/vb.tq` atualiza `CurrencySaveData.Quantity` do gold e `vb.tz`/`vd` atualiza `HeroSaveData.HeroLevel`, `AbilityPoint`, `AllocatedHeroAbilityPoint` e `HeroExp` por `heroKey`. O ES3 continua sendo fallback inteiro quando a leitura viva nao esta disponivel. Use `--memory-stage-scan` para comparar managers runtime contra o save vivo: ele amostra `runtimeStageKey`, `DeadMonsterUnit -> Monster.cache -> MonsterInfoData`, `runtimeGold`, `runtimeHeroMetrics`, `saveGold` e `savePartyHeroLevels`.
 
 Validacao local de 2026-06-18: durante 8s em combate, `runtimeGold` subiu 1444 e EXP runtime do Knight subiu 6382 enquanto `saveGold` e `savePartyHeroLevels` ficaram parados. Em seguida, `--memory-save-scan` confirmou que o resumo `memory` ja saiu com `goldDelta=5774` e EXP dos herois acima do ES3, provando que snapshots de 10s passam a ter delta real sem esperar autosave.
 
@@ -249,9 +249,9 @@ Para reduzir banda sem criar outro protocolo, o agente envia:
 - `save` completo no primeiro sync, quando uma mudanca estrutural do save ativo ocorre, quando o sync e forcado por mudanca de config, ou no tick metrico de ~10s quando houver delta de save pendente;
 - `save: null` quando apenas eventos de historico mudaram. O backend preserva `tbh_current_state.save` via `coalesce(excluded.save, tbh_current_state.save)`.
 
-Mudancas metricas continuas sao `gold`, `playTime`, `currentStageWave`, `monsterKills` e `exp` dos herois. Elas alimentam snapshots de EXP/Ouro sem transformar cada tick da memoria em POST imediato; o envio metrico e consolidado em ~10s. Mudancas estruturais continuam imediatas: stage key/max stage, inventario/storage/trade, equipamentos, skills equipadas, runas, pets, atributos e demais campos do save normalizado.
+Mudancas metricas continuas sao `gold`, `playTime`, `currentStageWave`, `monsterKills` e `exp` dos herois. Elas alimentam snapshots de EXP/Ouro sem transformar cada tick da memoria em POST imediato; o envio metrico e consolidado em ~10s. Mudancas estruturais continuam imediatas: stage key/max stage, inventario/storage/trade, equipamentos, skills equipadas, runas, pets, atributos, `abilityPoint`/`allocatedAbilityPoint` dos herois e demais campos do save normalizado.
 
-O tick de ~10s garante tentativa de envio com `save` completo apenas quando houver delta pendente. Para gold/EXP, o resumo vivo ja usa os caches runtime validados (`runtimeGold` e `runtimeHeroExp`), entao kills durante a stage geram hash novo mesmo quando o ES3 e o modelo `bal.bgaw/bgax` ainda nao foram comitados pelo autosave. Se o jogador estiver parado e o resumo efetivo for identico, o worker nao forca POST repetido so pelo tempo.
+O tick de ~10s garante tentativa de envio com `save` completo apenas quando houver delta pendente. Para gold/EXP, o resumo vivo ja usa os caches runtime validados (`runtimeGold` e `runtimeHeroMetrics`), entao kills durante a stage geram hash novo mesmo quando o ES3 e o modelo `bal.bgaw/bgax` ainda nao foram comitados pelo autosave. Pontos de habilidade vindos do runtime ficam no hash estrutural para atualizar indicadores do frontend sem esperar autosave. Se o jogador estiver parado e o resumo efetivo for identico, o worker nao forca POST repetido so pelo tempo.
 
 Nao enviar delta parcial de save sem antes implementar merge server-side e broadcast compatível. Varios recursos comparam save anterior vs novo (`rune alerts`, pet unlock, inventario cheio, snapshots e derived stats), entao patch parcial seria mais arriscado que economico enquanto o `save` completo ainda estiver pequeno.
 
@@ -309,7 +309,7 @@ Classes/eventos importantes:
 | `MonsterSpawnManager` | Singleton runtime de monstros; `--memory-stage-scan` amostra listas de monstros vivos/mortos/summoned e usa monstros vivos/summoned para identificar o stage atual sem esperar autosave. |
 | `Monster` / `MonsterInfoData` | `--memory-stage-scan` le os ultimos mortos via `DeadMonsterUnit`, incluindo `MonsterKey`, `RewardGold`, `RewardExp` base e o stage runtime carregado no monstro. |
 | `vb.tp` / `vb.tq` | Cache runtime de currencies; `--memory-stage-scan` le `runtimeCurrencies` e `runtimeGold` sem esperar commit no save. |
-| `vb.tz` / `vd` | Cache runtime de herois; `--memory-stage-scan` le `runtimeHeroExp` de `vd.beuv` sem esperar commit no save. |
+| `vb.tz` / `vd` | Cache runtime de herois; `--memory-stage-scan` le `runtimeHeroMetrics` com level, `abilityPoint`, `allocatedAbilityPoint` e EXP sem esperar commit no save. |
 | `LogData` | Texto, relogio e DateTime de cada evento. |
 | `BoxOpenLog` | Item obtido; contem `ItemName_<key>` e `EGradeType`. |
 | `GetBoxLog` | Bau obtido. |
@@ -405,10 +405,13 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 Etapas:
 
 1. Recalcula mapa IL2CPP para a versao atual do jogo.
-2. Compila `build\TBH_Companion.exe` via `build.bat --no-restart --release`, desligando `TBH_DEVELOPMENT_MODE`.
-3. Detecta versao do jogo e escolhe tag.
-4. Commita e faz push do agente.
-5. Cria GitHub Release com `.exe` e `.zip`.
+2. Detecta a versao do jogo.
+3. Se `-SkipFrontend` nao foi usado, garante `exported-assets\TaskBarHero-<versao>\frontend-pack\`; quando o pack ainda nao existe, exige `-ExportedProject` e chama `scripts\export_unity_assets.ps1 -OrganizeExportedProject`.
+4. Chama `../tbh-farm-local-frontend/scripts/rebuild-from-agent-pack.ps1` com o pack da versao atual; em release real, passa `-Commit -Push` para publicar o frontend antes do GitHub Release do agente.
+5. Compila `build\TBH_Companion.exe` via `build.bat --no-restart --release`, desligando `TBH_DEVELOPMENT_MODE`.
+6. Escolhe tag.
+7. Commita e faz push do agente.
+8. Cria GitHub Release com `.exe` e `.zip`.
 
 Flags:
 
@@ -417,12 +420,19 @@ Flags:
 - `-Draft`: cria release como rascunho.
 - `-DryRun`: nao commita, nao envia e nao publica.
 - `-GameDir`: caminho do TaskBarHero.
+- `-FrontendDir`: caminho do repo `tbh-farm-local-frontend`; padrao e repo irmao.
+- `-ExportedProject`: caminho do `ExportedProject` do AssetRipper; obrigatorio quando o `frontend-pack` da versao atual ainda nao existe.
+- `-SkipFrontend`: pula export/rebuild/push do frontend; use apenas para release sem mudanca de jogo/frontend.
+- `-ForceAssetExport`: recria o `frontend-pack` da versao atual a partir de `-ExportedProject`.
+- `-NoContactSheets`: pula contact sheets quando o release precisar gerar `frontend-pack`.
 - `-LogPath`: caminho opcional do transcript; por padrao o script grava `dist\release-<timestamp>.log`.
 
 Regras:
 
 - `scripts\release.ps1` deve iniciar transcript antes dos pre-requisitos e imprimir o caminho do log em sucesso ou falha.
 - Use `imgidedin/tbh-companion` para comandos `gh --repo`; a URL `.git` fica reservada ao remote Git.
+- Release normal deve ser total: agente e frontend ficam sincronizados com a mesma versao de assets/dados do jogo. Se o pack da versao nao existe e nenhum `-ExportedProject` foi informado, o script deve falhar antes de build/commit/publish.
+- `-DryRun` pode rodar rebuild/export local, mas nao deve passar `-Commit -Push` ao frontend nem publicar o GitHub Release do agente.
 
 Pre-requisitos:
 
@@ -430,6 +440,8 @@ Pre-requisitos:
 - `git`.
 - GitHub CLI `gh` autenticado.
 - `py` no PATH.
+- Node/npm no PATH para o rebuild do frontend.
+- Repo `tbh-farm-local-frontend` disponivel como irmao do agente ou via `-FrontendDir`.
 - Jogo instalado; para verificacao viva, jogo aberto.
 
 ## Export Unity assets / frontend-pack
@@ -741,7 +753,7 @@ Validar:
 - `ownerSteamId`/`playerId` esperado.
 - `currentStageKey`, `maxStageKey`, gold, herois, runas, pets e monster kills aparecem.
 - Com jogo aberto, `--memory-save-scan` deve retornar `liveOk=true`; diferencas pontuais podem ser esperadas quando a memoria ja tem mudancas que o ES3 ainda nao salvou.
-- `--memory-stage-scan` deve retornar amostras com ponteiros de `StageManager`/`MonsterSpawnManager`, contagens de listas de monstros, `runtimeStageKey`, `deadMonsterRewardTotals`, `recentDeadMonsters`, `runtimeGold`, `runtimeHeroExp` e, no mesmo sample, `saveGold`/`savePartyHeroLevels`. Use este harness para provar se runtime muda antes do save vivo.
+- `--memory-stage-scan` deve retornar amostras com ponteiros de `StageManager`/`MonsterSpawnManager`, contagens de listas de monstros, `runtimeStageKey`, `deadMonsterRewardTotals`, `recentDeadMonsters`, `runtimeGold`, `runtimeHeroMetrics` e, no mesmo sample, `saveGold`/`savePartyHeroLevels`. Use este harness para provar se runtime muda antes do save vivo.
 - Se uma feature frontend depende de novo campo, confirmar o campo no dump.
 
 ### Harness de memoria/log
@@ -779,7 +791,7 @@ Validar:
 - Saida do script mostra `Runtime stage` com TypeInfos de `StageManager` e `MonsterSpawnManager`.
 - Saida do script mostra `Runtime rewards` com offsets de `Monster.cache`, `MonsterInfoData.RewardGold` e `MonsterInfoData.RewardExp`.
 - Saida do script mostra `Runtime currency` com TypeInfo de `vb.tp`, offset da lista de currencies e offset do `ObscuredLong` usado por `vb.tq`.
-- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offset do campo `ObscuredFloat` de EXP em `vd`.
+- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offsets de level, ability, allocatedAbility e EXP em `vd`.
 - `src/main.cpp` foi patchado dentro dos marcadores.
 - Frontend `server.js` e `public/calculator.js` recebem mapa de raridade se mudou.
 
@@ -893,7 +905,7 @@ Validar:
 3. Mantenha `frontend-pack` estavel para o frontend.
 4. Se criar nova categoria, atualizar `Ensure-PortableTree` e manifest.
 5. Gerar contact sheets quando possivel.
-6. Rodar rebuild no frontend.
+6. Rodar rebuild no frontend; em release normal, deixar `scripts\release.ps1` orquestrar isso para tambem commitar/pushar o frontend.
 
 ### Skill: release
 
@@ -901,7 +913,8 @@ Validar:
 2. Rode `scripts\release.ps1 -DryRun`.
 3. Rode release real apenas quando build/mapa estiverem validados.
 4. Nao esconder falhas de `gh`, `git`, `build.bat` ou map refresh.
-5. Depois do release, validar download do GitHub Release.
+5. Se o pack da versao ainda nao existe, passe `-ExportedProject`; nao use `-SkipFrontend` para update normal de versao do jogo.
+6. Depois do release, validar download do GitHub Release e conferir que o frontend tambem recebeu push.
 
 ## Seguranca e governanca
 

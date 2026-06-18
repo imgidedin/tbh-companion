@@ -272,6 +272,10 @@ def field_offset_by_type(body: str, type_name: str, class_name: str) -> int:
     return matches[0][1]
 
 
+def field_offsets_by_type(body: str, type_name: str) -> list[int]:
+    return [off for typ, _fname, off in fields_of(body) if typ == type_name]
+
+
 def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: str) -> int:
     try:
         return field_offset(body, name, class_name)
@@ -446,6 +450,12 @@ def extract_map(dump_dir: Path) -> dict:
     )
     info["runtime_hero_dictionary_offset"] = static_field_offset_by_type(runtime_hero_manager, "Dictionary<int, vd>", "vb.tz")
     info["runtime_hero_info_offset"] = field_offset_by_type(runtime_hero, "HeroInfoData", "vd")
+    runtime_hero_int_offsets = field_offsets_by_type(runtime_hero, "ObscuredInt")
+    if len(runtime_hero_int_offsets) < 4:
+        raise SystemExit("classe vd sem os quatro ObscuredInt esperados para level/ability points.")
+    info["runtime_hero_level_offset"] = runtime_hero_int_offsets[0]
+    info["runtime_hero_ability_point_offset"] = runtime_hero_int_offsets[2]
+    info["runtime_hero_allocated_ability_point_offset"] = runtime_hero_int_offsets[3]
     info["runtime_hero_exp_offset"] = field_offset_by_type(runtime_hero, "ObscuredFloat", "vd")
     info["hero_info_hero_key_offset"] = field_offset(hero_info, "HeroKey", "HeroInfoData")
 
@@ -739,6 +749,9 @@ constexpr uintptr_t kRuntimeCurrencyAltAmountOffset = 0x{info['runtime_currency_
 constexpr uintptr_t kCurrencyInfoKeyOffset = 0x{info['currency_info_key_offset']:X};
 constexpr uintptr_t kRuntimeHeroDictionaryOffset = 0x{info['runtime_hero_dictionary_offset']:X};
 constexpr uintptr_t kRuntimeHeroInfoOffset = 0x{info['runtime_hero_info_offset']:X};
+constexpr uintptr_t kRuntimeHeroLevelOffset = 0x{info['runtime_hero_level_offset']:X};
+constexpr uintptr_t kRuntimeHeroAbilityPointOffset = 0x{info['runtime_hero_ability_point_offset']:X};
+constexpr uintptr_t kRuntimeHeroAllocatedAbilityPointOffset = 0x{info['runtime_hero_allocated_ability_point_offset']:X};
 constexpr uintptr_t kRuntimeHeroExpOffset = 0x{info['runtime_hero_exp_offset']:X};
 constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x{info['hero_info_hero_key_offset']:X};
 static const char* const kGradeNames[] = {{
@@ -832,6 +845,9 @@ def main() -> int:
     print(f"[*] Runtime heroes: {info.get('runtime_hero_manager_typeinfo_name', '?')} "
           f"RVA=0x{info['runtime_hero_manager_typeinfo_rva']:X} "
           f"dict=0x{info['runtime_hero_dictionary_offset']:X} "
+          f"level=0x{info['runtime_hero_level_offset']:X} "
+          f"ability=0x{info['runtime_hero_ability_point_offset']:X} "
+          f"allocatedAbility=0x{info['runtime_hero_allocated_ability_point_offset']:X} "
           f"exp=0x{info['runtime_hero_exp_offset']:X}")
     print(f"[*] EGradeType: {info['grade_names']}")
 

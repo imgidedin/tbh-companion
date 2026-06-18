@@ -7,18 +7,37 @@
   Etapas:
     1. Recalcula o mapa IL2CPP (scripts\refresh_il2cpp_map.py) para a versao
        atual do jogo. Com o jogo aberto, faz a verificacao na memoria viva.
-    2. Fecha a instancia local, compila o executavel (build.bat) e relanca ao fim.
-    3. Descobre a versao do jogo e monta a tag: <versao>; se ja existir um
+    2. Garante que existe frontend-pack da versao e rebuilda/commita/pusha o
+       frontend com os dados/assets atuais do jogo.
+    3. Fecha a instancia local, compila o executavel (build.bat) e relanca ao fim.
+    4. Descobre a versao do jogo e monta a tag: <versao>; se ja existir um
        release dessa versao, usa <versao>-1, <versao>-2, ...
-    4. Commita as mudancas do agente e envia para o origin
+    5. Commita as mudancas do agente e envia para o origin
        (https://github.com/imgidedin/tbh-companion.git).
-    5. Cria o GitHub Release na tag com o TBH_Companion.exe (e um .zip) anexados.
+    6. Cria o GitHub Release na tag com o TBH_Companion.exe (e um .zip) anexados.
 
 .PARAMETER GameDir
   Pasta do TaskBarHero (com GameAssembly.dll). Autodetecta no Steam se omitido.
 
+.PARAMETER FrontendDir
+  Pasta do repo tbh-farm-local-frontend. Por padrao usa o repo irmao.
+
+.PARAMETER ExportedProject
+  Pasta ExportedProject do AssetRipper. Obrigatoria quando o frontend-pack da
+  versao atual ainda nao existe.
+
 .PARAMETER SkipMap
   Pula a etapa de recalcular o mapa IL2CPP (usa o main.cpp como esta).
+
+.PARAMETER SkipFrontend
+  Nao exporta assets nem rebuilda/pusha o frontend. Use apenas para release do
+  agente sem mudancas de jogo/frontend.
+
+.PARAMETER ForceAssetExport
+  Recria o frontend-pack da versao atual a partir de -ExportedProject.
+
+.PARAMETER NoContactSheets
+  Passa -NoContactSheets ao export_unity_assets.ps1 quando gerar frontend-pack.
 
 .PARAMETER NoLive
   Passa --no-live ao refresh (nao le a memoria do jogo).
@@ -40,7 +59,12 @@
 [CmdletBinding()]
 param(
   [string]$GameDir,
+  [string]$FrontendDir,
+  [string]$ExportedProject,
   [switch]$SkipMap,
+  [switch]$SkipFrontend,
+  [switch]$ForceAssetExport,
+  [switch]$NoContactSheets,
   [switch]$NoLive,
   [switch]$Draft,
   [switch]$DryRun,
@@ -52,15 +76,28 @@ $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/imgidedin/tbh-companion.git"
 $RepoSlug = "imgidedin/tbh-companion"
 $AgentDir = Split-Path -Parent $PSScriptRoot         # raiz do repo do agente
+$DefaultFrontendDir = Join-Path (Split-Path -Parent $AgentDir) "tbh-farm-local-frontend"
 $ExePath = Join-Path $AgentDir "build\TBH_Companion.exe"
 $DistDir = Join-Path $AgentDir "dist"
 $MapScript = Join-Path $PSScriptRoot "refresh_il2cpp_map.py"
 $BuildBat = Join-Path $AgentDir "build.bat"
 $ProcessScript = Join-Path $PSScriptRoot "companion_process.ps1"
+$ExportUnityScript = Join-Path $PSScriptRoot "export_unity_assets.ps1"
 $Git = @("-C", $AgentDir)                            # roda git sempre no repo do agente
 
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Fail($msg) { throw $msg }
+function Resolve-FullPath([string]$path) {
+  $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
+}
+function ConvertTo-SafeName([string]$value) {
+  $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+  $safe = $value
+  foreach ($char in $invalid) {
+    $safe = $safe.Replace([string]$char, "-")
+  }
+  return $safe.Replace(" ", "-")
+}
 # Roda um comando nativo sem que o stderr dele aborte o script (PS trata stderr
 # de exe como erro terminante quando ErrorActionPreference=Stop). Checa o exit code.
 function Exec([scriptblock]$cmd) {
@@ -75,6 +112,76 @@ function StopCompanion() {
 function StartCompanion() {
   Exec { & powershell -NoProfile -ExecutionPolicy Bypass -File $ProcessScript -ExePath $ExePath -Start }
   if ($LASTEXITCODE -ne 0) { Fail "nao foi possivel iniciar o TBH_Companion.exe local." }
+}
+function Get-FrontendPackInfo([string]$version) {
+  $safeVersion = ConvertTo-SafeName $version
+  $versionDir = Join-Path (Join-Path $AgentDir "exported-assets") "TaskBarHero-$safeVersion"
+  $pack = Join-Path $versionDir "frontend-pack"
+  $data = Join-Path $pack "data"
+  return [pscustomobject]@{
+    VersionDir = $versionDir
+    Pack = $pack
+    Data = $data
+    Manifest = Join-Path $pack "manifest.json"
+  }
+}
+function Test-FrontendPack([object]$pack) {
+  return (
+    (Test-Path $pack.Manifest) -and
+    (Test-Path (Join-Path $pack.Data "raw-csv"))
+  )
+}
+function Ensure-FrontendPack([object]$pack, [string]$resolvedExportedProject, [string]$resolvedGameDir) {
+  if ((Test-FrontendPack $pack) -and -not $ForceAssetExport) {
+    Write-Host "    frontend-pack existente: $($pack.Pack)"
+    return
+  }
+
+  if (-not $resolvedExportedProject) {
+    Fail "Nao existe frontend-pack valido em $($pack.Pack). Passe -ExportedProject `"C:\caminho\ExportedProject`" para gerar assets antes do release, ou use -SkipFrontend conscientemente."
+  }
+  if (-not (Test-Path (Join-Path $resolvedExportedProject "Assets"))) {
+    Fail "ExportedProject invalido: nao encontrei Assets em $resolvedExportedProject"
+  }
+
+  Step "Gerando frontend-pack da versao atual..."
+  $exportArgs = @(
+    "-ExecutionPolicy", "Bypass",
+    "-File", $ExportUnityScript,
+    "-OrganizeExportedProject", $resolvedExportedProject
+  )
+  if ($resolvedGameDir) { $exportArgs += @("-GameDir", $resolvedGameDir) }
+  if ($ForceAssetExport) { $exportArgs += "-Force" }
+  if ($NoContactSheets) { $exportArgs += "-NoContactSheets" }
+
+  Exec { & powershell @exportArgs }
+  if ($LASTEXITCODE -ne 0) { Fail "export_unity_assets.ps1 falhou." }
+  if (-not (Test-FrontendPack $pack)) {
+    Fail "export_unity_assets.ps1 concluiu, mas nao gerou frontend-pack valido em $($pack.Pack)"
+  }
+}
+function Invoke-FrontendRelease([object]$pack, [string]$resolvedFrontendDir, [string]$resolvedExportedProject, [string]$resolvedGameDir, [string]$version) {
+  if (-not (Test-Path (Join-Path $resolvedFrontendDir "scripts\rebuild-from-agent-pack.ps1"))) {
+    Fail "FrontendDir invalido: nao encontrei scripts\rebuild-from-agent-pack.ps1 em $resolvedFrontendDir"
+  }
+
+  Step "Rebuildando frontend com assets/dados do jogo..."
+  $rebuildArgs = @(
+    "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $resolvedFrontendDir "scripts\rebuild-from-agent-pack.ps1"),
+    "-AgentDir", $AgentDir,
+    "-PackDir", $pack.Pack
+  )
+  if ($resolvedGameDir) { $rebuildArgs += @("-GameDir", $resolvedGameDir) }
+  if ($resolvedExportedProject) {
+    $rebuildArgs += @("-ExportedProject", $resolvedExportedProject)
+  }
+  if (-not $DryRun) {
+    $rebuildArgs += @("-Commit", "-Push", "-CommitMessage", "Update TaskBarHero assets $version")
+  }
+
+  Exec { & powershell @rebuildArgs }
+  if ($LASTEXITCODE -ne 0) { Fail "rebuild-from-agent-pack.ps1 falhou." }
 }
 
 $script:ReleaseTranscriptStarted = $false
@@ -103,6 +210,7 @@ function StopReleaseLog() {
 }
 
 $pushedLocation = $false
+$frontendReleaseCompleted = $false
 StartReleaseLog
 try {
   Push-Location $AgentDir
@@ -116,7 +224,11 @@ try {
   if ($LASTEXITCODE -ne 0) { Fail "gh nao autenticado. Rode: gh auth login" }
 
   $gameArg = @()
-  if ($GameDir) { $gameArg = @("--game-dir", $GameDir) }
+  $resolvedGameDir = $null
+  if ($GameDir) {
+    $resolvedGameDir = Resolve-FullPath $GameDir
+    $gameArg = @("--game-dir", $resolvedGameDir)
+  }
 
   # --- 1) mapa IL2CPP -------------------------------------------------------
   if ($SkipMap) {
@@ -138,7 +250,26 @@ try {
   if (-not $version) { Fail "Nao consegui detectar a versao do jogo." }
   Write-Host "    versao do jogo: $version"
 
-  # --- 3) build -------------------------------------------------------------
+  # --- 3) frontend pack + rebuild ------------------------------------------
+  if ($SkipFrontend) {
+    Step "Pulando export/rebuild do frontend (-SkipFrontend)."
+  } else {
+    $resolvedFrontendDir = Resolve-FullPath ($(if ($FrontendDir) { $FrontendDir } else { $DefaultFrontendDir }))
+    if (-not (Test-Path $resolvedFrontendDir)) {
+      Fail "FrontendDir nao encontrado: $resolvedFrontendDir. Passe -FrontendDir ou use -SkipFrontend conscientemente."
+    }
+    $resolvedExportedProject = $null
+    if ($ExportedProject) {
+      $resolvedExportedProject = Resolve-FullPath $ExportedProject
+    }
+
+    $pack = Get-FrontendPackInfo $version
+    Ensure-FrontendPack $pack $resolvedExportedProject $resolvedGameDir
+    Invoke-FrontendRelease $pack $resolvedFrontendDir $resolvedExportedProject $resolvedGameDir $version
+    $frontendReleaseCompleted = $true
+  }
+
+  # --- 4) build -------------------------------------------------------------
   Step "Compilando o executavel (build.bat)..."
   # Encerra uma instancia de dev rodando a partir do proprio build\ (senao o
   # linker falha com LNK1104). Nao mexe em exes instalados em outro lugar.
@@ -148,7 +279,7 @@ try {
   if (-not (Test-Path $ExePath)) { Fail "Executavel nao encontrado: $ExePath" }
   Write-Host ("    OK: {0} ({1:N0} bytes)" -f $ExePath, (Get-Item $ExePath).Length)
 
-  # --- 4) configurar remote + calcular a tag --------------------------------
+  # --- 5) configurar remote + calcular a tag --------------------------------
   $hasOrigin = [bool](Exec { & git @Git remote } | Where-Object { $_ -eq "origin" })
   if (-not $hasOrigin) {
     Step "Adicionando remote origin -> $RepoUrl"
@@ -170,7 +301,7 @@ try {
   while ($existing -contains $tag) { $n++; $tag = "$version-$n" }
   Write-Host "    tag escolhida: $tag"
 
-  # --- 5) empacotar o asset -------------------------------------------------
+  # --- 6) empacotar o asset -------------------------------------------------
   Step "Empacotando o release..."
   New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
   $exeAsset = Join-Path $DistDir "TBH_Companion.exe"
@@ -184,11 +315,12 @@ try {
   Write-Host "    asset: $exeAsset"
   Write-Host "    asset: $zipAsset"
 
-  # --- 6) commit + push -----------------------------------------------------
+  # --- 7) commit + push -----------------------------------------------------
   $notes = @"
 TBH Companion para TaskBarHero **$version**.
 
 - Mapa IL2CPP recalculado para esta versao do jogo.
+$(if ($frontendReleaseCompleted) { "- Frontend rebuildado com dados/assets do jogo para esta versao." } else { "- Frontend nao foi rebuildado neste release (-SkipFrontend)." })
 - Baixe ``TBH_Companion.exe`` e rode. Configure URL do servidor, token e SteamID na primeira execucao.
 
 Gerado por ``scripts\release.ps1``.
@@ -218,7 +350,7 @@ Gerado por ``scripts\release.ps1``.
   Exec { & git @Git push -u origin $branch }
   if ($LASTEXITCODE -ne 0) { Fail "git push falhou." }
 
-  # --- 7) GitHub Release ----------------------------------------------------
+  # --- 8) GitHub Release ----------------------------------------------------
   Step "Publicando o GitHub Release '$tag'..."
   $relArgs = @(
     "release", "create", $tag,
