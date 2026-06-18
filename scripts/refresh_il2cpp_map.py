@@ -158,7 +158,7 @@ def run_dumper(dumper: Path, game_dir: Path) -> Path:
 # --------------------------------------------------------------------------- #
 def class_body(src: str, name: str) -> str | None:
     m = re.search(
-        r"// Namespace:[^\n]*\npublic (?:abstract |sealed )*class " + re.escape(name) + r"\b.*?\n\}",
+        r"// Namespace:[^\n]*\n(?:\[[^\n]*\]\n)*public (?:abstract |sealed )*class " + re.escape(name) + r"\b.*?\n\}",
         src, re.S,
     )
     return m.group(0) if m else None
@@ -202,21 +202,16 @@ def parse_enum(src: str, name: str) -> list[str]:
     return [pairs[i] for i in range(max(pairs) + 1) if i in pairs]
 
 
-def log_manager_typeinfo_candidates(log_manager_body: str) -> list[str]:
+def singleton_typeinfo_candidates(class_body_text: str, class_name: str, fallback_names: list[str] | None = None) -> list[str]:
     candidates: list[str] = []
-    header = log_manager_body.splitlines()[1] if len(log_manager_body.splitlines()) > 1 else ""
-    m = re.search(r"\bclass\s+LogManager\s*:\s*([A-Za-z_]\w*)<LogManager>", header)
+    header = next((line for line in class_body_text.splitlines() if f"class {class_name}" in line), "")
+    m = re.search(r"\bclass\s+" + re.escape(class_name) + r"\s*:\s*([A-Za-z_]\w*)<" + re.escape(class_name) + r">", header)
     if m:
-        candidates.append(f"{m.group(1)}<LogManager>_TypeInfo")
+        candidates.append(f"{m.group(1)}<{class_name}>_TypeInfo")
 
-    # Fallbacks for older dumps and for future obfuscator renames where the
-    # generic singleton prefix changes but script.json still keeps a useful name.
-    candidates.extend([
-        "nn<LogManager>_TypeInfo",
-        "np<LogManager>_TypeInfo",
-        "TaskbarHero.Log.LogManager_TypeInfo",
-        "LogManager_TypeInfo",
-    ])
+    candidates.extend([f"np<{class_name}>_TypeInfo", f"nn<{class_name}>_TypeInfo", f"{class_name}_TypeInfo"])
+    if fallback_names:
+        candidates.extend(fallback_names)
 
     deduped: list[str] = []
     for candidate in candidates:
@@ -225,23 +220,38 @@ def log_manager_typeinfo_candidates(log_manager_body: str) -> list[str]:
     return deduped
 
 
-def find_typeinfo_rva(script_json: Path, names: list[str]) -> tuple[int, str]:
+def find_typeinfo_rva(script_json: Path, names: list[str], class_name: str) -> tuple[int, str]:
     data = json.loads(script_json.read_text(encoding="utf-8"))
     metadata = data.get("ScriptMetadata", [])
-    wanted = set(names)
-    for entry in metadata:
-        if entry.get("Name") in wanted:
+    by_name = {str(entry.get("Name")): entry for entry in metadata}
+    for name in names:
+        entry = by_name.get(name)
+        if entry:
             return int(entry["Address"]), str(entry["Name"])
 
     for entry in data.get("ScriptMetadata", []):
         entry_name = str(entry.get("Name", ""))
-        if entry_name.endswith("<LogManager>_TypeInfo"):
+        if entry_name.endswith(f"<{class_name}>_TypeInfo") or entry_name == f"{class_name}_TypeInfo":
             return int(entry["Address"]), entry_name
 
     raise SystemExit(
-        "TypeInfo de LogManager nao encontrado em script.json (ScriptMetadata). "
+        f"TypeInfo de {class_name} nao encontrado em script.json (ScriptMetadata). "
         f"Candidatos: {', '.join(names)}"
     )
+
+
+def require_class(src: str, name: str) -> str:
+    body = class_body(src, name)
+    if not body:
+        raise SystemExit(f"classe {name} nao encontrada.")
+    return body
+
+
+def field_offset(body: str, name: str, class_name: str) -> int:
+    for _typ, fname, off in fields_of(body):
+        if fname == name:
+            return off
+    raise SystemExit(f"campo {class_name}.{name} nao encontrado no dump.")
 
 
 def extract_map(dump_dir: Path) -> dict:
@@ -254,7 +264,8 @@ def extract_map(dump_dir: Path) -> dict:
         raise SystemExit("classe LogManager nao encontrada.")
     info["typeinfo_rva"], info["typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
-        log_manager_typeinfo_candidates(lm),
+        singleton_typeinfo_candidates(lm, "LogManager", ["TaskbarHero.Log.LogManager_TypeInfo", "LogManager_TypeInfo"]),
+        "LogManager",
     )
     lists = [off for (t, _n, off) in fields_of(lm) if t == "List<LogData>"]
     if not lists:
@@ -287,6 +298,40 @@ def extract_map(dump_dir: Path) -> dict:
     # Enum de raridade.
     grades = parse_enum(src, "EGradeType")
     info["grade_names"] = [g for g in grades if g != "NONE"]
+
+    bal = require_class(src, "bal")
+    info["save_typeinfo_rva"], info["save_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        singleton_typeinfo_candidates(bal, "bal", ["bal_TypeInfo"]),
+        "bal",
+    )
+    info["save_manager_account_offset"] = field_offset(bal, "bgaw", "bal")
+    info["save_manager_player_offset"] = field_offset(bal, "bgax", "bal")
+
+    account = require_class(src, "AccountSaveData")
+    common = require_class(src, "CommonSaveData")
+    player = require_class(src, "PlayerSaveData")
+    info["account_player_id_offset"] = field_offset(account, "<playerId>k__BackingField", "AccountSaveData")
+    info["account_version_offset"] = field_offset(account, "version", "AccountSaveData")
+    info["account_owner_steam_id_offset"] = field_offset(account, "ownerSteamId", "AccountSaveData")
+    info["common_version_offset"] = field_offset(common, "version", "CommonSaveData")
+    info["common_play_time_offset"] = field_offset(common, "playTime", "CommonSaveData")
+    info["common_arranged_pet_key_offset"] = field_offset(common, "ArrangedPetKey", "CommonSaveData")
+    info["common_arranged_hero_key_offset"] = field_offset(common, "arrangedHeroKey", "CommonSaveData")
+    info["common_max_completed_stage_offset"] = field_offset(common, "maxCompletedStage", "CommonSaveData")
+    info["common_current_stage_key_offset"] = field_offset(common, "currentStageKey", "CommonSaveData")
+    info["common_current_stage_wave_offset"] = field_offset(common, "currentStageWave", "CommonSaveData")
+    info["player_common_offset"] = field_offset(player, "commonSaveData", "PlayerSaveData")
+    info["player_currencies_offset"] = field_offset(player, "currenySaveDatas", "PlayerSaveData")
+    info["player_heroes_offset"] = field_offset(player, "heroSaveDatas", "PlayerSaveData")
+    info["player_attributes_offset"] = field_offset(player, "attributeSaveDatas", "PlayerSaveData")
+    info["player_pets_offset"] = field_offset(player, "PetSaveData", "PlayerSaveData")
+    info["player_runes_offset"] = field_offset(player, "RuneSaveData", "PlayerSaveData")
+    info["player_inventory_offset"] = field_offset(player, "inventorySaveDatas", "PlayerSaveData")
+    info["player_stash_offset"] = field_offset(player, "stashSaveDatas", "PlayerSaveData")
+    info["player_trade_stash_offset"] = field_offset(player, "tradingStashSaveDatas", "PlayerSaveData")
+    info["player_items_offset"] = field_offset(player, "itemSaveDatas", "PlayerSaveData")
+    info["player_aggregates_offset"] = field_offset(player, "aggregateSaveDatas", "PlayerSaveData")
 
     return info
 
@@ -505,21 +550,43 @@ def _rebuild_main(text: str, version: str, info: dict) -> str:
 
     # static_fields, list, texto e relogio so sao confiaveis com o jogo vivo;
     # sem isso, preserva os valores atuais (nao adivinha pela ordem do dump).
-    live = info.get("static_fields_offset") is not None
-    note = "" if live else "  // verificacao ao vivo nao rodou: mantido"
     static_off = info.get("static_fields_offset") or current("kKlassStaticFieldsOffset")
     list_off = info.get("list_offset") or current("kLogManagerListOffset") or info["list_offsets"][0]
     text_off = info.get("text_offset") or current("kLogDataTextOffset")
     clock_off = info.get("clock_offset") or current("kLogDataClockOffset")
     block = f"""// ===== BEGIN IL2CPP MAP (TaskBarHero {version}) =====
 constexpr uintptr_t kLogManagerTypeInfoRva = 0x{info['typeinfo_rva']:X};
-constexpr uintptr_t kKlassStaticFieldsOffset = 0x{static_off:X};{note}
+constexpr uintptr_t kKlassStaticFieldsOffset = 0x{static_off:X};
 constexpr uintptr_t kLogManagerListOffset = 0x{list_off:X};
 constexpr uintptr_t kLogDataTextOffset = 0x{text_off:X};
 constexpr uintptr_t kLogDataClockOffset = 0x{clock_off:X};
 constexpr uintptr_t kLogDataDateTimeOffset = 0x{info['datetime_offset']:X};
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x{info['box_item_key_offset']:X};
 constexpr uintptr_t kBoxOpenGradeOffset = 0x{info['box_grade_offset']:X};
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x{info['save_typeinfo_rva']:X};
+constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x{info['save_manager_account_offset']:X};
+constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x{info['save_manager_player_offset']:X};
+constexpr uintptr_t kAccountSavePlayerIdOffset = 0x{info['account_player_id_offset']:X};
+constexpr uintptr_t kAccountSaveVersionOffset = 0x{info['account_version_offset']:X};
+constexpr uintptr_t kAccountSaveOwnerSteamIdOffset = 0x{info['account_owner_steam_id_offset']:X};
+constexpr uintptr_t kCommonSaveVersionOffset = 0x{info['common_version_offset']:X};
+constexpr uintptr_t kCommonSavePlayTimeOffset = 0x{info['common_play_time_offset']:X};
+constexpr uintptr_t kCommonSaveArrangedPetKeyOffset = 0x{info['common_arranged_pet_key_offset']:X};
+constexpr uintptr_t kCommonSaveArrangedHeroKeyOffset = 0x{info['common_arranged_hero_key_offset']:X};
+constexpr uintptr_t kCommonSaveMaxCompletedStageOffset = 0x{info['common_max_completed_stage_offset']:X};
+constexpr uintptr_t kCommonSaveCurrentStageKeyOffset = 0x{info['common_current_stage_key_offset']:X};
+constexpr uintptr_t kCommonSaveCurrentStageWaveOffset = 0x{info['common_current_stage_wave_offset']:X};
+constexpr uintptr_t kPlayerSaveCommonOffset = 0x{info['player_common_offset']:X};
+constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x{info['player_currencies_offset']:X};
+constexpr uintptr_t kPlayerSaveHeroesOffset = 0x{info['player_heroes_offset']:X};
+constexpr uintptr_t kPlayerSaveAttributesOffset = 0x{info['player_attributes_offset']:X};
+constexpr uintptr_t kPlayerSavePetsOffset = 0x{info['player_pets_offset']:X};
+constexpr uintptr_t kPlayerSaveRunesOffset = 0x{info['player_runes_offset']:X};
+constexpr uintptr_t kPlayerSaveInventoryOffset = 0x{info['player_inventory_offset']:X};
+constexpr uintptr_t kPlayerSaveStashOffset = 0x{info['player_stash_offset']:X};
+constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x{info['player_trade_stash_offset']:X};
+constexpr uintptr_t kPlayerSaveItemsOffset = 0x{info['player_items_offset']:X};
+constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x{info['player_aggregates_offset']:X};
 static const char* const kGradeNames[] = {{
 {grades_inner},
 }};
@@ -592,6 +659,10 @@ def main() -> int:
           f"strings={[hex(x) for x in info['string_offsets']]} "
           f"datetime=0x{info['datetime_offset']:X} "
           f"box(item=0x{info['box_item_key_offset']:X},grade=0x{info['box_grade_offset']:X})")
+    print(f"[*] Save manager: TypeInfo {info.get('save_typeinfo_name', '?')} "
+          f"RVA=0x{info['save_typeinfo_rva']:X} "
+          f"account=0x{info['save_manager_account_offset']:X} "
+          f"player=0x{info['save_manager_player_offset']:X}")
     print(f"[*] EGradeType: {info['grade_names']}")
 
     if not args.no_live:

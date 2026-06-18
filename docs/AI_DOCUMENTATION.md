@@ -43,6 +43,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | Assets Unity | `scripts/export_unity_assets.ps1`, `scripts/extract_unity_localization.py`, `exported-assets/` | Organiza AssetRipper export em `frontend-pack`. |
 | Frontend pack | `exported-assets/TaskBarHero-<versao>/frontend-pack/` | Fonte para rebuild do frontend. |
 | Referencia de batalha | `scripts/extract_battle_reference.py`, `docs/battle-reference-<versao>.*` | Cruza AssetRipper, CSVs, prefabs, AnimationClips e dump IL2CPP para features visuais de combate. |
+| Analise DPS/memoria | `docs/dps-memory-analysis-1.00.13.md` | Avalia viabilidade de DPS real por skill/source usando `DamageInfo`, `Unit.gpw`, `ActiveSkill` e dumps Ghidra/IL2CPP. |
 | Ghidra IL2CPP | `scripts/run-ghidra-il2cpp-headless.ps1`, `scripts/run-ghidra-combat-decompile.ps1`, `scripts/ghidra/` | Importa `GameAssembly.dll`, aplica labels do Il2CppDumper e exporta pseudocodigo de combate via Ghidra headless. |
 
 ## Arquitetura operacional
@@ -61,20 +62,21 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
 | Historico/clears | `BuildHistoryJson`, `BuildClearsJson`, caches locais. |
 | Sync | `CachedPayload`, `PostJsonPayload`, `SyncCachedPayload`, sync incremental. |
-| Harness CLI | `--compare`, `--dump-save-summary`, `--memory-scan`. |
+| Harness CLI | `--compare`, `--dump-save-summary`, `--memory-save-scan`, `--memory-scan`. |
 
 ### Loop do worker
 
 1. `WorkerProc` inicia e carrega `sync-state.json`.
-2. `RefreshSaveCache` compara mtime do save; se mudou, le e parseia o save.
+2. `RefreshSaveCache` compara mtime do save; se mudou, le e parseia o ES3 como fallback inteiro.
 3. `EnsureGameRunning` abre o TaskBarHero via Steam se o processo nao existir.
-4. Se SteamID estiver vazio no config e o save tiver SteamID, o agente salva automaticamente.
-5. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda.
-6. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
-7. Eventos novos sao adicionados com `index` monotonicamente crescente.
-8. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
-9. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ou historico tambem atualizam automaticamente o runtime local do frontend.
-10. O loop para quando a janela/tray manda encerrar.
+4. `RefreshLiveSaveCache` tenta ler o snapshot vivo do save em `bal` a cada ~500ms; se validar, promove `saveSource=memory`; se falhar, volta para o snapshot ES3 inteiro.
+5. Se SteamID estiver vazio no config e o save ativo tiver SteamID, o agente salva automaticamente.
+6. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda ou quando o save ativo muda.
+7. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
+8. Eventos novos sao adicionados com `index` monotonicamente crescente.
+9. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
+10. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend.
+11. O loop para quando a janela/tray manda encerrar.
 
 ### Configuracao local
 
@@ -131,7 +133,7 @@ Arquivos relevantes:
 | `sync-state.json` | Progresso de sync incremental. Apagar forca reenvio completo. |
 | cache de memory history | Historico local de eventos para sobreviver a reinicio. |
 | cache de items extraidos | `items.json` extraido de `items.zip` embutido quando necessario. |
-| arquivos temporarios de harness | Resultado de `--compare`, `--memory-scan` e dump de save. |
+| arquivos temporarios de harness | Resultado de `--compare`, `--memory-save-scan`, `--memory-scan` e dump de save. |
 
 ## Contrato com o frontend
 
@@ -204,6 +206,46 @@ Comportamento do save oficial do jogo, confirmado no dump IL2CPP 1.00.12:
 - Teste manual do harness de sinais de janela/OS nao disparou alteracao do save. Tratamos `OnApplicationPause(true)` como inacessivel por mensagens normais de janela no Windows neste build; chamar diretamente exigiria patch/injecao/chamada interna IL2CPP.
 - Varredura estatica por funcao no `GameAssembly.dll` confirmou 16 xrefs diretos para `bal.mbn()`: `StageManager.<SpawnFriendlyUnitAsync>d__115.MoveNext`, quatro callbacks `StageManager.rm` (`cxp`, `ew`, `gbt`, `ibr`), `StageManager.ru.MoveNext`, `StageManager.ry.MoveNext`, `vb.Cube.<TriggerCurrentRecipeLogic>d__138.MoveNext`, `vb.uj.uh.<TryClaimItem>d__19.MoveNext`, tres helpers de mail/claim (`dsn`, `iyo`, `kcj`) e quatro metodos de inicializacao `qi` (`ehk`, `hdi`, `ihv`, `mrj`). Nao houve xrefs diretos para `bal.dgy`, `bal.frn`, `bal.ljj` ou `bal.muj`.
 - O companion nao escreve o save oficial; `RefreshSaveCache` observa apenas `mtime`. Portanto e esperado o arquivo ficar sem alteracao por mais de 1 minuto, especialmente entre ciclos de autosave de 180s ou quando a escrita esta aguardando semaforo/cancelamento/validacao.
+- O ES3 agora e fallback inteiro. O snapshot preferido vem de memoria quando `ReadLiveSaveSummary` consegue ler e validar `bal`.
+
+## Leitura viva do save pela memoria
+
+O agente prefere ler o save vivo do singleton obfuscado `bal : np<bal>`:
+
+- `bal.bgaw` -> `AccountSaveData`
+- `bal.bgax` -> `PlayerSaveData`
+- `PlayerSaveData.commonSaveData` e listas de currency, herois, atributos, pets, runas, inventario, storage, trade stash, itens e aggregates
+
+`ReadLiveSaveSummary` monta um `JsonValue` com a mesma forma que `LoadSaveRoot` produz para o ES3 e chama o mesmo `BuildSaveSummaryJson`. Isso evita regras paralelas para equipamentos, inventario, enchants, bonuses, runas e kills.
+
+Validacao minima:
+
+- processo e `GameAssembly.dll` encontrados;
+- `np<bal>_TypeInfo`, `static_fields` e singleton resolvidos;
+- `AccountSaveData`, `PlayerSaveData` e `CommonSaveData` nao nulos;
+- listas e arrays lidos com limites maximos defensivos;
+- resumo final tem SteamID valido.
+
+Se a leitura viva falhar, `RefreshLiveSaveCache` marca `has_live_save=false`, grava `saveFallbackReason` e promove o ultimo `file_save` lido por ES3. Nao misturar blocos de memoria e arquivo no mesmo payload.
+
+`watcher-status.json` deve incluir:
+
+- `saveSource`: `memory`, `save` ou `none`;
+- `lastSaveFileReadAt`;
+- `lastLiveSaveReadAt`;
+- `lastLiveSaveReadMs`;
+- `saveFallbackReason` quando a leitura viva falhou.
+
+## Tráfego do save no ingest
+
+O contrato remoto continua aceitando `save` como snapshot completo. Nao existe `saveDelta`/patch por campo no backend.
+
+Para reduzir banda sem criar outro protocolo, o agente envia:
+
+- `save` completo no primeiro sync, quando o save ativo muda ou quando o sync e forcado por mudanca de config;
+- `save: null` quando apenas eventos de historico mudaram. O backend preserva `tbh_current_state.save` via `coalesce(excluded.save, tbh_current_state.save)`.
+
+Nao enviar delta parcial de save sem antes implementar merge server-side e broadcast compatível. Varios recursos comparam save anterior vs novo (`rune alerts`, pet unlock, inventario cheio, snapshots e derived stats), entao patch parcial seria mais arriscado que economico enquanto o `save` completo ainda estiver pequeno.
 
 Dados extraidos:
 
@@ -474,6 +516,26 @@ Regras:
 - O C# exportado pelo AssetRipper em IL2CPP tem corpos stubados. Target selection, timing exato e fluxo interno de movimento/ataque exigem Ghidra/IDA no `GameAssembly.dll` com nomes/RVAs do Il2CppDumper.
 - Para Ghidra, preferir adicionar a pasta `scripts\ghidra` no Script Manager e rodar `apply_il2cppdumper_labels.py`; o script original em `.cache\il2cppdumper\ghidra.py` pode nao aparecer porque nao tem metadados de categoria do Ghidra.
 
+## Analise DPS real / fonte de dano
+
+Referencia atual:
+
+```text
+docs\dps-memory-analysis-1.00.13.md
+```
+
+Conclusao para 1.00.13:
+
+- `LogManager` nao contem eventos de dano/skill; o cache vivo observado tem apenas `clear`, `failure`, `death`, `drop` e `craft`, com campos como `type`, `category`, `hero`, `enemy`, `item`, `grade`, `itemKey`, `seconds`, `clock` e `ts`.
+- `DamageInfo` contem os dados centrais para DPS: `Attacker @0x00`, `OriginDamage @0x08`, `IsCritical @0x0C`, `DamageAttribute @0x10`, `DamageType @0x14` e `HitEffects @0x20`.
+- `Unit.gpw` e o ponto mais promissor para dano real aplicado: ele recebe `DamageInfo`, aplica absorcao/reducao/evasao e chama o health controller com o valor final.
+- `ActiveSkill` mantem contexto de origem: `skillCache @0x18`, owner/caster `bgrq @0x38`, `AnimClipName @0x40`, `ActionTimeName @0x48`, behavior `bgrt @0x68`; `SkillBehaviorContext` tambem liga `SkillOwner`, `SkillCache` e `ActiveSkill`.
+- Sem hook/instrumentacao, DPS por skill so deve ser tratado como inferencia por polling de HP, unidades e skills/projeteis ativos. DPS autoritativo exige observar a chamada quente (`Unit.gpw`, `Hero.gpw`, `Monster.gpw`, `DamageInfo.ctor` ou producers de `AttackDamage`), o que sai da postura read-only atual se exigir injecao/hook.
+
+Regra:
+
+- Nao adicionar DPS autoritativo ao companion de producao sem decidir explicitamente se a postura read-only continua obrigatoria. Se continuar, nomear a feature como estimativa/inferencia e validar com harness controlado.
+
 ### Ghidra CLI IL2CPP
 
 Fluxo preferido para evitar passos manuais no Ghidra:
@@ -567,6 +629,12 @@ Dump do resumo C++:
 build\TBH_Companion.exe --dump-save-summary C:\temp\tbh-save-summary.json
 ```
 
+Comparar save vivo em memoria contra ES3:
+
+```powershell
+build\TBH_Companion.exe --memory-save-scan C:\temp\tbh-memory-save-scan.json
+```
+
 Scan de memoria:
 
 ```powershell
@@ -610,6 +678,7 @@ Validar:
 ```powershell
 build\TBH_Companion.exe --compare
 build\TBH_Companion.exe --dump-save-summary C:\temp\tbh-save-summary.json
+build\TBH_Companion.exe --memory-save-scan C:\temp\tbh-memory-save-scan.json
 ```
 
 Validar:
@@ -618,6 +687,7 @@ Validar:
 - JSON gerado parseia.
 - `ownerSteamId`/`playerId` esperado.
 - `currentStageKey`, `maxStageKey`, gold, herois, runas, pets e monster kills aparecem.
+- Com jogo aberto, `--memory-save-scan` deve retornar `liveOk=true`; diferencas pontuais podem ser esperadas quando a memoria ja tem mudancas que o ES3 ainda nao salvou.
 - Se uma feature frontend depende de novo campo, confirmar o campo no dump.
 
 ### Harness de memoria/log
@@ -634,7 +704,7 @@ Validar:
 - `history.events` contem eventos recentes.
 - `clears` contem stage summaries quando ha clear/failure.
 - Drops de item tem `item_key` e `grade`.
-- `watcher` reporta `cpp-agent il2cpp reader`.
+- `watcher` reporta `cpp-agent il2cpp reader` e, quando gerado pelo worker/export dev, inclui `saveSource`.
 
 ### Harness de mapa IL2CPP
 
@@ -642,6 +712,7 @@ Validar:
 py scripts\refresh_il2cpp_map.py --dry-run
 py scripts\refresh_il2cpp_map.py
 build.bat
+build\TBH_Companion.exe --memory-save-scan C:\temp\tbh-memory-save-scan.json
 build\TBH_Companion.exe --memory-scan
 ```
 
@@ -650,6 +721,7 @@ Validar:
 - Script detecta versao correta.
 - Dump gera offsets.
 - Verificacao viva mostra amostras de eventos.
+- Saida do script mostra `Save manager: TypeInfo np<bal>_TypeInfo`.
 - `src/main.cpp` foi patchado dentro dos marcadores.
 - Frontend `server.js` e `public/calculator.js` recebem mapa de raridade se mudou.
 
@@ -713,11 +785,11 @@ Validar:
 
 ### Skill: corrigir leitura de save
 
-1. Leia `ReadSaveSummary`, `BuildSaveSummaryJson` e helpers de JSON.
+1. Leia `ReadSaveSummary`, `ReadLiveSaveSummary`, `BuildSaveSummaryJson` e helpers de JSON.
 2. Gere dump com `--dump-save-summary` antes de editar, se possivel.
-3. Adicione o campo no resumo sem quebrar campos existentes.
+3. Adicione o campo no resumo sem quebrar campos existentes; se vier do save, implemente no caminho ES3 e no caminho vivo por memoria.
 4. Se o frontend depende do novo campo, documente e ajuste o frontend.
-5. Rode `build.bat` e `--dump-save-summary`.
+5. Rode `build.bat`, `--dump-save-summary` e `--memory-save-scan` com jogo aberto.
 
 ### Skill: corrigir eventos/historico
 
@@ -733,7 +805,7 @@ Validar:
 1. Rode `py scripts\refresh_il2cpp_map.py --dry-run`.
 2. Rode sem dry-run com jogo aberto.
 3. Build com `build.bat`.
-4. Rode `--memory-scan`.
+4. Rode `--memory-save-scan` e `--memory-scan`.
 5. Se grade novo aparecer, atualize traducoes no script e no frontend.
 6. Reinicie agente.
 7. Se necessario, apague `sync-state.json` para reenvio completo.

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -56,6 +57,8 @@ constexpr wchar_t STEAM_GAME_URI[] = L"steam://rungameid/3678970";
 constexpr wchar_t AUTOSTART_VALUE_NAME[] = L"TBH Companion";
 constexpr wchar_t APP_WINDOW_CLASS[] = L"TBHCompanionAgentWindow";
 constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\TBHCompanionAgentSingleInstance";
+constexpr DWORD kLiveSavePollMs = 500;
+constexpr DWORD kLogMemoryPollMs = 2000;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -87,6 +90,7 @@ struct Config {
 Config LoadConfig();
 
 struct SaveSummary {
+  std::string source = "save";
   std::string steam_id;
   std::string owner_steam_id;
   std::string player_id;
@@ -150,13 +154,23 @@ struct MemoryRegion {
 struct WorkerState {
   SaveSummary save;
   bool has_save = false;
+  SaveSummary file_save;
+  bool has_file_save = false;
+  SaveSummary live_save;
+  bool has_live_save = false;
   FILETIME save_mtime{};
+  double last_save_file_read_at = 0;
+  double last_live_save_read_at = 0;
+  DWORD last_live_save_read_ms = 0;
+  DWORD last_live_save_scan = 0;
+  std::string live_save_error;
   MemorySnapshot memory;
   std::vector<MemoryRegion> memory_regions;
   DWORD memory_pid = 0;
   DWORD last_memory_scan = 0;
   DWORD last_region_discovery = 0;
   std::string last_payload_hash;
+  std::string last_synced_save_hash;
   std::string last_sync_config_signature;
   std::set<std::string> memory_seen;     // ids ja vistos (historico + baseline)
   bool memory_baseline_ready = false;    // primeira leitura vira baseline e e ignorada
@@ -1088,6 +1102,30 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0D958;
+constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
+constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
+constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
+constexpr uintptr_t kAccountSaveVersionOffset = 0x18;
+constexpr uintptr_t kAccountSaveOwnerSteamIdOffset = 0x50;
+constexpr uintptr_t kCommonSaveVersionOffset = 0x10;
+constexpr uintptr_t kCommonSavePlayTimeOffset = 0x20;
+constexpr uintptr_t kCommonSaveArrangedPetKeyOffset = 0x40;
+constexpr uintptr_t kCommonSaveArrangedHeroKeyOffset = 0x48;
+constexpr uintptr_t kCommonSaveMaxCompletedStageOffset = 0x54;
+constexpr uintptr_t kCommonSaveCurrentStageKeyOffset = 0x58;
+constexpr uintptr_t kCommonSaveCurrentStageWaveOffset = 0x5C;
+constexpr uintptr_t kPlayerSaveCommonOffset = 0x10;
+constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x38;
+constexpr uintptr_t kPlayerSaveHeroesOffset = 0x40;
+constexpr uintptr_t kPlayerSaveAttributesOffset = 0x50;
+constexpr uintptr_t kPlayerSavePetsOffset = 0x58;
+constexpr uintptr_t kPlayerSaveRunesOffset = 0x60;
+constexpr uintptr_t kPlayerSaveInventoryOffset = 0x68;
+constexpr uintptr_t kPlayerSaveStashOffset = 0x70;
+constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x78;
+constexpr uintptr_t kPlayerSaveItemsOffset = 0x90;
+constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x98;
 static const char* const kGradeNames[] = {
     "COMMON", "UNCOMMON", "RARE", "LEGENDARY", "IMMORTAL",
     "ARCANA", "BEYOND", "CELESTIAL", "DIVINE", "COSMIC",
@@ -1127,6 +1165,13 @@ uintptr_t ReadPtr(HANDLE process, uintptr_t address) {
 bool ReadInt32(HANDLE process, uintptr_t address, int& value) {
   SIZE_T read = 0;
   return ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &read) &&
+         read == sizeof(value);
+}
+
+template <typename T>
+bool ReadScalar(HANDLE process, uintptr_t address, T& value) {
+  SIZE_T read = 0;
+  return address && ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), &value, sizeof(value), &read) &&
          read == sizeof(value);
 }
 
@@ -2652,6 +2697,37 @@ JsonValue CopyOrEmptyArray(const JsonValue* value) {
   return JsonValue::Array();
 }
 
+bool JsonSemanticEqual(const JsonValue* a, const JsonValue* b) {
+  if (!a || !b) return a == b;
+  if (a->type == JsonValue::Type::Number && b->type == JsonValue::Type::Number) {
+    return std::fabs(JsonNumberDouble(a) - JsonNumberDouble(b)) < 0.000000001;
+  }
+  if (a->type != b->type) return false;
+  switch (a->type) {
+    case JsonValue::Type::Null:
+      return true;
+    case JsonValue::Type::Bool:
+      return a->boolean == b->boolean;
+    case JsonValue::Type::Number:
+      return a->number == b->number;
+    case JsonValue::Type::String:
+      return a->string == b->string;
+    case JsonValue::Type::Array:
+      if (a->array.size() != b->array.size()) return false;
+      for (size_t i = 0; i < a->array.size(); ++i) {
+        if (!JsonSemanticEqual(&a->array[i], &b->array[i])) return false;
+      }
+      return true;
+    case JsonValue::Type::Object:
+      if (a->object.size() != b->object.size()) return false;
+      for (const auto& item : a->object) {
+        if (!JsonSemanticEqual(&item.second, ObjectGet(*b, item.first))) return false;
+      }
+      return true;
+  }
+  return false;
+}
+
 JsonValue BuildStatSummary(const JsonValue& stat, const std::string& section) {
   JsonValue out = JsonValue::Object();
   ObjectSet(out, "stat", CopyOrNull(ObjectGet(stat, "stat")));
@@ -3374,26 +3450,319 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   return out;
 }
 
-std::string LeadingDigits(const std::string& value) {
-  std::string digits;
-  for (char c : value) {
-    if (c < '0' || c > '9') break;
-    digits.push_back(c);
-  }
-  return digits;
+std::string LeadingDigits(const std::string& value);
+
+JsonValue LiveString(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  return JsonValue::String(Utf8(ReadManagedString(process, ReadPtr(process, obj + offset))));
 }
 
-bool ReadSaveSummary(SaveSummary& summary) {
-  std::vector<unsigned char> bytes;
-  std::wstring path = DefaultSavePath();
-  if (!ReadAllBytes(path, bytes)) return false;
+JsonValue LiveInt(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  int value = 0;
+  ReadScalar(process, obj + offset, value);
+  return JsonValue::Number(static_cast<long long>(value));
+}
 
-  std::string json;
-  if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return false;
+JsonValue LiveLong(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  long long value = 0;
+  ReadScalar(process, obj + offset, value);
+  return JsonValue::Number(value);
+}
 
-  JsonValue save;
-  if (!LoadSaveRoot(json, save)) return false;
+JsonValue LiveULong(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  unsigned long long value = 0;
+  ReadScalar(process, obj + offset, value);
+  return JsonValue::Number(std::to_string(value));
+}
+
+JsonValue LiveFloat(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  float value = 0;
+  ReadScalar(process, obj + offset, value);
+  return JsonValue::Number(static_cast<double>(value));
+}
+
+JsonValue LiveBool(HANDLE process, uintptr_t obj, uintptr_t offset) {
+  unsigned char value = 0;
+  ReadScalar(process, obj + offset, value);
+  return JsonValue::Bool(value != 0);
+}
+
+bool ReadIl2CppArrayLength(HANDLE process, uintptr_t array, int& length, int max_count, std::string* error,
+                           const char* label) {
+  length = 0;
+  if (!array) return true;
+  if (!ReadInt32(process, array + 0x18, length) || length < 0 || length > max_count) {
+    if (error) *error = std::string("array invalido: ") + label;
+    return false;
+  }
+  return true;
+}
+
+bool ReadLiveIntArray(HANDLE process, uintptr_t array, int max_count, JsonValue& out, std::string* error,
+                      const char* label) {
+  out = JsonValue::Array();
+  int length = 0;
+  if (!ReadIl2CppArrayLength(process, array, length, max_count, error, label)) return false;
+  for (int i = 0; i < length; ++i) {
+    int value = 0;
+    if (!ReadScalar(process, array + 0x20 + static_cast<uintptr_t>(i) * sizeof(int), value)) {
+      if (error) *error = std::string("falha lendo array: ") + label;
+      return false;
+    }
+    out.array.push_back(JsonValue::Number(static_cast<long long>(value)));
+  }
+  return true;
+}
+
+bool ReadLiveULongArray(HANDLE process, uintptr_t array, int max_count, JsonValue& out, std::string* error,
+                        const char* label) {
+  out = JsonValue::Array();
+  int length = 0;
+  if (!ReadIl2CppArrayLength(process, array, length, max_count, error, label)) return false;
+  for (int i = 0; i < length; ++i) {
+    unsigned long long value = 0;
+    if (!ReadScalar(process, array + 0x20 + static_cast<uintptr_t>(i) * sizeof(unsigned long long), value)) {
+      if (error) *error = std::string("falha lendo array: ") + label;
+      return false;
+    }
+    out.array.push_back(JsonValue::Number(std::to_string(value)));
+  }
+  return true;
+}
+
+bool ReadLiveEnchantArray(HANDLE process, uintptr_t array, JsonValue& out, std::string* error) {
+  out = JsonValue::Array();
+  int length = 0;
+  if (!ReadIl2CppArrayLength(process, array, length, 512, error, "ItemEnchantSaveData")) return false;
+  constexpr uintptr_t kEnchantSize = 0x1C;
+  for (int i = 0; i < length; ++i) {
+    uintptr_t base = array + 0x20 + static_cast<uintptr_t>(i) * kEnchantSize;
+    int stat_mod_key = 0, tier = 0, value = 0, recipe_type = 0, mod_type = 0, material_key = 0, stat_type = 0;
+    if (!ReadScalar(process, base + 0x00, stat_mod_key) ||
+        !ReadScalar(process, base + 0x04, tier) ||
+        !ReadScalar(process, base + 0x08, value) ||
+        !ReadScalar(process, base + 0x0C, recipe_type) ||
+        !ReadScalar(process, base + 0x10, mod_type) ||
+        !ReadScalar(process, base + 0x14, material_key) ||
+        !ReadScalar(process, base + 0x18, stat_type)) {
+      if (error) *error = "falha lendo ItemEnchantSaveData";
+      return false;
+    }
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "StatModKey", JsonValue::Number(static_cast<long long>(stat_mod_key)));
+    ObjectSet(row, "Tier", JsonValue::Number(static_cast<long long>(tier)));
+    ObjectSet(row, "Value", JsonValue::Number(static_cast<long long>(value)));
+    ObjectSet(row, "RecipeType", JsonValue::Number(static_cast<long long>(recipe_type)));
+    ObjectSet(row, "ModType", JsonValue::Number(static_cast<long long>(mod_type)));
+    ObjectSet(row, "MaterialKey", JsonValue::Number(static_cast<long long>(material_key)));
+    ObjectSet(row, "StatType", JsonValue::Number(static_cast<long long>(stat_type)));
+    out.array.push_back(std::move(row));
+  }
+  return true;
+}
+
+bool ReadLiveObjectList(HANDLE process, uintptr_t list, int max_count, const char* label,
+                        const std::function<bool(uintptr_t, JsonValue&, std::string*)>& build,
+                        JsonValue& out, std::string* error, bool required = true) {
+  out = JsonValue::Array();
+  if (!list) {
+    if (required && error) *error = std::string("lista nula: ") + label;
+    return !required;
+  }
+  uintptr_t items = ReadPtr(process, list + 0x10);
+  int size = 0;
+  if (!items || !ReadInt32(process, list + 0x18, size) || size < 0 || size > max_count) {
+    if (error) *error = std::string("lista invalida: ") + label;
+    return false;
+  }
+  std::vector<uintptr_t> pointers(static_cast<size_t>(size));
+  SIZE_T read = 0;
+  if (size > 0 && (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(items + 0x20), pointers.data(),
+                                      pointers.size() * sizeof(uintptr_t), &read) ||
+                   read != pointers.size() * sizeof(uintptr_t))) {
+    if (error) *error = std::string("falha lendo lista: ") + label;
+    return false;
+  }
+  for (uintptr_t obj : pointers) {
+    if (!obj) continue;
+    JsonValue row;
+    if (!build(obj, row, error)) return false;
+    out.array.push_back(std::move(row));
+  }
+  return true;
+}
+
+bool BuildLiveSaveRoot(HANDLE process, uintptr_t save_manager, JsonValue& root, std::string* error) {
+  uintptr_t account_ptr = ReadPtr(process, save_manager + kSaveManagerAccountSaveOffset);
+  uintptr_t player_ptr = ReadPtr(process, save_manager + kSaveManagerPlayerSaveOffset);
+  if (!account_ptr) {
+    if (error) *error = "AccountSaveData nulo";
+    return false;
+  }
+  if (!player_ptr) {
+    if (error) *error = "PlayerSaveData nulo";
+    return false;
+  }
+
+  uintptr_t common_ptr = ReadPtr(process, player_ptr + kPlayerSaveCommonOffset);
+  if (!common_ptr) {
+    if (error) *error = "CommonSaveData nulo";
+    return false;
+  }
+
+  JsonValue account = JsonValue::Object();
+  ObjectSet(account, "playerId", LiveString(process, account_ptr, kAccountSavePlayerIdOffset));
+  ObjectSet(account, "version", LiveString(process, account_ptr, kAccountSaveVersionOffset));
+  ObjectSet(account, "ownerSteamId", LiveString(process, account_ptr, kAccountSaveOwnerSteamIdOffset));
+
+  JsonValue common = JsonValue::Object();
+  ObjectSet(common, "version", LiveString(process, common_ptr, kCommonSaveVersionOffset));
+  ObjectSet(common, "playTime", LiveFloat(process, common_ptr, kCommonSavePlayTimeOffset));
+  ObjectSet(common, "ArrangedPetKey", LiveInt(process, common_ptr, kCommonSaveArrangedPetKeyOffset));
+  JsonValue arranged;
+  if (!ReadLiveIntArray(process, ReadPtr(process, common_ptr + kCommonSaveArrangedHeroKeyOffset), 16, arranged, error,
+                        "arrangedHeroKey")) return false;
+  ObjectSet(common, "arrangedHeroKey", std::move(arranged));
+  ObjectSet(common, "maxCompletedStage", LiveInt(process, common_ptr, kCommonSaveMaxCompletedStageOffset));
+  ObjectSet(common, "currentStageKey", LiveInt(process, common_ptr, kCommonSaveCurrentStageKeyOffset));
+  ObjectSet(common, "currentStageWave", LiveInt(process, common_ptr, kCommonSaveCurrentStageWaveOffset));
+
+  JsonValue player = JsonValue::Object();
+  ObjectSet(player, "commonSaveData", std::move(common));
+
+  JsonValue currencies;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveCurrenciesOffset), 64, "CurrencySaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        row = JsonValue::Object();
+        ObjectSet(row, "Key", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "Quantity", LiveLong(process, obj, 0x18));
+        return true;
+      }, currencies, error)) return false;
+  ObjectSet(player, "currenySaveDatas", std::move(currencies));
+
+  JsonValue heroes;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveHeroesOffset), 32, "HeroSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string* err) {
+        row = JsonValue::Object();
+        ObjectSet(row, "heroKey", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "HeroLevel", LiveInt(process, obj, 0x14));
+        ObjectSet(row, "IsUnLock", LiveBool(process, obj, 0x18));
+        ObjectSet(row, "HeroExp", LiveFloat(process, obj, 0x1C));
+        ObjectSet(row, "AbilityPoint", LiveInt(process, obj, 0x20));
+        ObjectSet(row, "AllocatedHeroAbilityPoint", LiveInt(process, obj, 0x24));
+        JsonValue equipped_items;
+        if (!ReadLiveULongArray(process, ReadPtr(process, obj + 0x28), 16, equipped_items, err, "equippedItemIds")) return false;
+        ObjectSet(row, "equippedItemIds", std::move(equipped_items));
+        JsonValue skills;
+        if (!ReadLiveIntArray(process, ReadPtr(process, obj + 0x30), 16, skills, err, "equippedSKillKey")) return false;
+        ObjectSet(row, "equippedSKillKey", std::move(skills));
+        JsonValue unlocked_groups;
+        if (!ReadLiveIntArray(process, ReadPtr(process, obj + 0x38), 256, unlocked_groups, err,
+                              "unlockedAttributeGroupKeys")) return false;
+        ObjectSet(row, "unlockedAttributeGroupKeys", std::move(unlocked_groups));
+        return true;
+      }, heroes, error)) return false;
+  ObjectSet(player, "heroSaveDatas", std::move(heroes));
+
+  JsonValue attributes;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveAttributesOffset), 4096, "AttributeSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        row = JsonValue::Object();
+        ObjectSet(row, "Key", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "Level", LiveInt(process, obj, 0x14));
+        return true;
+      }, attributes, error)) return false;
+  ObjectSet(player, "attributeSaveDatas", std::move(attributes));
+
+  JsonValue pets;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSavePetsOffset), 256, "PetSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        row = JsonValue::Object();
+        ObjectSet(row, "PetKey", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "IsUnlock", LiveBool(process, obj, 0x14));
+        ObjectSet(row, "IsViewed", LiveBool(process, obj, 0x15));
+        return true;
+      }, pets, error)) return false;
+  ObjectSet(player, "PetSaveData", std::move(pets));
+
+  JsonValue runes;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveRunesOffset), 4096, "RuneSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        row = JsonValue::Object();
+        ObjectSet(row, "RuneKey", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "Level", LiveInt(process, obj, 0x14));
+        return true;
+      }, runes, error)) return false;
+  ObjectSet(player, "RuneSaveData", std::move(runes));
+
+  auto build_slot = [&](const char* unlock_field) {
+    return [&, unlock_field](uintptr_t obj, JsonValue& row, std::string*) {
+      row = JsonValue::Object();
+      ObjectSet(row, "Index", LiveInt(process, obj, 0x10));
+      ObjectSet(row, "ItemUniqueId", LiveULong(process, obj, 0x18));
+      ObjectSet(row, unlock_field, LiveBool(process, obj, 0x20));
+      if (strcmp(unlock_field, "IsUnlock") == 0) ObjectSet(row, "IsUnlockedByRune", LiveBool(process, obj, 0x21));
+      return true;
+    };
+  };
+
+  JsonValue inventory;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveInventoryOffset), 2048, "InventorySaveData",
+                          build_slot("IsUnlock"), inventory, error)) return false;
+  ObjectSet(player, "inventorySaveDatas", std::move(inventory));
+
+  JsonValue stash;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveStashOffset), 4096, "StashSaveData",
+                          build_slot("IsUnLock"), stash, error)) return false;
+  ObjectSet(player, "stashSaveDatas", std::move(stash));
+
+  JsonValue trade_stash;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveTradeStashOffset), 4096,
+                          "TradingStashSaveData", build_slot("IsUnLock"), trade_stash, error)) return false;
+  ObjectSet(player, "tradingStashSaveDatas", std::move(trade_stash));
+
+  JsonValue items;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveItemsOffset), 8192, "ItemSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string* err) {
+        row = JsonValue::Object();
+        ObjectSet(row, "ItemKey", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "UniqueId", LiveULong(process, obj, 0x18));
+        ObjectSet(row, "IsChaotic", LiveBool(process, obj, 0x20));
+        ObjectSet(row, "IsBlocked", LiveBool(process, obj, 0x21));
+        ObjectSet(row, "IsServerPendingItem", LiveBool(process, obj, 0x22));
+        JsonValue counts;
+        if (!ReadLiveIntArray(process, ReadPtr(process, obj + 0x28), 16, counts, err, "EnchantCount")) return false;
+        ObjectSet(row, "EnchantCount", std::move(counts));
+        JsonValue enchants;
+        if (!ReadLiveEnchantArray(process, ReadPtr(process, obj + 0x30), enchants, err)) return false;
+        ObjectSet(row, "EnchantData", std::move(enchants));
+        ObjectSet(row, "DecorationAppliedTotalCount", LiveInt(process, obj, 0x38));
+        ObjectSet(row, "EngravingAppliedTotalCount", LiveInt(process, obj, 0x3C));
+        ObjectSet(row, "InscriptionAppliedTotalCount", LiveInt(process, obj, 0x40));
+        return true;
+      }, items, error)) return false;
+  ObjectSet(player, "itemSaveDatas", std::move(items));
+
+  JsonValue aggregates;
+  if (!ReadLiveObjectList(process, ReadPtr(process, player_ptr + kPlayerSaveAggregatesOffset), 8192, "AggregateSaveData",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        row = JsonValue::Object();
+        ObjectSet(row, "Type", LiveInt(process, obj, 0x10));
+        ObjectSet(row, "SubKey", LiveInt(process, obj, 0x14));
+        ObjectSet(row, "Value", LiveLong(process, obj, 0x18));
+        return true;
+      }, aggregates, error)) return false;
+  ObjectSet(player, "aggregateSaveDatas", std::move(aggregates));
+
+  root = JsonValue::Object();
+  ObjectSet(root, "AccountSaveData", std::move(account));
+  ObjectSet(root, "PlayerSaveData", std::move(player));
+  return true;
+}
+
+bool FillSaveSummaryFromRoot(const JsonValue& save, const std::string& source, SaveSummary& summary) {
   JsonValue full_summary = BuildSaveSummaryJson(save);
+  summary = SaveSummary();
+  summary.source = source;
   summary.summary_json = JsonSerialize(full_summary);
 
   const JsonValue* account = ObjectGet(save, "AccountSaveData");
@@ -3413,6 +3782,60 @@ bool ReadSaveSummary(SaveSummary& summary) {
   summary.pets_json = JsonSerialize(CopyOrEmptyArray(ObjectGet(full_summary, "pets")));
   summary.runes_json = JsonSerialize(CopyOrEmptyArray(ObjectGet(full_summary, "runes")));
   return !summary.steam_id.empty();
+}
+
+bool ReadLiveSaveSummary(DWORD pid, SaveSummary& summary, std::string* error = nullptr) {
+  auto fail = [&](const char* why) {
+    if (error) *error = why;
+    return false;
+  };
+  if (!pid) return fail("jogo nao esta rodando");
+  uintptr_t module_base = FindModuleBase(pid, L"GameAssembly.dll");
+  if (!module_base) return fail("GameAssembly.dll nao encontrada");
+  HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (!process) return fail("sem acesso ao processo");
+
+  bool ok = false;
+  do {
+    uintptr_t klass = ReadPtr(process, module_base + kSaveManagerTypeInfoRva);
+    if (!klass) { fail("TypeInfo do save manager nulo"); break; }
+    uintptr_t statics = ReadPtr(process, klass + kKlassStaticFieldsOffset);
+    uintptr_t instance = ReadPtr(process, statics);
+    if (!instance) { fail("singleton do save manager ainda nao criado"); break; }
+
+    JsonValue root;
+    if (!BuildLiveSaveRoot(process, instance, root, error)) break;
+    if (!FillSaveSummaryFromRoot(root, "memory", summary)) {
+      fail("snapshot vivo sem SteamID valido");
+      break;
+    }
+    ok = true;
+  } while (false);
+
+  CloseHandle(process);
+  return ok;
+}
+
+std::string LeadingDigits(const std::string& value) {
+  std::string digits;
+  for (char c : value) {
+    if (c < '0' || c > '9') break;
+    digits.push_back(c);
+  }
+  return digits;
+}
+
+bool ReadSaveSummary(SaveSummary& summary) {
+  std::vector<unsigned char> bytes;
+  std::wstring path = DefaultSavePath();
+  if (!ReadAllBytes(path, bytes)) return false;
+
+  std::string json;
+  if (!DecryptEs3AesCbc(bytes, DEFAULT_ES3_KEY, json)) return false;
+
+  JsonValue save;
+  if (!LoadSaveRoot(json, save)) return false;
+  return FillSaveSummaryFromRoot(save, "save", summary);
 }
 
 std::wstring ReadSteamIdFromSave() {
@@ -3436,9 +3859,17 @@ std::string JsonEscape(const std::string& input) {
   return output;
 }
 
+bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason = nullptr) {
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  std::string live_error;
+  if (ReadLiveSaveSummary(pid, summary, &live_error)) return true;
+  if (fallback_reason) *fallback_reason = live_error;
+  return ReadSaveSummary(summary);
+}
+
 std::string SavePayload(const Config& config) {
   SaveSummary summary;
-  bool has_save = ReadSaveSummary(summary);
+  bool has_save = ReadPreferredSaveSummary(summary);
   std::string difficulty = has_save ? DifficultyFromStageKey(summary.current_stage_key) : "NORMAL";
   MemorySnapshot memory = ReadMemorySnapshot(difficulty);
   std::string steam_raw = config.steam_id.empty() ? (summary.steam_id.empty() ? "default" : summary.steam_id) : Utf8(config.steam_id);
@@ -3456,10 +3887,11 @@ std::string SavePayload(const Config& config) {
          ",\"watcher\":" + memory.watcher_json + "}";
 }
 
-std::string CachedPayload(const Config& config, const WorkerState& state, int events_from_index = -1) {
+std::string CachedPayload(const Config& config, const WorkerState& state, int events_from_index = -1,
+                          bool include_save = true) {
   std::string steam_raw = EffectiveSteamId(config, state);
   std::string steam = JsonEscape(steam_raw);
-  std::string save = state.has_save ? state.save.summary_json : "null";
+  std::string save = include_save && state.has_save ? state.save.summary_json : "null";
   std::string pairing_hash = PairingHash(config, steam_raw);
   std::string pairing = pairing_hash.empty() ? "null" : ("\"" + pairing_hash + "\"");
   std::string history = state.memory.history_json;
@@ -3559,33 +3991,87 @@ std::wstring PostJsonPayload(const Config& config, const std::string& payload) {
 
 std::wstring PostIngest(const Config& config) {
   SaveSummary summary;
-  if (!ReadSaveSummary(summary)) return L"Não foi possível ler o save C++.";
+  std::string fallback_reason;
+  if (!ReadPreferredSaveSummary(summary, &fallback_reason)) return L"Não foi possível ler o save C++.";
   return PostJsonPayload(config, SavePayload(config));
+}
+
+std::string WatcherStatusJson(const std::string& message, const WorkerState* state = nullptr);
+
+void PromoteActiveSave(WorkerState& state, const SaveSummary& summary) {
+  state.save = summary;
+  state.has_save = true;
 }
 
 bool RefreshSaveCache(WorkerState& state) {
   FILETIME mtime{};
   std::wstring path = DefaultSavePath();
   if (!FileMTime(path, mtime)) return false;
-  if (state.has_save && SameFileTime(state.save_mtime, mtime)) return false;
+  if (state.has_file_save && SameFileTime(state.save_mtime, mtime)) return false;
   PostStatus(L"Lendo save...");
   SaveSummary summary;
   if (!ReadSaveSummary(summary)) {
     PostStatus(L"Falha ao ler save.");
     return false;
   }
-  state.save = std::move(summary);
+  state.file_save = std::move(summary);
   state.save_mtime = mtime;
-  state.has_save = true;
+  state.has_file_save = true;
+  state.last_save_file_read_at = static_cast<double>(time(nullptr));
+  if (!state.has_live_save) PromoteActiveSave(state, state.file_save);
   PostStatus(L"Save lido.");
   return true;
 }
 
-std::string WatcherStatusJson(const std::string& message) {
+bool RefreshLiveSaveCache(WorkerState& state, bool force = false) {
+  DWORD now = GetTickCount();
+  bool due = force || now - state.last_live_save_scan > kLiveSavePollMs;
+  if (!due) return false;
+  state.last_live_save_scan = now;
+
+  SaveSummary summary;
+  std::string error;
+  DWORD scan_start = GetTickCount();
+  if (ReadLiveSaveSummary(FindProcessIdByName(L"TaskBarHero.exe"), summary, &error)) {
+    DWORD scan_ms = GetTickCount() - scan_start;
+    bool changed = !state.has_live_save || summary.summary_json != state.live_save.summary_json;
+    state.live_save = std::move(summary);
+    state.has_live_save = true;
+    state.live_save_error.clear();
+    state.last_live_save_read_at = static_cast<double>(time(nullptr));
+    state.last_live_save_read_ms = scan_ms;
+    PromoteActiveSave(state, state.live_save);
+    state.memory.watcher_json = WatcherStatusJson("cpp-agent live save reader", &state);
+    if (changed) PostStatus(L"Save vivo atualizado em " + std::to_wstring(scan_ms) + L"ms.");
+    return changed;
+  }
+
+  bool had_live = state.has_live_save;
+  state.has_live_save = false;
+  state.live_save_error = error.empty() ? "leitura viva indisponivel" : error;
+  if (state.has_file_save) PromoteActiveSave(state, state.file_save);
+  state.memory.watcher_json = WatcherStatusJson("cpp-agent save fallback", &state);
+  return had_live;
+}
+
+std::string WatcherStatusJson(const std::string& message, const WorkerState* state) {
   JsonValue watcher = JsonValue::Object();
   ObjectSet(watcher, "source", JsonValue::String("cpp-agent"));
   ObjectSet(watcher, "updatedAt", JsonValue::Number(static_cast<double>(time(nullptr))));
   ObjectSet(watcher, "message", JsonValue::String(message));
+  if (state) {
+    ObjectSet(watcher, "saveSource", JsonValue::String(state->has_save ? state->save.source : "none"));
+    ObjectSet(watcher, "lastSaveFileReadAt", state->last_save_file_read_at > 0
+        ? JsonValue::Number(state->last_save_file_read_at)
+        : JsonValue::Null());
+    ObjectSet(watcher, "lastLiveSaveReadAt", state->last_live_save_read_at > 0
+        ? JsonValue::Number(state->last_live_save_read_at)
+        : JsonValue::Null());
+    ObjectSet(watcher, "lastLiveSaveReadMs", JsonValue::Number(static_cast<long long>(state->last_live_save_read_ms)));
+    if (!state->has_live_save && !state->live_save_error.empty()) {
+      ObjectSet(watcher, "saveFallbackReason", JsonValue::String(state->live_save_error));
+    }
+  }
   return JsonSerialize(watcher);
 }
 
@@ -3608,7 +4094,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   }
 
   if (!pid) return false;
-  bool due = force_discover || now - state.last_memory_scan > 2000;
+  bool due = force_discover || now - state.last_memory_scan > kLogMemoryPollMs;
   if (!due) return false;
   state.last_memory_scan = now;
 
@@ -3638,7 +4124,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
     changed = true;
   }
   state.memory.pid = pid;
-  state.memory.watcher_json = WatcherStatusJson("cpp-agent il2cpp reader");
+  state.memory.watcher_json = WatcherStatusJson("cpp-agent il2cpp reader", &state);
 
   DWORD scan_ms = GetTickCount() - scan_start;
   if (added > 0) {
@@ -3699,13 +4185,17 @@ std::wstring WriteDevRuntimeSnapshot(const SaveSummary& save, const MemorySnapsh
 std::wstring ExportDevRuntimeSnapshot() {
   if (!kDevelopmentMode) return L"Export dev indisponível neste build.";
 
-  SaveSummary summary;
-  if (!ReadSaveSummary(summary)) return L"Falha: não foi possível ler o save do jogo.";
-
   WorkerState state;
-  state.save = std::move(summary);
-  state.has_save = true;
-  state.memory.watcher_json = WatcherStatusJson("manual dev export starting");
+  SaveSummary summary;
+  if (ReadSaveSummary(summary)) {
+    state.file_save = std::move(summary);
+    state.has_file_save = true;
+    state.last_save_file_read_at = static_cast<double>(time(nullptr));
+    PromoteActiveSave(state, state.file_save);
+  }
+  state.memory.watcher_json = WatcherStatusJson("manual dev export starting", &state);
+  RefreshLiveSaveCache(state, true);
+  if (!state.has_save) return L"Falha: não foi possível ler o save do jogo.";
 
   RefreshMemoryCache(state, true);
 
@@ -3720,7 +4210,8 @@ std::wstring ExportDevRuntimeSnapshot() {
   }
 
   state.memory.watcher_json =
-      WatcherStatusJson(state.memory.pid ? "manual dev export from live game" : "manual dev export from cached history");
+      WatcherStatusJson(state.memory.pid ? "manual dev export from live game" : "manual dev export from cached history",
+                        &state);
   SaveMemoryHistoryCache(state.memory);
 
   return WriteDevRuntimeSnapshot(state.save, state.memory);
@@ -3752,6 +4243,8 @@ bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = fa
   // muda ou quando ha eventos novos.
   std::string steam_raw = EffectiveSteamId(config, state);
   std::string pairing_hash = PairingHash(config, steam_raw);
+  std::string save_hash = state.has_save ? Fnv1aHash(state.save.summary_json) : "null";
+  bool include_save = state.has_save && (force || save_hash != state.last_synced_save_hash);
   std::string signature = Fnv1aHash((state.has_save ? state.save.summary_json : "null") + "|" +
                                     std::to_string(events.size()) + "|" +
                                     (events.empty() ? "" : events.back().id) + "|" +
@@ -3773,12 +4266,14 @@ bool SyncCachedPayload(const Config& config, WorkerState& state, bool force = fa
   long long new_events = static_cast<long long>(events.size()) - from_index;
 
   PostStatus(L"Montando payload...");
-  std::string payload = CachedPayload(config, state, from_index);
+  std::string payload = CachedPayload(config, state, from_index, include_save);
   PostStatus(L"Enviando sync (" + std::to_wstring(payload.size()) + L" bytes, " +
-             std::to_wstring(new_events) + L" eventos novos)...");
+             std::to_wstring(new_events) + L" eventos novos, " +
+             (include_save ? L"save completo" : L"sem save") + L")...");
   std::wstring result = PostJsonPayload(config, payload);
   if (result.rfind(L"HTTP 200", 0) == 0 || result.rfind(L"HTTP 201", 0) == 0) {
     state.last_payload_hash = signature;
+    if (include_save) state.last_synced_save_hash = save_hash;
     state.synced_index = events.empty() ? -1 : events.back().index;
     state.synced_first_id = events.empty() ? "" : events.front().id;
     SaveSyncState(state);
@@ -3823,7 +4318,7 @@ bool EnsureGameRunning() {
 
 DWORD WINAPI WorkerProc(LPVOID) {
   WorkerState state;
-  state.memory.watcher_json = WatcherStatusJson("worker starting");
+  state.memory.watcher_json = WatcherStatusJson("worker starting", &state);
   LoadSyncState(state);
   PostStatus(L"Worker iniciado. Monitorando save e memoria.");
   RefreshSaveCache(state);
@@ -3847,9 +4342,15 @@ DWORD WINAPI WorkerProc(LPVOID) {
       game_ready = false;
       state.memory_regions.clear();
       state.memory_pid = 0;
+      state.has_live_save = false;
+      state.live_save_error = "jogo fechado";
+      if (state.has_file_save) PromoteActiveSave(state, state.file_save);
       PostStatus(L"Jogo fechado. Aguardando reabrir.");
       continue;
     }
+
+    bool live_save_changed = RefreshLiveSaveCache(state);
+    changed = live_save_changed || changed;
 
     if (!state.has_save) {
       PostStatus(L"Aguardando save valido.");
@@ -3871,7 +4372,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
     bool memory_changed = RefreshMemoryCache(state);
     changed = memory_changed || changed;
-    AutoExportDevRuntimeSnapshot(state, save_changed || memory_changed);
+    AutoExportDevRuntimeSnapshot(state, save_changed || live_save_changed || memory_changed);
     if (memory_changed) {
       SyncCachedPayload(config, state);
     }
@@ -4133,6 +4634,56 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
         return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--memory-save-scan") == 0) {
+        SaveSummary live;
+        SaveSummary file;
+        std::string live_error;
+        bool live_ok = ReadLiveSaveSummary(FindProcessIdByName(L"TaskBarHero.exe"), live, &live_error);
+        bool file_ok = ReadSaveSummary(file);
+
+        JsonValue out = JsonValue::Object();
+        ObjectSet(out, "liveOk", JsonValue::Bool(live_ok));
+        ObjectSet(out, "fileOk", JsonValue::Bool(file_ok));
+        ObjectSet(out, "saveSource", JsonValue::String(live_ok ? "memory" : (file_ok ? "save" : "none")));
+        if (!live_ok) ObjectSet(out, "liveError", JsonValue::String(live_error));
+        if (live_ok) {
+          JsonValue parsed;
+          if (ParseJson(live.summary_json, parsed)) ObjectSet(out, "memory", std::move(parsed));
+        }
+        if (file_ok) {
+          JsonValue parsed;
+          if (ParseJson(file.summary_json, parsed)) ObjectSet(out, "save", std::move(parsed));
+        }
+
+        JsonValue diffs = JsonValue::Array();
+        if (live_ok && file_ok) {
+          JsonValue live_root;
+          JsonValue file_root;
+          ParseJson(live.summary_json, live_root);
+          ParseJson(file.summary_json, file_root);
+          for (const char* key : {"steamId", "currentStageKey", "currentStageWave", "maxCompletedStage", "gold",
+                                  "partyHeroLevels", "unlockedHeroes", "pets", "attributeLevels", "runeLevels",
+                                  "runes", "monsterKills", "inventory"}) {
+            const JsonValue* live_item = ObjectGet(live_root, key);
+            const JsonValue* file_item = ObjectGet(file_root, key);
+            if (JsonSemanticEqual(live_item, file_item)) continue;
+            JsonValue diff = JsonValue::Object();
+            ObjectSet(diff, "key", JsonValue::String(key));
+            ObjectSet(diff, "memory", JsonValue::String(JsonSerialize(CopyOrNull(live_item))));
+            ObjectSet(diff, "save", JsonValue::String(JsonSerialize(CopyOrNull(file_item))));
+            diffs.array.push_back(std::move(diff));
+          }
+        }
+        ObjectSet(out, "matches", JsonValue::Bool(live_ok && file_ok && diffs.array.empty()));
+        ObjectSet(out, "diffCount", JsonValue::Number(static_cast<long long>(diffs.array.size())));
+        ObjectSet(out, "differences", std::move(diffs));
+
+        std::wstring output = TempComparePath();
+        if (i + 1 < argc && argv[i + 1][0] != L'-') output = argv[++i];
+        bool ok = WriteUtf8TextFileAtomic(output, JsonSerialize(out));
+        LocalFree(argv);
+        return ok && live_ok ? 0 : 2;
       }
       if (wcscmp(argv[i], L"--memory-scan") == 0) {
         MemorySnapshot snapshot = ReadMemorySnapshot("NORMAL");
