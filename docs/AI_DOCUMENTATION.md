@@ -62,21 +62,22 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
 | Historico/clears | `BuildHistoryJson`, `BuildClearsJson`, caches locais. |
 | Sync | `CachedPayload`, `PostJsonPayload`, `SyncCachedPayload`, sync incremental. |
-| Harness CLI | `--compare`, `--dump-save-summary`, `--memory-save-scan`, `--memory-stage-scan`, `--memory-scan`. |
+| Harness CLI | `--compare`, `--dump-save-summary`, `--game-version-check`, `--memory-save-scan`, `--memory-stage-scan`, `--memory-scan`. |
 
 ### Loop do worker
 
 1. `WorkerProc` inicia e carrega `sync-state.json`.
-2. `RefreshSaveCache` compara mtime do save; se mudou, le e parseia o ES3 como fallback inteiro.
-3. `EnsureGameRunning` abre o TaskBarHero via Steam se o processo nao existir.
-4. `RefreshLiveSaveCache` tenta ler o snapshot vivo do save em `bal` a cada ~500ms; se validar, promove `saveSource=memory`; se falhar, volta para o snapshot ES3 inteiro.
-5. Se SteamID estiver vazio no config e o save ativo tiver SteamID, o agente salva automaticamente.
-6. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda; mudancas estruturais do save ativo enviam imediatamente, e mudancas metricas pendentes sao enviadas no tick de ~10s para alimentar snapshots.
-7. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
-8. Eventos novos sao adicionados com `index` monotonicamente crescente.
-9. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
-10. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend.
-11. O loop para quando a janela/tray manda encerrar.
+2. `EnsureCompatibleGameVersion` compara `Version.txt` do jogo instalado com `kIl2CppMapGameVersion`; se divergir, bloqueia abertura/sync ate atualizar o mapa ou marcar `app.allow_game_version_mismatch=1`.
+3. `RefreshSaveCache` compara mtime do save; se mudou, le e parseia o ES3 como fallback inteiro.
+4. `EnsureGameRunning` abre o TaskBarHero via Steam se o processo nao existir.
+5. `RefreshLiveSaveCache` tenta ler o snapshot vivo do save em `bal` a cada ~500ms; se validar, promove `saveSource=memory`; se falhar, volta para o snapshot ES3 inteiro.
+6. Se SteamID estiver vazio no config e o save ativo tiver SteamID, o agente salva automaticamente.
+7. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda; mudancas estruturais do save ativo enviam imediatamente, e mudancas metricas pendentes sao enviadas no tick de ~10s para alimentar snapshots.
+8. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
+9. Eventos novos sao adicionados com `index` monotonicamente crescente.
+10. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
+11. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend quando `app.auto_export_dev_runtime=1`.
+12. O loop para quando a janela/tray manda encerrar.
 
 ### Configuracao local
 
@@ -94,6 +95,8 @@ Campos importantes:
 - `pairing_secret`: senha local usada para parear browsers.
 - autostart no registro do Windows.
 - `app.minimize_to_taskbar`: opcional; `0` por padrao minimiza o agent para a bandeja, `1` mantem minimizacao normal na taskbar.
+- `app.auto_export_dev_runtime`: opcional; em build de desenvolvimento, `1` por padrao atualiza o runtime local do frontend automaticamente, `0` deixa apenas a atualizacao manual.
+- `app.allow_game_version_mismatch`: opcional; `0` por padrao bloqueia abertura/sync quando a versao instalada do jogo diverge do mapa IL2CPP compilado, `1` libera manualmente para diagnostico.
 
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
 
@@ -114,7 +117,7 @@ Regras:
 - O agente cria icone na bandeja e continua rodando quando a janela e fechada.
 - Minimizar esconde o agente na bandeja por padrao; o menu de contexto da bandeja tem `Minimizar para taskbar` para alternar o comportamento e persistir em `config.ini`.
 - O menu da bandeja inclui `Esconder TBH`/`Mostrar TBH`, que alterna a visibilidade da janela principal de `TaskBarHero.exe`; o processo do jogo continua rodando e o worker segue lendo save/memoria normalmente.
-- Em build de desenvolvimento, a janela mostra `Atualizar dev` e o menu da bandeja mostra `Atualizar save local`; ambos exportam `save-summary.json`, `clears.json`, `log-history.json` e `watcher-status.json` para o runtime local. Esses controles nao existem em release.
+- Em build de desenvolvimento, a janela mostra `Atualizar dev` e o menu da bandeja mostra `Atualizar save local`; ambos exportam `save-summary.json`, `clears.json`, `log-history.json` e `watcher-status.json` para o runtime local. O menu da bandeja tambem mostra `Atualizar dev automaticamente` como toggle persistido em `app.auto_export_dev_runtime`. Esses controles nao existem em release.
 - O label de status e um controle `STATIC` com fundo solido; ao atualizar texto menor que o anterior, force repaint para evitar sobra visual.
 
 ### Arquivos de cache/local runtime
@@ -230,7 +233,9 @@ Validacao minima:
 - listas e arrays lidos com limites maximos defensivos;
 - resumo final tem SteamID valido.
 
-Se a leitura viva falhar, `RefreshLiveSaveCache` marca `has_live_save=false`, grava `saveFallbackReason` e promove o ultimo `file_save` lido por ES3. Nao misturar blocos de memoria e arquivo no mesmo payload.
+Se a leitura viva falhar antes de qualquer leitura viva valida nesta sessao, `RefreshLiveSaveCache` marca `has_live_save=false`, grava `saveFallbackReason` e promove o ultimo `file_save` lido por ES3. Nao misturar blocos de memoria e arquivo no mesmo payload.
+
+Se `ReadLiveSaveSummary` ja teve pelo menos uma leitura valida e uma leitura viva posterior falhar de forma transitoria, o agente deve manter o ultimo save ativo vindo de memoria em vez de promover imediatamente o ES3. Isso evita regressao temporaria de `currentStageKey`, gold e EXP para um autosave antigo enquanto o processo ainda esta aberto. O ES3 continua sendo fallback quando a leitura viva nunca funcionou nesta sessao ou quando o jogo fecha.
 
 `watcher-status.json` deve incluir:
 
@@ -275,6 +280,7 @@ Regras:
 - Evitar parsing por string quando o `JsonValue` ja permite navegar com chaves.
 - Se extrair novo array/objeto grande, considerar impacto no payload e no Postgres.
 - `equipmentBonuses` agrega somente os equipamentos da equipe ativa (`partyHeroLevels`); equipamentos serializados em `unlockedHeroes` nao devem somar bonus global para evitar duplicacao e incluir herois fora da composicao atual.
+- IDs unicos de item vindos do jogo sao `ulong` e frequentemente passam de `2^53`. No resumo enviado ao frontend, `uniqueId`, `itemUniqueId` e `equippedItemIds[]` devem sair como string quando diferentes de zero; zero pode continuar numerico para compatibilidade. Nunca compare esses IDs no navegador como `Number`, porque JavaScript arredonda e pode fazer inventario/equipamentos apontarem para o item errado.
 
 ## Leitura de memoria / LogManager / IL2CPP
 
@@ -288,6 +294,7 @@ Bloco sensivel:
 
 ```cpp
 // ===== BEGIN IL2CPP MAP (TaskBarHero <versao>) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"<versao>";
 constexpr uintptr_t kLogManagerTypeInfoRva = ...;
 constexpr uintptr_t kKlassStaticFieldsOffset = ...;
 constexpr uintptr_t kLogManagerListOffset = ...;
@@ -655,10 +662,12 @@ O script:
 
 Regra critica:
 
+- O refresh deve manter `kIl2CppMapGameVersion` igual ao `Version.txt` detectado; o companion usa essa constante para bloquear worker desatualizado antes de abrir o jogo.
 - Se o enum `EGradeType` ganhar grade novo, atualizar `GRADE_PT` no script.
 - Nao aceitar offset novo sem harness quando o jogo esta aberto e a verificacao viva e possivel.
 - Se usar `--no-live`, registre o risco: offsets dependentes de memoria podem ter sido preservados da versao anterior.
 - Para classes obfuscadas, prefira resolver campos por tipo estavel (`AccountSaveData`, `PlayerSaveData`, `MonsterInfoData`, `CurrencyInfoData`, `ObscuredLong`, `ObscuredFloat`, `Dictionary<int, vd>`) antes de depender de nomes como `bgaw`, `bepe` ou `beuv`, porque esses nomes podem mudar entre versoes.
+- Em `Monster`, os campos runtime logo apos `MonsterType` devem ser resolvidos pela sequencia de tipos `int, int, float, EStageType, int`, nao por nomes obfuscados (`bcq*`), porque os nomes mudam entre builds mesmo quando o layout permanece.
 - Se a verificacao viva do `LogManager` tiver menos de 3 eventos, o refresh deve preservar `kLogDataTextOffset`/`kLogDataClockOffset` atuais e avisar, nao abortar o release por falta de amostra.
 
 ## Ambiente e comandos

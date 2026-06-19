@@ -283,6 +283,28 @@ def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: 
         return field_offset_by_type(body, type_name, class_name)
 
 
+def monster_runtime_offsets(body: str) -> dict[str, int]:
+    fields = fields_of(body)
+    monster_type = field_offset(body, "MonsterType", "Monster")
+    tail = [(typ, fname, off) for typ, fname, off in fields if off > monster_type]
+    expected = ["int", "int", "float", "EStageType", "int"]
+    found: list[int] = []
+    start = 0
+    for expected_type in expected:
+        match_index = next((i for i in range(start, len(tail)) if tail[i][0] == expected_type), None)
+        if match_index is None:
+            raise SystemExit(f"Monster nao tem sequencia runtime esperada apos MonsterType: {expected}")
+        found.append(tail[match_index][2])
+        start = match_index + 1
+    return {
+        "runtime_int_a": found[0],
+        "runtime_int_b": found[1],
+        "runtime_float": found[2],
+        "stage_type": found[3],
+        "runtime_int_c": found[4],
+    }
+
+
 def static_field_offset_by_type(body: str, type_name: str, class_name: str) -> int:
     matches = [(fname, off) for typ, fname, off in fields_of(body, include_static=True) if typ == type_name]
     if not matches:
@@ -407,11 +429,12 @@ def extract_map(dump_dir: Path) -> dict:
     info["monster_spawn_manager_force_boss_wave_offset"] = field_offset(monster_spawn_manager, "IsForceEnterBossWave", "MonsterSpawnManager")
     info["monster_cache_offset"] = field_offset(monster, "cache", "Monster")
     info["monster_type_offset"] = field_offset(monster, "MonsterType", "Monster")
-    info["monster_runtime_int_a_offset"] = field_offset(monster, "bcqr", "Monster")
-    info["monster_runtime_int_b_offset"] = field_offset(monster, "bcqs", "Monster")
-    info["monster_runtime_float_offset"] = field_offset(monster, "bcqt", "Monster")
-    info["monster_stage_type_offset"] = field_offset(monster, "bcqu", "Monster")
-    info["monster_runtime_int_c_offset"] = field_offset(monster, "bcqv", "Monster")
+    runtime_monster = monster_runtime_offsets(monster)
+    info["monster_runtime_int_a_offset"] = runtime_monster["runtime_int_a"]
+    info["monster_runtime_int_b_offset"] = runtime_monster["runtime_int_b"]
+    info["monster_runtime_float_offset"] = runtime_monster["runtime_float"]
+    info["monster_stage_type_offset"] = runtime_monster["stage_type"]
+    info["monster_runtime_int_c_offset"] = runtime_monster["runtime_int_c"]
     info["monster_cache_info_data_offset"] = field_offset_by_type(monster_cache, "MonsterInfoData", "vb.ul")
     info["monster_info_monster_key_offset"] = field_offset(monster_info, "MonsterKey", "MonsterInfoData")
     info["monster_info_monster_type_offset"] = field_offset(monster_info, "MONSTERTYPE", "MonsterInfoData")
@@ -684,6 +707,7 @@ def _rebuild_main(text: str, version: str, info: dict) -> str:
     text_off = info.get("text_offset") or current("kLogDataTextOffset")
     clock_off = info.get("clock_offset") or current("kLogDataClockOffset")
     block = f"""// ===== BEGIN IL2CPP MAP (TaskBarHero {version}) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"{version}";
 constexpr uintptr_t kLogManagerTypeInfoRva = 0x{info['typeinfo_rva']:X};
 constexpr uintptr_t kKlassStaticFieldsOffset = 0x{static_off:X};
 constexpr uintptr_t kLogManagerListOffset = 0x{list_off:X};

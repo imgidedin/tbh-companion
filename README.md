@@ -73,6 +73,10 @@ amostra dos ultimos eventos) e atualiza automaticamente, entre marcadores:
 > Dica: o `release.ps1` ja roda este passo. Use o comando acima sozinho quando
 > quiser so atualizar o mapa sem gerar um release.
 
+Por padrao, o companion compara o `Version.txt` instalado com a versao compilada
+no bloco `IL2CPP MAP` e bloqueia abertura/sync se elas divergirem. Para
+diagnostico, marque **Permitir versão divergente** na janela do companion.
+
 Opcoes: `--game-dir "caminho\TaskbarHero"`, `--no-live` (so dump, preserva os
 offsets que dependem de verificacao viva), `--dry-run` (so mostra o que mudaria).
 Depois: `build.bat`, reinicie o agente e suba o frontend. Se o enum de raridade
@@ -103,8 +107,10 @@ A mesma rotina pode ser chamada por terminal com:
 build\TBH_Companion.exe --export-dev-runtime
 ```
 
-Em builds de desenvolvimento, o worker tambem atualiza esses arquivos
-automaticamente quando detecta mudanca no save ou novos eventos de historico.
+Em builds de desenvolvimento, o menu de bandeja tambem mostra o toggle
+**Atualizar dev automaticamente**. Quando ele esta ativo, o worker atualiza
+esses arquivos automaticamente ao detectar mudanca no save ou novos eventos de
+historico.
 Builds gerados por `scripts\release.ps1` desligam esse modo e nao exibem esses
 controles.
 

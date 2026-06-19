@@ -42,6 +42,7 @@ constexpr int IDC_OPEN = 1006;
 constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
 constexpr int IDC_EXPORT_DEV_RUNTIME = 1010;
+constexpr int IDC_ALLOW_VERSION_MISMATCH = 1011;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr int IDM_TRAY_OPEN = 2001;
@@ -50,6 +51,7 @@ constexpr int IDM_TRAY_EXIT = 2003;
 constexpr int IDM_TRAY_TOGGLE_TBH = 2004;
 constexpr int IDM_TRAY_MINIMIZE_TO_TASKBAR = 2005;
 constexpr int IDM_TRAY_EXPORT_DEV_RUNTIME = 2006;
+constexpr int IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME = 2007;
 constexpr bool kDevelopmentMode = TBH_DEVELOPMENT_MODE != 0;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
@@ -61,6 +63,7 @@ constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\TBHCompanionAgentSingl
 constexpr DWORD kLiveSavePollMs = 500;
 constexpr DWORD kLogMemoryPollMs = 2000;
 constexpr DWORD kMetricSaveSyncMs = 10000;
+constexpr DWORD kGameVersionCheckMs = 30000;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -68,6 +71,7 @@ HWND g_token = nullptr;
 HWND g_steam = nullptr;
 HWND g_pairing_secret = nullptr;
 HWND g_autostart = nullptr;
+HWND g_allow_version_mismatch = nullptr;
 HWND g_status = nullptr;
 HWND g_main_window = nullptr;
 HANDLE g_worker_stop = nullptr;
@@ -87,6 +91,8 @@ struct Config {
   std::wstring pairing_secret;
   bool auto_start = false;
   bool minimize_to_taskbar = false;
+  bool auto_export_dev_runtime = true;
+  bool allow_game_version_mismatch = false;
 };
 
 Config LoadConfig();
@@ -171,6 +177,9 @@ struct WorkerState {
   DWORD memory_pid = 0;
   DWORD last_memory_scan = 0;
   DWORD last_region_discovery = 0;
+  DWORD last_game_version_check = 0;
+  bool game_version_blocked = false;
+  std::wstring last_game_version_status;
   std::string last_payload_hash;
   std::string last_synced_save_hash;
   std::string last_synced_save_structural_hash;
@@ -276,6 +285,8 @@ void ShowTrayMenu(HWND hwnd) {
   AppendMenuW(menu, MF_STRING | (config.minimize_to_taskbar ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar");
   if (kDevelopmentMode) {
+    AppendMenuW(menu, MF_STRING | (config.auto_export_dev_runtime ? MF_CHECKED : MF_UNCHECKED),
+                IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME, L"Atualizar dev automaticamente");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXPORT_DEV_RUNTIME, L"Atualizar save local");
   }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -482,6 +493,8 @@ Config LoadConfig() {
 
   config.auto_start = IsAutoStartEnabled();
   config.minimize_to_taskbar = GetPrivateProfileIntW(L"app", L"minimize_to_taskbar", 0, path.c_str()) != 0;
+  config.auto_export_dev_runtime = GetPrivateProfileIntW(L"app", L"auto_export_dev_runtime", 1, path.c_str()) != 0;
+  config.allow_game_version_mismatch = GetPrivateProfileIntW(L"app", L"allow_game_version_mismatch", 0, path.c_str()) != 0;
 
   return config;
 }
@@ -494,6 +507,9 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"player", L"pairing_secret", config.pairing_secret.c_str(), path.c_str());
   WritePrivateProfileStringW(L"app", L"auto_start", config.auto_start ? L"1" : L"0", path.c_str());
   WritePrivateProfileStringW(L"app", L"minimize_to_taskbar", config.minimize_to_taskbar ? L"1" : L"0", path.c_str());
+  WritePrivateProfileStringW(L"app", L"auto_export_dev_runtime", config.auto_export_dev_runtime ? L"1" : L"0", path.c_str());
+  WritePrivateProfileStringW(L"app", L"allow_game_version_mismatch",
+                             config.allow_game_version_mismatch ? L"1" : L"0", path.c_str());
   SetAutoStart(config.auto_start);
 }
 
@@ -504,12 +520,17 @@ Config ReadConfigFromUi() {
   config.steam_id = GetWindowTextString(g_steam);
   config.pairing_secret = GetWindowTextString(g_pairing_secret);
   config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
-  config.minimize_to_taskbar = LoadConfig().minimize_to_taskbar;
+  Config saved = LoadConfig();
+  config.minimize_to_taskbar = saved.minimize_to_taskbar;
+  config.auto_export_dev_runtime = saved.auto_export_dev_runtime;
+  config.allow_game_version_mismatch =
+      g_allow_version_mismatch ? SendMessageW(g_allow_version_mismatch, BM_GETCHECK, 0, 0) == BST_CHECKED
+                               : saved.allow_game_version_mismatch;
   return config;
 }
 
 bool UiConfigReady() {
-  return g_server && g_token && g_steam && g_pairing_secret && g_autostart;
+  return g_server && g_token && g_steam && g_pairing_secret && g_autostart && g_allow_version_mismatch;
 }
 
 void SaveConfigFromUi() {
@@ -519,17 +540,19 @@ void SaveConfigFromUi() {
 
 std::string Utf8(const std::wstring& text) {
   if (text.empty()) return {};
-  int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
-  std::string out(size > 0 ? size - 1 : 0, '\0');
-  if (size > 1) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, out.data(), size, nullptr, nullptr);
+  int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+  std::string out(size > 0 ? size : 0, '\0');
+  if (size > 0) {
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size, nullptr, nullptr);
+  }
   return out;
 }
 
 std::wstring Widen(const std::string& text) {
   if (text.empty()) return {};
-  int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-  std::wstring out(size > 0 ? size - 1 : 0, L'\0');
-  if (size > 1) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), size);
+  int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+  std::wstring out(size > 0 ? size : 0, L'\0');
+  if (size > 0) MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size);
   return out;
 }
 
@@ -641,6 +664,25 @@ double JsonNumberDouble(const JsonValue* value, double fallback = 0) {
 
 bool IsZeroNumber(const JsonValue* value) {
   return value && value->type == JsonValue::Type::Number && JsonNumberDouble(value) == 0;
+}
+
+bool IsZeroId(const JsonValue* value) {
+  std::string key = JsonNumberKey(value);
+  return key.empty() || key == "0";
+}
+
+JsonValue StableIdValue(const JsonValue* value) {
+  std::string key = JsonNumberKey(value);
+  if (key.empty()) return JsonValue::Null();
+  if (key == "0") return JsonValue::Number(0LL);
+  return JsonValue::String(key);
+}
+
+JsonValue StableIdArray(const JsonValue* value) {
+  JsonValue out = JsonValue::Array();
+  if (!value || value->type != JsonValue::Type::Array) return out;
+  for (const auto& item : value->array) out.array.push_back(StableIdValue(&item));
+  return out;
 }
 
 class JsonParser {
@@ -1105,8 +1147,9 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.14) =====
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5DEC470;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.15) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.15";
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E0AF70;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
@@ -1114,11 +1157,11 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
-constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5DED200;
-constexpr uintptr_t kStageManagerTypeInfoRva = 0x5DECB38;
-constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5DEC660;
-constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D75538;
-constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D75720;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0BD00;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E0B638;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E0B160;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D94058;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D94240;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1144,10 +1187,10 @@ constexpr uintptr_t kPlayerSaveItemsOffset = 0x90;
 constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x98;
 constexpr uintptr_t kStageManagerStageStateOffset = 0x78;
 constexpr uintptr_t kStageManagerStageStartedOffset = 0x98;
-constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x108;
-constexpr uintptr_t kStageManagerRuntimeIntOffset = 0x118;
-constexpr uintptr_t kStageManagerRuntimeListAOffset = 0xD8;
-constexpr uintptr_t kStageManagerRuntimeListBOffset = 0xE0;
+constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0xD8;
+constexpr uintptr_t kStageManagerRuntimeIntOffset = 0xE8;
+constexpr uintptr_t kStageManagerRuntimeListAOffset = 0xC0;
+constexpr uintptr_t kStageManagerRuntimeListBOffset = 0xC8;
 constexpr uintptr_t kMonsterSpawnManagerMonsterListOffset = 0x28;
 constexpr uintptr_t kMonsterSpawnManagerDeadMonsterListOffset = 0x30;
 constexpr uintptr_t kMonsterSpawnManagerSummonedMonsterListOffset = 0x38;
@@ -2403,6 +2446,119 @@ bool DirectoryExists(const std::wstring& path) {
   return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool FileExists(const std::wstring& path) {
+  DWORD attrs = GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::wstring ReplaceAll(std::wstring value, const std::wstring& from, const std::wstring& to) {
+  if (from.empty()) return value;
+  size_t pos = 0;
+  while ((pos = value.find(from, pos)) != std::wstring::npos) {
+    value.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+  return value;
+}
+
+std::wstring EnvironmentString(const wchar_t* name) {
+  std::vector<wchar_t> buffer(32768);
+  DWORD length = GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) return L"";
+  return std::wstring(buffer.data(), length);
+}
+
+std::wstring ProcessImageDirectory(DWORD pid) {
+  if (!pid) return L"";
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) return L"";
+  std::vector<wchar_t> path(32768);
+  DWORD size = static_cast<DWORD>(path.size());
+  bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &size) != 0;
+  CloseHandle(process);
+  if (!ok || size == 0) return L"";
+  return ParentDir(std::wstring(path.data(), size));
+}
+
+void AddTaskBarHeroCandidate(std::vector<std::wstring>& candidates, const std::wstring& game_dir) {
+  if (game_dir.empty()) return;
+  candidates.push_back(game_dir);
+}
+
+void AddSteamLibraryCandidates(std::vector<std::wstring>& candidates, const std::wstring& steam_root) {
+  if (steam_root.empty()) return;
+  AddTaskBarHeroCandidate(candidates, steam_root + L"\\steamapps\\common\\TaskbarHero");
+
+  std::string text;
+  if (!ReadTextFile(steam_root + L"\\steamapps\\libraryfolders.vdf", text)) return;
+
+  std::regex path_re("\"path\"\\s*\"([^\"]+)\"");
+  for (std::sregex_iterator it(text.begin(), text.end(), path_re), end; it != end; ++it) {
+    std::wstring library = ReplaceAll(Widen((*it)[1].str()), L"\\\\", L"\\");
+    AddTaskBarHeroCandidate(candidates, library + L"\\steamapps\\common\\TaskbarHero");
+  }
+}
+
+std::wstring ReadTaskBarHeroVersionFile(const std::wstring& game_dir) {
+  std::wstring path = game_dir + L"\\Version.txt";
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return L"";
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024) {
+    CloseHandle(file);
+    return L"";
+  }
+  std::string text(static_cast<size_t>(size.QuadPart), '\0');
+  DWORD read = 0;
+  BOOL ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+  CloseHandle(file);
+  if (!ok || read != text.size()) return L"";
+
+  std::wstring version;
+  for (unsigned char ch : text) {
+    if (ch == 0xEF || ch == 0xBB || ch == 0xBF) continue;
+    version.push_back(static_cast<wchar_t>(ch));
+  }
+  return Trim(version);
+}
+
+std::wstring FindInstalledTaskBarHeroDir(std::vector<std::wstring>* checked_candidates = nullptr) {
+  std::vector<std::wstring> candidates;
+
+  DWORD pid = FindProcessIdByName(L"TaskBarHero.exe");
+  if (pid) AddTaskBarHeroCandidate(candidates, ProcessImageDirectory(pid));
+
+  std::wstring program_files_x86 = EnvironmentString(L"ProgramFiles(x86)");
+  std::wstring program_files = EnvironmentString(L"ProgramFiles");
+  AddSteamLibraryCandidates(candidates, program_files_x86 + L"\\Steam");
+  if (program_files != program_files_x86) AddSteamLibraryCandidates(candidates, program_files + L"\\Steam");
+
+  for (wchar_t drive = L'C'; drive <= L'Z'; ++drive) {
+    std::wstring root;
+    root.push_back(drive);
+    root += L":";
+    AddTaskBarHeroCandidate(candidates, root + L"\\SteamLibrary\\steamapps\\common\\TaskbarHero");
+    AddTaskBarHeroCandidate(candidates, root + L"\\Program Files (x86)\\Steam\\steamapps\\common\\TaskbarHero");
+  }
+
+  std::set<std::wstring> seen;
+  for (const std::wstring& candidate : candidates) {
+    if (candidate.empty() || !seen.insert(candidate).second) continue;
+    if (checked_candidates) checked_candidates->push_back(candidate);
+    if (FileExists(candidate + L"\\Version.txt")) return candidate;
+  }
+  return L"";
+}
+
+std::wstring InstalledTaskBarHeroVersion(std::wstring* game_dir = nullptr,
+                                         std::vector<std::wstring>* checked_candidates = nullptr) {
+  std::wstring dir = FindInstalledTaskBarHeroDir(checked_candidates);
+  if (game_dir) *game_dir = dir;
+  if (dir.empty()) return L"";
+  return ReadTaskBarHeroVersionFile(dir);
+}
+
 bool EnsureDirectoryTree(const std::wstring& dir) {
   if (dir.empty()) return false;
   if (DirectoryExists(dir)) return true;
@@ -3166,7 +3322,7 @@ JsonValue BuildSavedItemSummary(const JsonValue& saved_item,
                                               exp_bonus, gold_bonus, bonus_sources);
 
   JsonValue out = JsonValue::Object();
-  ObjectSet(out, "uniqueId", CopyOrNull(ObjectGet(saved_item, "UniqueId")));
+  ObjectSet(out, "uniqueId", StableIdValue(ObjectGet(saved_item, "UniqueId")));
   ObjectSet(out, "itemKey", CopyOrNull(item_key));
   ObjectSet(out, "name", item ? CopyOrNull(ObjectGet(*item, "name")) : JsonValue::Null());
   ObjectSet(out, "grade", item ? CopyOrNull(ObjectGet(*item, "grade")) : JsonValue::Null());
@@ -3234,7 +3390,7 @@ JsonValue BuildEquippedItems(const JsonValue& hero,
   JsonValue* target_bonus_sources = accumulate_bonuses ? &bonus_sources : &ignored_bonus_sources;
 
   for (const auto& unique_id : equipped_ids->array) {
-    if (IsZeroNumber(&unique_id)) continue;
+    if (IsZeroId(&unique_id)) continue;
     auto saved_it = item_by_uid.find(JsonNumberKey(&unique_id));
     if (saved_it == item_by_uid.end()) continue;
     const JsonValue* saved_item = saved_it->second;
@@ -3261,7 +3417,7 @@ JsonValue BuildHeroSummary(const JsonValue& hero, bool include_equipment,
   ObjectSet(out, "allocatedAbilityPoint", CopyOrNull(ObjectGet(hero, "AllocatedHeroAbilityPoint")));
   ObjectSet(out, "equippedSkillKey", CopyOrEmptyArray(ObjectGet(hero, "equippedSKillKey")));
   if (include_equipment) {
-    ObjectSet(out, "equippedItemIds", CopyOrEmptyArray(ObjectGet(hero, "equippedItemIds")));
+    ObjectSet(out, "equippedItemIds", StableIdArray(ObjectGet(hero, "equippedItemIds")));
     ObjectSet(out, "equippedItems", BuildEquippedItems(hero, item_by_uid, exp_bonus, gold_bonus, bonus_sources,
                                                        accumulate_equipment_bonuses));
   }
@@ -3358,8 +3514,8 @@ JsonValue BuildInventorySlotSummary(const JsonValue& slot,
   if (const JsonValue* unlocked_by_rune = ObjectGet(slot, "IsUnlockedByRune")) {
     ObjectSet(out, "unlockedByRune", *unlocked_by_rune);
   }
-  ObjectSet(out, "itemUniqueId", CopyOrNull(item_uid));
-  ObjectSet(out, "occupied", JsonValue::Bool(!IsZeroNumber(item_uid)));
+  ObjectSet(out, "itemUniqueId", StableIdValue(item_uid));
+  ObjectSet(out, "occupied", JsonValue::Bool(!IsZeroId(item_uid)));
 
   auto saved_it = item_by_uid.find(JsonNumberKey(item_uid));
   if (saved_it == item_by_uid.end()) {
@@ -3394,7 +3550,7 @@ JsonValue BuildInventoryTabSummary(const std::string& id,
     for (const auto& slot : source_slots->array) {
       const JsonValue* unlocked = SlotUnlockField(slot);
       bool is_unlocked = JsonBool(unlocked, false);
-      bool is_occupied = !IsZeroNumber(ObjectGet(slot, "ItemUniqueId"));
+      bool is_occupied = !IsZeroId(ObjectGet(slot, "ItemUniqueId"));
       if (is_unlocked) unlocked_count++;
       if (is_occupied) occupied_count++;
       if (is_unlocked) slots.array.push_back(BuildInventorySlotSummary(slot, item_by_uid));
@@ -4708,7 +4864,7 @@ bool RefreshLiveSaveCache(WorkerState& state, bool force = false) {
   bool had_live = state.has_live_save;
   state.has_live_save = false;
   state.live_save_error = error.empty() ? "leitura viva indisponivel" : error;
-  if (state.has_file_save) PromoteActiveSave(state, state.file_save);
+  if (!had_live && state.has_file_save) PromoteActiveSave(state, state.file_save);
   state.memory.watcher_json = WatcherStatusJson("cpp-agent save fallback", &state);
   return had_live;
 }
@@ -4730,8 +4886,64 @@ std::string WatcherStatusJson(const std::string& message, const WorkerState* sta
     if (!state->has_live_save && !state->live_save_error.empty()) {
       ObjectSet(watcher, "saveFallbackReason", JsonValue::String(state->live_save_error));
     }
+    ObjectSet(watcher, "gameVersionBlocked", JsonValue::Bool(state->game_version_blocked));
+    if (!state->last_game_version_status.empty()) {
+      ObjectSet(watcher, "gameVersionStatus", JsonValue::String(Utf8(state->last_game_version_status)));
+    }
   }
   return JsonSerialize(watcher);
+}
+
+bool EnsureCompatibleGameVersion(const Config& config, WorkerState& state, bool force = false) {
+  if (config.allow_game_version_mismatch) {
+    if (state.game_version_blocked) {
+      PostStatus(L"Bloqueio de versão ignorado pela configuração.");
+    }
+    state.game_version_blocked = false;
+    state.last_game_version_status.clear();
+    return true;
+  }
+
+  DWORD now = GetTickCount();
+  if (!force && !state.game_version_blocked && state.last_game_version_check != 0 &&
+      now - state.last_game_version_check < kGameVersionCheckMs) {
+    return true;
+  }
+  state.last_game_version_check = now;
+
+  std::wstring game_dir;
+  std::wstring installed_version = InstalledTaskBarHeroVersion(&game_dir);
+  std::wstring compiled_version = kIl2CppMapGameVersion;
+
+  if (installed_version.empty()) {
+    std::wstring status = L"Não consegui detectar a versão instalada do TaskBarHero; continuando sem bloquear.";
+    if (force || state.last_game_version_status != status) {
+      PostStatus(status);
+      state.last_game_version_status = status;
+      state.memory.watcher_json = WatcherStatusJson("game version unavailable", &state);
+    }
+    state.game_version_blocked = false;
+    return true;
+  }
+
+  if (installed_version != compiled_version) {
+    std::wstring status = L"Versão do jogo incompatível: jogo " + installed_version + L", companion " +
+                          compiled_version +
+                          L". Atualize o mapa antes de abrir/sincronizar ou marque Permitir versão divergente.";
+    if (!state.game_version_blocked || state.last_game_version_status != status) {
+      PostStatus(status);
+      state.last_game_version_status = status;
+    }
+    state.game_version_blocked = true;
+    state.memory.watcher_json = WatcherStatusJson("blocked: game version mismatch", &state);
+    return false;
+  }
+
+  std::wstring status = L"Versão do jogo OK: " + installed_version + L".";
+  if (force || state.game_version_blocked) PostStatus(status);
+  state.game_version_blocked = false;
+  state.last_game_version_status = status;
+  return true;
 }
 
 bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
@@ -4876,8 +5088,8 @@ std::wstring ExportDevRuntimeSnapshot() {
   return WriteDevRuntimeSnapshot(state.save, state.memory);
 }
 
-void AutoExportDevRuntimeSnapshot(const WorkerState& state, bool changed) {
-  if (!kDevelopmentMode || !changed || !state.has_save) return;
+void AutoExportDevRuntimeSnapshot(const WorkerState& state, bool changed, bool enabled) {
+  if (!kDevelopmentMode || !enabled || !changed || !state.has_save) return;
   if (state.memory.history_json == "null" || state.memory.clears_json == "null") return;
   static std::string last_signature;
   const std::vector<MemoryEvent>& events = state.memory.events;
@@ -4984,12 +5196,24 @@ DWORD WINAPI WorkerProc(LPVOID) {
   state.memory.watcher_json = WatcherStatusJson("worker starting", &state);
   LoadSyncState(state);
   PostStatus(L"Worker iniciado. Monitorando save e memoria.");
+  Config startup_config = LoadConfig();
+  while (!EnsureCompatibleGameVersion(startup_config, state, true)) {
+    if (WaitForSingleObject(g_worker_stop, 10000) != WAIT_TIMEOUT) {
+      PostStatus(L"Worker parado.");
+      return 0;
+    }
+    startup_config = LoadConfig();
+  }
   RefreshSaveCache(state);
   bool game_ready = EnsureGameRunning();
   bool first_sync_done = false;
 
   while (WaitForSingleObject(g_worker_stop, 1000) == WAIT_TIMEOUT) {
     Config config = LoadConfig();
+    if (!EnsureCompatibleGameVersion(config, state)) {
+      game_ready = false;
+      continue;
+    }
     bool save_changed = RefreshSaveCache(state);
     bool changed = save_changed;
 
@@ -5052,7 +5276,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
     bool memory_changed = RefreshMemoryCache(state);
     changed = memory_changed || changed;
-    AutoExportDevRuntimeSnapshot(state, save_changed || live_save_changed || memory_changed);
+    AutoExportDevRuntimeSnapshot(state, save_changed || live_save_changed || memory_changed,
+                                 config.auto_export_dev_runtime);
     if (memory_changed) {
       SyncCachedPayload(config, state, false, false);
     }
@@ -5155,6 +5380,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_pairing_secret = AddEdit(hwnd, IDC_PAIRING_SECRET, config.pairing_secret, 144, 212, 430, 28, font, true);
 
       g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 220, 24, font);
+      g_allow_version_mismatch = AddCheckbox(hwnd, IDC_ALLOW_VERSION_MISMATCH, L"Permitir versão divergente",
+                                             config.allow_game_version_mismatch, 344, 250, 250, 24, font);
 
       AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
       if (kDevelopmentMode) {
@@ -5195,6 +5422,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         Config config = ReadConfigFromUi();
         SaveConfig(config);
         SetStatus(config.auto_start ? L"Inicialização com Windows ativada." : L"Inicialização com Windows desativada.");
+      } else if (id == IDC_ALLOW_VERSION_MISMATCH) {
+        Config config = ReadConfigFromUi();
+        SaveConfig(config);
+        SetStatus(config.allow_game_version_mismatch ? L"Versão divergente permitida. Use só para diagnóstico."
+                                                     : L"Bloqueio de versão divergente ativado.");
       } else if (id == IDM_TRAY_OPEN) {
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
@@ -5207,6 +5439,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         config.minimize_to_taskbar = !config.minimize_to_taskbar;
         SaveConfig(config);
         SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
+      } else if (id == IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
+        Config config = LoadConfig();
+        config.auto_export_dev_runtime = !config.auto_export_dev_runtime;
+        SaveConfig(config);
+        SetStatus(config.auto_export_dev_runtime ? L"Atualização dev automática ativada." : L"Atualização dev automática desativada.");
       } else if (id == IDM_TRAY_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
         SaveConfig(ReadConfigFromUi());
         SetStatus(L"Atualizando save local...");
@@ -5351,6 +5588,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         WriteTextFile(TempComparePath(), result);
         LocalFree(argv);
         return result.rfind(L"OK:", 0) == 0 ? 0 : 2;
+      }
+      if (wcscmp(argv[i], L"--game-version-check") == 0) {
+        std::vector<std::wstring> checked;
+        std::wstring game_dir;
+        std::wstring installed_version = InstalledTaskBarHeroVersion(&game_dir, &checked);
+        JsonValue out = JsonValue::Object();
+        ObjectSet(out, "compiledVersion", JsonValue::String(Utf8(kIl2CppMapGameVersion)));
+        ObjectSet(out, "installedVersion", installed_version.empty()
+                                           ? JsonValue::Null()
+                                           : JsonValue::String(Utf8(installed_version)));
+        ObjectSet(out, "gameDir", game_dir.empty() ? JsonValue::Null() : JsonValue::String(Utf8(game_dir)));
+        JsonValue candidates = JsonValue::Array();
+        for (const std::wstring& candidate : checked) {
+          JsonValue row = JsonValue::Object();
+          ObjectSet(row, "path", JsonValue::String(Utf8(candidate)));
+          ObjectSet(row, "hasVersion", JsonValue::Bool(FileExists(candidate + L"\\Version.txt")));
+          candidates.array.push_back(std::move(row));
+        }
+        ObjectSet(out, "candidates", std::move(candidates));
+        bool ok = !installed_version.empty() && installed_version == kIl2CppMapGameVersion;
+        ObjectSet(out, "compatible", JsonValue::Bool(ok));
+        WriteTextFile(TempComparePath(), Widen(JsonSerialize(out)));
+        LocalFree(argv);
+        return ok ? 0 : 2;
       }
       if (wcscmp(argv[i], L"--memory-stage-scan") == 0) {
         std::wstring output = TempComparePath();
