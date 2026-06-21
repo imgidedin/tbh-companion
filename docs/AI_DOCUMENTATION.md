@@ -268,7 +268,7 @@ Dados extraidos:
 - stage atual e max stage
 - herois e equipe ativa
 - equipamentos e stats dos herois; `partyHeroLevels[].equippedItems` e `unlockedHeroes[].equippedItems` incluem os itens equipados para permitir comparacao de composicao no frontend; itens devem preservar `uniqueMod` para tooltips exibirem Stats Unicas de raridades altas
-- inventario, storage e stash de troca (`inventorySaveDatas`, `stashSaveDatas`, `tradingStashSaveDatas`) com slots desbloqueados, vazios e itens resolvidos por `itemSaveDatas`
+- inventario, storage e stash de troca (`inventorySaveDatas`, `stashSaveDatas`, `tradingStashSaveDatas`) com slots desbloqueados, vazios e itens resolvidos por `itemSaveDatas`; se um slot vier ocupado por `ItemUniqueId` mas o item correspondente ainda nao existir em `itemSaveDatas` naquele snapshot, o slot continua ocupado com `item: null`, `itemResolution: "missing-item-save"` e `itemPending: true`, e a aba publica `unresolvedSlots` para o frontend tratar como sincronizacao transitoria em vez de item desconhecido
 - pets e estados de unlock/viewed
 - runas e niveis
 - monster kills agregadas

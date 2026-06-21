@@ -3520,6 +3520,10 @@ JsonValue BuildInventorySlotSummary(const JsonValue& slot,
   auto saved_it = item_by_uid.find(JsonNumberKey(item_uid));
   if (saved_it == item_by_uid.end()) {
     ObjectSet(out, "item", JsonValue::Null());
+    if (!IsZeroId(item_uid)) {
+      ObjectSet(out, "itemResolution", JsonValue::String("missing-item-save"));
+      ObjectSet(out, "itemPending", JsonValue::Bool(true));
+    }
     return out;
   }
 
@@ -3544,15 +3548,18 @@ JsonValue BuildInventoryTabSummary(const std::string& id,
   long long total = 0;
   long long unlocked_count = 0;
   long long occupied_count = 0;
+  long long unresolved_count = 0;
 
   if (source_slots && source_slots->type == JsonValue::Type::Array) {
     total = static_cast<long long>(source_slots->array.size());
     for (const auto& slot : source_slots->array) {
       const JsonValue* unlocked = SlotUnlockField(slot);
       bool is_unlocked = JsonBool(unlocked, false);
-      bool is_occupied = !IsZeroId(ObjectGet(slot, "ItemUniqueId"));
+      const JsonValue* item_uid = ObjectGet(slot, "ItemUniqueId");
+      bool is_occupied = !IsZeroId(item_uid);
       if (is_unlocked) unlocked_count++;
       if (is_occupied) occupied_count++;
+      if (is_occupied && item_by_uid.find(JsonNumberKey(item_uid)) == item_by_uid.end()) unresolved_count++;
       if (is_unlocked) slots.array.push_back(BuildInventorySlotSummary(slot, item_by_uid));
     }
   }
@@ -3563,6 +3570,7 @@ JsonValue BuildInventoryTabSummary(const std::string& id,
   ObjectSet(tab, "unlockedSlots", JsonValue::Number(unlocked_count));
   ObjectSet(tab, "lockedSlots", JsonValue::Number((std::max)(0LL, total - unlocked_count)));
   ObjectSet(tab, "occupiedSlots", JsonValue::Number(occupied_count));
+  ObjectSet(tab, "unresolvedSlots", JsonValue::Number(unresolved_count));
   ObjectSet(tab, "emptySlots", JsonValue::Number((std::max)(0LL, unlocked_count - occupied_count)));
   ObjectSet(tab, "slots", std::move(slots));
   return tab;
