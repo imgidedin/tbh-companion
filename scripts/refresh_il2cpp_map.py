@@ -455,6 +455,8 @@ def extract_map(dump_dir: Path) -> dict:
     runtime_hero_manager = require_class(src, "vb.tz")
     runtime_hero = require_class(src, "vd")
     hero_info = require_class(src, "HeroInfoData")
+    runtime_backend_inventory = require_class(src, "wk")
+    backend_inventory_item = require_class(src, "InventoryItemData")
     info["stage_manager_typeinfo_rva"], info["stage_manager_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
         singleton_typeinfo_candidates(stage_manager, "StageManager", ["np<StageManager>_TypeInfo"]),
@@ -530,6 +532,18 @@ def extract_map(dump_dir: Path) -> dict:
     info["runtime_hero_allocated_ability_point_offset"] = runtime_hero_int_offsets[3]
     info["runtime_hero_exp_offset"] = field_offset_by_type(runtime_hero, "ObscuredFloat", "vd")
     info["hero_info_hero_key_offset"] = field_offset(hero_info, "HeroKey", "HeroInfoData")
+    info["runtime_backend_inventory_typeinfo_rva"], info["runtime_backend_inventory_typeinfo_name"] = find_typeinfo_rva(
+        dump_dir / "script.json",
+        ["wk_TypeInfo"],
+        "wk",
+    )
+    info["runtime_backend_inventory_items_offset"] = static_field_offset_by_type(
+        runtime_backend_inventory,
+        "List<InventoryItemData>",
+        "wk",
+    )
+    info["backend_inventory_item_unique_key_offset"] = field_offset(backend_inventory_item, "itemKey", "InventoryItemData")
+    info["backend_inventory_item_id_offset"] = field_offset(backend_inventory_item, "itemId", "InventoryItemData")
 
     return info
 
@@ -770,6 +784,7 @@ constexpr uintptr_t kStageManagerTypeInfoRva = 0x{info['stage_manager_typeinfo_r
 constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x{info['monster_spawn_manager_typeinfo_rva']:X};
 constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x{info['runtime_currency_manager_typeinfo_rva']:X};
 constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x{info['runtime_hero_manager_typeinfo_rva']:X};
+constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x{info['runtime_backend_inventory_typeinfo_rva']:X};
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x{info['save_manager_account_offset']:X};
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x{info['save_manager_player_offset']:X};
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x{info['account_player_id_offset']:X};
@@ -827,6 +842,9 @@ constexpr uintptr_t kRuntimeHeroAbilityPointOffset = 0x{info['runtime_hero_abili
 constexpr uintptr_t kRuntimeHeroAllocatedAbilityPointOffset = 0x{info['runtime_hero_allocated_ability_point_offset']:X};
 constexpr uintptr_t kRuntimeHeroExpOffset = 0x{info['runtime_hero_exp_offset']:X};
 constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x{info['hero_info_hero_key_offset']:X};
+constexpr uintptr_t kRuntimeBackendInventoryItemsOffset = 0x{info['runtime_backend_inventory_items_offset']:X};
+constexpr uintptr_t kBackendInventoryItemUniqueKeyOffset = 0x{info['backend_inventory_item_unique_key_offset']:X};
+constexpr uintptr_t kBackendInventoryItemIdOffset = 0x{info['backend_inventory_item_id_offset']:X};
 static const char* const kGradeNames[] = {{
 {grades_inner},
 }};
@@ -924,6 +942,11 @@ def main() -> int:
           f"ability=0x{info['runtime_hero_ability_point_offset']:X} "
           f"allocatedAbility=0x{info['runtime_hero_allocated_ability_point_offset']:X} "
           f"exp=0x{info['runtime_hero_exp_offset']:X}")
+    print(f"[*] Runtime backend inventory: {info.get('runtime_backend_inventory_typeinfo_name', '?')} "
+          f"RVA=0x{info['runtime_backend_inventory_typeinfo_rva']:X} "
+          f"items=0x{info['runtime_backend_inventory_items_offset']:X} "
+          f"uniqueKey=0x{info['backend_inventory_item_unique_key_offset']:X} "
+          f"itemId=0x{info['backend_inventory_item_id_offset']:X}")
     print(f"[*] EGradeType: {info['grade_names']}")
 
     if not args.no_live:

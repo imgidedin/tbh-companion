@@ -64,8 +64,8 @@ constexpr DWORD kLiveSavePollMs = 500;
 constexpr DWORD kLogMemoryPollMs = 2000;
 constexpr DWORD kMetricSaveSyncMs = 10000;
 constexpr DWORD kGameVersionCheckMs = 30000;
-constexpr int kLiveSaveInventoryResolveAttempts = 4;
-constexpr DWORD kLiveSaveInventoryResolveDelayMs = 35;
+constexpr int kLiveSaveInventoryResolveAttempts = 2;
+constexpr DWORD kLiveSaveInventoryResolveDelayMs = 10;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -655,6 +655,14 @@ std::string JsonNumberKey(const JsonValue* value) {
   return text;
 }
 
+bool IsDecimalDigits(const std::string& value) {
+  if (value.empty()) return false;
+  for (char c : value) {
+    if (c < '0' || c > '9') return false;
+  }
+  return true;
+}
+
 double JsonNumberDouble(const JsonValue* value, double fallback = 0) {
   if (!value || value->type != JsonValue::Type::Number) return fallback;
   try {
@@ -1164,6 +1172,7 @@ constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E17A90;
 constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E174C0;
 constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DA04A0;
 constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DA0688;
+constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DF7AD0;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1221,6 +1230,9 @@ constexpr uintptr_t kRuntimeHeroAbilityPointOffset = 0xEC;
 constexpr uintptr_t kRuntimeHeroAllocatedAbilityPointOffset = 0xFC;
 constexpr uintptr_t kRuntimeHeroExpOffset = 0x10C;
 constexpr uintptr_t kHeroInfoHeroKeyOffset = 0x30;
+constexpr uintptr_t kRuntimeBackendInventoryItemsOffset = 0x0;
+constexpr uintptr_t kBackendInventoryItemUniqueKeyOffset = 0x28;
+constexpr uintptr_t kBackendInventoryItemIdOffset = 0x30;
 static const char* const kGradeNames[] = {
     "COMMON", "UNCOMMON", "RARE", "LEGENDARY", "IMMORTAL",
     "ARCANA", "BEYOND", "CELESTIAL", "DIVINE", "COSMIC",
@@ -2970,23 +2982,52 @@ std::map<std::string, const JsonValue*> IndexItemSavesWithCache(const JsonValue*
   return index;
 }
 
-int CountMissingInventoryItemSaves(const JsonValue& save) {
+struct InventoryItemResolutionReport {
+  int missing_count = 0;
+  std::vector<std::string> sample_ids;
+};
+
+InventoryItemResolutionReport CheckInventoryItemResolution(const JsonValue& save) {
   const JsonValue* player = ObjectGet(save, "PlayerSaveData");
-  auto item_by_uid = IndexArrayByNumberKey(player ? ObjectGet(*player, "itemSaveDatas") : nullptr, "UniqueId");
-  int missing = 0;
-  auto count_missing = [&](const JsonValue* slots) {
+  const JsonValue* account = ObjectGet(save, "AccountSaveData");
+  auto item_by_uid = IndexItemSavesWithCache(account, player);
+  InventoryItemResolutionReport report;
+  auto count_missing = [&](const char* tab, const JsonValue* slots) {
     if (!slots || slots->type != JsonValue::Type::Array) return;
     for (const auto& slot : slots->array) {
       std::string key = JsonNumberKey(ObjectGet(slot, "ItemUniqueId"));
-      if (!key.empty() && key != "0" && item_by_uid.find(key) == item_by_uid.end()) ++missing;
+      if (key.empty() || key == "0" || item_by_uid.find(key) != item_by_uid.end()) continue;
+      ++report.missing_count;
+      if (report.sample_ids.size() < 6) {
+        std::string index = JsonNumberKey(ObjectGet(slot, "Index"));
+        report.sample_ids.push_back(std::string(tab) + "[" + (index.empty() ? "?" : index) + "]=" + key);
+      }
     }
   };
   if (player) {
-    count_missing(ObjectGet(*player, "inventorySaveDatas"));
-    count_missing(ObjectGet(*player, "stashSaveDatas"));
-    count_missing(ObjectGet(*player, "tradingStashSaveDatas"));
+    count_missing("inventory", ObjectGet(*player, "inventorySaveDatas"));
+    count_missing("storage", ObjectGet(*player, "stashSaveDatas"));
+    count_missing("trade", ObjectGet(*player, "tradingStashSaveDatas"));
   }
-  return missing;
+  return report;
+}
+
+std::string InventoryItemResolutionError(const InventoryItemResolutionReport& report) {
+  std::ostringstream out;
+  out << "snapshot vivo com item sem ItemSaveData: " << report.missing_count;
+  if (!report.sample_ids.empty()) {
+    out << " (";
+    for (size_t i = 0; i < report.sample_ids.size(); ++i) {
+      if (i) out << ", ";
+      out << report.sample_ids[i];
+    }
+    out << ")";
+  }
+  return out.str();
+}
+
+bool IsTransientLiveSaveError(const std::string& error) {
+  return error.rfind("snapshot vivo com item sem ItemSaveData:", 0) == 0;
 }
 
 JsonValue CopyOrNull(const JsonValue* value) {
@@ -4177,6 +4218,80 @@ bool ReadRuntimeHeroMetrics(HANDLE process, uintptr_t module_base, JsonValue& he
   return !heroes.array.empty();
 }
 
+std::string ReadBackendInventoryUniqueKey(HANDLE process, uintptr_t item) {
+  std::string unique_key = Utf8(ReadManagedString(process, ReadPtr(process, item + kBackendInventoryItemUniqueKeyOffset)));
+  if (!unique_key.empty()) return unique_key;
+
+  uintptr_t obscured = ReadPtr(process, item + 0x10);
+  if (!obscured) return {};
+  return Utf8(ReadManagedString(process, ReadPtr(process, obscured + 0x28)));
+}
+
+bool ReadRuntimeBackendInventoryItems(HANDLE process, uintptr_t module_base, JsonValue& items,
+                                      std::string* error = nullptr) {
+  items = JsonValue::Array();
+  uintptr_t statics = ResolveStaticFields(process, module_base, kRuntimeBackendInventoryTypeInfoRva);
+  if (!statics) {
+    if (error) *error = "static_fields de runtime backend inventory nulo";
+    return false;
+  }
+
+  uintptr_t list = ReadPtr(process, statics + kRuntimeBackendInventoryItemsOffset);
+  return ReadLiveObjectList(process, list, 16384, "RuntimeBackendInventoryItem",
+      [&](uintptr_t obj, JsonValue& row, std::string*) {
+        std::string unique_key = ReadBackendInventoryUniqueKey(process, obj);
+        int item_id = 0;
+        ReadScalar(process, obj + kBackendInventoryItemIdOffset, item_id);
+        if (item_id <= 0) item_id = DecodeRuntimeHeroObscuredInt(process, obj + 0x18);
+
+        row = JsonValue::Object();
+        ObjectSet(row, "UniqueId", IsDecimalDigits(unique_key) ? JsonValue::Number(unique_key) : JsonValue::String(unique_key));
+        ObjectSet(row, "ItemKey", JsonValue::Number(static_cast<long long>(item_id)));
+        return true;
+      }, items, error, false);
+}
+
+int AppendRuntimeBackendItemsToSaveRoot(HANDLE process, uintptr_t module_base, JsonValue& root,
+                                        std::string* error = nullptr) {
+  JsonValue* player = ObjectGet(root, "PlayerSaveData");
+  JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
+  if (!player || !item_saves || item_saves->type != JsonValue::Type::Array) return 0;
+
+  JsonValue runtime_items;
+  std::string runtime_error;
+  if (!ReadRuntimeBackendInventoryItems(process, module_base, runtime_items, &runtime_error)) {
+    if (error && !runtime_error.empty()) *error = runtime_error;
+    return 0;
+  }
+
+  std::set<std::string> referenced_ids = ReferencedItemIds(player);
+  std::map<std::string, const JsonValue*> existing = IndexArrayByNumberKey(item_saves, "UniqueId");
+  int appended = 0;
+  for (const JsonValue& runtime_item : runtime_items.array) {
+    std::string unique_id = JsonNumberKey(ObjectGet(runtime_item, "UniqueId"));
+    std::string item_key = JsonNumberKey(ObjectGet(runtime_item, "ItemKey"));
+    if (!IsDecimalDigits(unique_id) || unique_id == "0" || !IsDecimalDigits(item_key) || item_key == "0") continue;
+    if (referenced_ids.find(unique_id) == referenced_ids.end()) continue;
+    if (existing.find(unique_id) != existing.end()) continue;
+
+    JsonValue item = JsonValue::Object();
+    ObjectSet(item, "ItemKey", JsonValue::Number(item_key));
+    ObjectSet(item, "UniqueId", JsonValue::Number(unique_id));
+    ObjectSet(item, "IsChaotic", JsonValue::Bool(false));
+    ObjectSet(item, "IsBlocked", JsonValue::Bool(false));
+    ObjectSet(item, "IsServerPendingItem", JsonValue::Bool(false));
+    ObjectSet(item, "EnchantCount", JsonValue::Array());
+    ObjectSet(item, "EnchantData", JsonValue::Array());
+    ObjectSet(item, "DecorationAppliedTotalCount", JsonValue::Number(0LL));
+    ObjectSet(item, "EngravingAppliedTotalCount", JsonValue::Number(0LL));
+    ObjectSet(item, "InscriptionAppliedTotalCount", JsonValue::Number(0LL));
+    item_saves->array.push_back(std::move(item));
+    existing[unique_id] = &item_saves->array.back();
+    ++appended;
+  }
+  return appended;
+}
+
 bool IsPlausibleRuntimeStageKey(int stage_key) {
   int difficulty = stage_key / 1000;
   int act = (stage_key % 1000) / 100;
@@ -4638,6 +4753,7 @@ bool ReadLiveStageMetrics(DWORD pid, JsonValue& out, std::string* error = nullpt
       JsonValue root;
       std::string save_error;
       if (BuildLiveSaveRoot(process, save_manager, root, &save_error)) {
+        AppendRuntimeBackendItemsToSaveRoot(process, module_base, root);
         JsonValue summary = BuildSaveSummaryJson(root);
         ObjectSet(out, "saveStageKey", CopyOrNull(ObjectGet(summary, "currentStageKey")));
         ObjectSet(out, "saveStageWave", CopyOrNull(ObjectGet(summary, "currentStageWave")));
@@ -4656,6 +4772,7 @@ bool ReadLiveStageMetrics(DWORD pid, JsonValue& out, std::string* error = nullpt
 }
 
 bool FillSaveSummaryFromRoot(const JsonValue& save, const std::string& source, SaveSummary& summary) {
+  if (CheckInventoryItemResolution(save).missing_count > 0) return false;
   JsonValue full_summary = BuildSaveSummaryJson(save);
   summary = SaveSummary();
   summary.source = source;
@@ -4701,14 +4818,21 @@ bool ReadLiveSaveSummary(DWORD pid, SaveSummary& summary, std::string* error = n
 
     JsonValue root;
     bool root_read = false;
+    InventoryItemResolutionReport inventory_report;
     for (int attempt = 0; attempt < kLiveSaveInventoryResolveAttempts; ++attempt) {
       root_read = BuildLiveSaveRoot(process, instance, root, error);
       if (!root_read) break;
+      AppendRuntimeBackendItemsToSaveRoot(process, module_base, root);
       ApplyRuntimeMetricsToSaveRoot(process, module_base, root);
-      if (CountMissingInventoryItemSaves(root) == 0 || attempt + 1 >= kLiveSaveInventoryResolveAttempts) break;
+      inventory_report = CheckInventoryItemResolution(root);
+      if (inventory_report.missing_count == 0 || attempt + 1 >= kLiveSaveInventoryResolveAttempts) break;
       Sleep(kLiveSaveInventoryResolveDelayMs);
     }
     if (!root_read) break;
+    if (inventory_report.missing_count > 0) {
+      if (error) *error = InventoryItemResolutionError(inventory_report);
+      break;
+    }
     if (!FillSaveSummaryFromRoot(root, "memory", summary)) {
       fail("snapshot vivo sem SteamID valido");
       break;
@@ -4768,6 +4892,7 @@ bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason
   std::string live_error;
   if (ReadLiveSaveSummary(pid, summary, &live_error)) return true;
   if (fallback_reason) *fallback_reason = live_error;
+  if (pid && IsTransientLiveSaveError(live_error)) return false;
   return ReadSaveSummary(summary);
 }
 
@@ -4970,9 +5095,21 @@ bool RefreshLiveSaveCache(WorkerState& state, bool force = false) {
     return changed;
   }
 
+  std::string normalized_error = error.empty() ? "leitura viva indisponivel" : error;
+  if (IsTransientLiveSaveError(normalized_error)) {
+    bool changed_error = state.live_save_error != normalized_error;
+    state.live_save_error = normalized_error;
+    if (!state.has_live_save && state.has_save && state.save.source == "save") {
+      state.has_save = false;
+    }
+    state.memory.watcher_json = WatcherStatusJson("cpp-agent live save reader aguardando inventario consistente", &state);
+    if (changed_error) PostStatus(Widen(normalized_error));
+    return false;
+  }
+
   bool had_live = state.has_live_save;
   state.has_live_save = false;
-  state.live_save_error = error.empty() ? "leitura viva indisponivel" : error;
+  state.live_save_error = normalized_error;
   if (!had_live && state.has_file_save) PromoteActiveSave(state, state.file_save);
   state.memory.watcher_json = WatcherStatusJson("cpp-agent save fallback", &state);
   return had_live;
@@ -4994,6 +5131,8 @@ std::string WatcherStatusJson(const std::string& message, const WorkerState* sta
     ObjectSet(watcher, "lastLiveSaveReadMs", JsonValue::Number(static_cast<long long>(state->last_live_save_read_ms)));
     if (!state->has_live_save && !state->live_save_error.empty()) {
       ObjectSet(watcher, "saveFallbackReason", JsonValue::String(state->live_save_error));
+    } else if (state->has_live_save && !state->live_save_error.empty()) {
+      ObjectSet(watcher, "liveSaveWarning", JsonValue::String(state->live_save_error));
     }
     ObjectSet(watcher, "gameVersionBlocked", JsonValue::Bool(state->game_version_blocked));
     if (!state->last_game_version_status.empty()) {
