@@ -64,6 +64,8 @@ constexpr DWORD kLiveSavePollMs = 500;
 constexpr DWORD kLogMemoryPollMs = 2000;
 constexpr DWORD kMetricSaveSyncMs = 10000;
 constexpr DWORD kGameVersionCheckMs = 30000;
+constexpr int kLiveSaveInventoryResolveAttempts = 4;
+constexpr DWORD kLiveSaveInventoryResolveDelayMs = 35;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -2894,6 +2896,99 @@ std::map<std::string, const JsonValue*> IndexArrayByNumberKey(const JsonValue* a
   return index;
 }
 
+std::map<std::string, JsonValue> g_item_save_cache_by_uid;
+std::string g_item_save_cache_owner_key;
+
+void AddNonZeroJsonId(const JsonValue* value, std::set<std::string>& ids) {
+  std::string key = JsonNumberKey(value);
+  if (!key.empty() && key != "0") ids.insert(key);
+}
+
+void CollectArrayNumberIds(const JsonValue* array, const std::string& field, std::set<std::string>& ids) {
+  if (!array || array->type != JsonValue::Type::Array) return;
+  for (const auto& item : array->array) AddNonZeroJsonId(ObjectGet(item, field), ids);
+}
+
+void CollectSlotItemIds(const JsonValue* slots, std::set<std::string>& ids) {
+  CollectArrayNumberIds(slots, "ItemUniqueId", ids);
+}
+
+void CollectHeroEquippedItemIds(const JsonValue* heroes, std::set<std::string>& ids) {
+  if (!heroes || heroes->type != JsonValue::Type::Array) return;
+  for (const auto& hero : heroes->array) {
+    const JsonValue* equipped = ObjectGet(hero, "equippedItemIds");
+    if (!equipped || equipped->type != JsonValue::Type::Array) continue;
+    for (const auto& item_id : equipped->array) AddNonZeroJsonId(&item_id, ids);
+  }
+}
+
+std::string SaveOwnerKey(const JsonValue* account) {
+  std::string owner = JsonStringValue(account ? ObjectGet(*account, "ownerSteamId") : nullptr);
+  if (!owner.empty()) return owner;
+  return JsonStringValue(account ? ObjectGet(*account, "playerId") : nullptr);
+}
+
+std::set<std::string> ReferencedItemIds(const JsonValue* player) {
+  std::set<std::string> ids;
+  if (!player) return ids;
+  CollectArrayNumberIds(ObjectGet(*player, "itemSaveDatas"), "UniqueId", ids);
+  CollectSlotItemIds(ObjectGet(*player, "inventorySaveDatas"), ids);
+  CollectSlotItemIds(ObjectGet(*player, "stashSaveDatas"), ids);
+  CollectSlotItemIds(ObjectGet(*player, "tradingStashSaveDatas"), ids);
+  CollectHeroEquippedItemIds(ObjectGet(*player, "heroSaveDatas"), ids);
+  return ids;
+}
+
+void RefreshItemSaveCache(const JsonValue* account, const JsonValue* player) {
+  std::string owner_key = SaveOwnerKey(account);
+  if (owner_key != g_item_save_cache_owner_key) {
+    g_item_save_cache_owner_key = owner_key;
+    g_item_save_cache_by_uid.clear();
+  }
+
+  const JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
+  if (item_saves && item_saves->type == JsonValue::Type::Array) {
+    for (const auto& item : item_saves->array) {
+      std::string key = JsonNumberKey(ObjectGet(item, "UniqueId"));
+      if (!key.empty() && key != "0") g_item_save_cache_by_uid[key] = item;
+    }
+  }
+
+  std::set<std::string> referenced_ids = ReferencedItemIds(player);
+  for (auto it = g_item_save_cache_by_uid.begin(); it != g_item_save_cache_by_uid.end();) {
+    if (referenced_ids.find(it->first) == referenced_ids.end()) it = g_item_save_cache_by_uid.erase(it);
+    else ++it;
+  }
+}
+
+std::map<std::string, const JsonValue*> IndexItemSavesWithCache(const JsonValue* account, const JsonValue* player) {
+  RefreshItemSaveCache(account, player);
+  auto index = IndexArrayByNumberKey(player ? ObjectGet(*player, "itemSaveDatas") : nullptr, "UniqueId");
+  for (auto& item : g_item_save_cache_by_uid) {
+    if (index.find(item.first) == index.end()) index[item.first] = &item.second;
+  }
+  return index;
+}
+
+int CountMissingInventoryItemSaves(const JsonValue& save) {
+  const JsonValue* player = ObjectGet(save, "PlayerSaveData");
+  auto item_by_uid = IndexArrayByNumberKey(player ? ObjectGet(*player, "itemSaveDatas") : nullptr, "UniqueId");
+  int missing = 0;
+  auto count_missing = [&](const JsonValue* slots) {
+    if (!slots || slots->type != JsonValue::Type::Array) return;
+    for (const auto& slot : slots->array) {
+      std::string key = JsonNumberKey(ObjectGet(slot, "ItemUniqueId"));
+      if (!key.empty() && key != "0" && item_by_uid.find(key) == item_by_uid.end()) ++missing;
+    }
+  };
+  if (player) {
+    count_missing(ObjectGet(*player, "inventorySaveDatas"));
+    count_missing(ObjectGet(*player, "stashSaveDatas"));
+    count_missing(ObjectGet(*player, "tradingStashSaveDatas"));
+  }
+  return missing;
+}
+
 JsonValue CopyOrNull(const JsonValue* value) {
   return value ? *value : JsonValue::Null();
 }
@@ -3602,11 +3697,10 @@ JsonValue BuildSaveSummaryJson(const JsonValue& save) {
   const JsonValue* pets = player ? ObjectGet(*player, "PetSaveData") : nullptr;
   const JsonValue* runes = player ? ObjectGet(*player, "RuneSaveData") : nullptr;
   const JsonValue* attributes = player ? ObjectGet(*player, "attributeSaveDatas") : nullptr;
-  const JsonValue* item_saves = player ? ObjectGet(*player, "itemSaveDatas") : nullptr;
   const JsonValue* aggregates = player ? ObjectGet(*player, "aggregateSaveDatas") : nullptr;
 
   auto hero_by_key = IndexArrayByNumberKey(heroes, "heroKey");
-  auto item_by_uid = IndexArrayByNumberKey(item_saves, "UniqueId");
+  auto item_by_uid = IndexItemSavesWithCache(account, player);
 
   double exp_bonus = 0;
   double gold_bonus = 0;
@@ -4606,8 +4700,15 @@ bool ReadLiveSaveSummary(DWORD pid, SaveSummary& summary, std::string* error = n
     if (!instance) { fail("singleton do save manager ainda nao criado"); break; }
 
     JsonValue root;
-    if (!BuildLiveSaveRoot(process, instance, root, error)) break;
-    ApplyRuntimeMetricsToSaveRoot(process, module_base, root);
+    bool root_read = false;
+    for (int attempt = 0; attempt < kLiveSaveInventoryResolveAttempts; ++attempt) {
+      root_read = BuildLiveSaveRoot(process, instance, root, error);
+      if (!root_read) break;
+      ApplyRuntimeMetricsToSaveRoot(process, module_base, root);
+      if (CountMissingInventoryItemSaves(root) == 0 || attempt + 1 >= kLiveSaveInventoryResolveAttempts) break;
+      Sleep(kLiveSaveInventoryResolveDelayMs);
+    }
+    if (!root_read) break;
     if (!FillSaveSummaryFromRoot(root, "memory", summary)) {
       fail("snapshot vivo sem SteamID valido");
       break;
