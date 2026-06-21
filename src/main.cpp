@@ -1147,9 +1147,9 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.15) =====
-constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.15";
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E0AF70;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.17) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.17";
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E172D0;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
@@ -1157,11 +1157,11 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
-constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0BD00;
-constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E0B638;
-constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E0B160;
-constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D94058;
-constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D94240;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E18158;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E17A90;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E174C0;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DA04A0;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DA0688;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1187,10 +1187,10 @@ constexpr uintptr_t kPlayerSaveItemsOffset = 0x90;
 constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x98;
 constexpr uintptr_t kStageManagerStageStateOffset = 0x78;
 constexpr uintptr_t kStageManagerStageStartedOffset = 0x98;
-constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0xD8;
-constexpr uintptr_t kStageManagerRuntimeIntOffset = 0xE8;
-constexpr uintptr_t kStageManagerRuntimeListAOffset = 0xC0;
-constexpr uintptr_t kStageManagerRuntimeListBOffset = 0xC8;
+constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x110;
+constexpr uintptr_t kStageManagerRuntimeIntOffset = 0x138;
+constexpr uintptr_t kStageManagerRuntimeListAOffset = 0xE0;
+constexpr uintptr_t kStageManagerRuntimeListBOffset = 0xE8;
 constexpr uintptr_t kMonsterSpawnManagerMonsterListOffset = 0x28;
 constexpr uintptr_t kMonsterSpawnManagerDeadMonsterListOffset = 0x30;
 constexpr uintptr_t kMonsterSpawnManagerSummonedMonsterListOffset = 0x38;

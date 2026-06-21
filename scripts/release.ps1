@@ -23,8 +23,17 @@
   Pasta do repo tbh-farm-local-frontend. Por padrao usa o repo irmao.
 
 .PARAMETER ExportedProject
-  Pasta ExportedProject do AssetRipper. Obrigatoria quando o frontend-pack da
-  versao atual ainda nao existe.
+  Pasta ExportedProject do AssetRipper. Opcional; quando omitida e o
+  frontend-pack da versao atual nao existe, o release tenta exportar pelo
+  AssetRipper configurado.
+
+.PARAMETER AssetRipperExe
+  Executavel do AssetRipper. Aceita AssetRipper.GUI.Free.exe em modo web/headless
+  ou um CLI real quando usado com -AssetRipperMode cli.
+
+.PARAMETER AssetRipperConfig
+  JSON local com assetRipper.exe/mode/port/exportRoot. Por padrao tenta o
+  config.local.json do repo irmao tbh-compiler, quando existir.
 
 .PARAMETER SkipMap
   Pula a etapa de recalcular o mapa IL2CPP (usa o main.cpp como esta).
@@ -61,6 +70,12 @@ param(
   [string]$GameDir,
   [string]$FrontendDir,
   [string]$ExportedProject,
+  [string]$AssetRipperExe,
+  [string]$AssetRipperMode,
+  [string[]]$AssetRipperArgs,
+  [string]$AssetRipperConfig,
+  [string]$ExportRoot,
+  [int]$AssetRipperPort = -1,
   [switch]$SkipMap,
   [switch]$SkipFrontend,
   [switch]$ForceAssetExport,
@@ -79,16 +94,26 @@ $AgentDir = Split-Path -Parent $PSScriptRoot         # raiz do repo do agente
 $DefaultFrontendDir = Join-Path (Split-Path -Parent $AgentDir) "tbh-farm-local-frontend"
 $ExePath = Join-Path $AgentDir "build\TBH_Companion.exe"
 $DistDir = Join-Path $AgentDir "dist"
+$AssetRipperWorkDir = Join-Path $PSScriptRoot "exported-assets\assetripper-auto"
+$DefaultAssetRipperConfig = Join-Path (Split-Path -Parent $AgentDir) "tbh-compiler\config.local.json"
 $MapScript = Join-Path $PSScriptRoot "refresh_il2cpp_map.py"
 $BuildBat = Join-Path $AgentDir "build.bat"
 $ProcessScript = Join-Path $PSScriptRoot "companion_process.ps1"
 $ExportUnityScript = Join-Path $PSScriptRoot "export_unity_assets.ps1"
 $Git = @("-C", $AgentDir)                            # roda git sempre no repo do agente
+$script:AssetRipperConfigDir = $AgentDir
+$GameExe = "TaskbarHero.exe"
 
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Fail($msg) { throw $msg }
-function Resolve-FullPath([string]$path) {
-  $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path)
+function Resolve-FullPath([string]$path, [string]$baseDir = $null) {
+  if (-not $path) { return $null }
+  $candidate = $path
+  if (-not [System.IO.Path]::IsPathRooted($candidate)) {
+    $root = if ($baseDir) { $baseDir } else { (Get-Location).Path }
+    $candidate = Join-Path $root $candidate
+  }
+  $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($candidate)
 }
 function ConvertTo-SafeName([string]$value) {
   $invalid = [System.IO.Path]::GetInvalidFileNameChars()
@@ -104,6 +129,267 @@ function Exec([scriptblock]$cmd) {
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try { & $cmd } finally { $ErrorActionPreference = $old }
+}
+function Find-GameDir([string]$explicit) {
+  if ($explicit) {
+    $full = Resolve-FullPath $explicit
+    if (Test-Path -LiteralPath (Join-Path $full $GameExe)) { return $full }
+    Fail "GameDir invalido: nao encontrei $GameExe em $full"
+  }
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+  $steamRoots = @(
+    "C:\Program Files (x86)\Steam",
+    "C:\Program Files\Steam"
+  )
+  foreach ($steamRoot in $steamRoots) {
+    $vdf = Join-Path $steamRoot "steamapps\libraryfolders.vdf"
+    if (Test-Path -LiteralPath $vdf) {
+      $content = [System.IO.File]::ReadAllText($vdf)
+      $matches = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+      foreach ($match in $matches) {
+        $library = $match.Groups[1].Value.Replace("\\", "\")
+        $candidates.Add((Join-Path $library "steamapps\common\TaskbarHero")) | Out-Null
+      }
+    }
+  }
+
+  foreach ($drive in "C","D","E","F","G") {
+    $candidates.Add("$drive`:\SteamLibrary\steamapps\common\TaskbarHero") | Out-Null
+    $candidates.Add("$drive`:\Program Files (x86)\Steam\steamapps\common\TaskbarHero") | Out-Null
+  }
+
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath (Join-Path $candidate $GameExe)) {
+      return (Resolve-FullPath $candidate)
+    }
+  }
+  return $null
+}
+function Read-JsonFile([string]$path) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
+  return [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+}
+function ConfigValue([object]$root, [string]$name, $fallback = $null) {
+  if ($null -eq $root) { return $fallback }
+  if ($root.PSObject.Properties.Name -contains $name) {
+    $value = $root.$name
+    if ($null -ne $value -and "$value" -ne "") { return $value }
+  }
+  return $fallback
+}
+function Get-AssetRipperSettings() {
+  $configPath = $null
+  if ($AssetRipperConfig) {
+    $configPath = Resolve-FullPath $AssetRipperConfig
+  } elseif (Test-Path -LiteralPath $DefaultAssetRipperConfig) {
+    $configPath = Resolve-FullPath $DefaultAssetRipperConfig
+  }
+  if ($configPath) {
+    Write-Host "    AssetRipper config: $configPath"
+    $script:AssetRipperConfigDir = Split-Path -Parent $configPath
+    return (Read-JsonFile $configPath)
+  }
+  return $null
+}
+function Join-ProcessArguments([string[]]$arguments) {
+  return ($arguments | ForEach-Object {
+    $value = "$_"
+    if ($value -match '^[A-Za-z0-9_\-./:=]+$') { return $value }
+    '"' + $value.Replace('\', '\\').Replace('"', '\"') + '"'
+  }) -join " "
+}
+function Expand-AssetRipperArgs([string[]]$args, [string]$resolvedGameDir, [string]$resolvedExportRoot, [string]$version) {
+  $expanded = New-Object System.Collections.Generic.List[string]
+  foreach ($arg in $args) {
+    $expanded.Add(
+      $arg.
+        Replace("{GameDir}", $resolvedGameDir).
+        Replace("{ExportRoot}", $resolvedExportRoot).
+        Replace("{Version}", $version).
+        Replace("{AgentDir}", $AgentDir)
+    ) | Out-Null
+  }
+  return $expanded.ToArray()
+}
+function Find-ExportedProject([string]$root) {
+  $fullRoot = Resolve-FullPath $root
+  if (Test-Path -LiteralPath (Join-Path $fullRoot "Assets")) { return $fullRoot }
+
+  $direct = Join-Path $fullRoot "ExportedProject"
+  if (Test-Path -LiteralPath (Join-Path $direct "Assets")) { return (Resolve-FullPath $direct) }
+
+  $candidate = Get-ChildItem -LiteralPath $fullRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "Assets") } |
+    Sort-Object FullName |
+    Select-Object -First 1
+  if ($candidate) { return $candidate.FullName }
+  return $null
+}
+function Get-AvailablePort([object]$settings) {
+  if ($AssetRipperPort -gt 0) { return $AssetRipperPort }
+  $configured = [int](ConfigValue ($settings.assetRipper) "port" 0)
+  if ($configured -gt 0) { return $configured }
+
+  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+  try {
+    $listener.Start()
+    return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+  } finally {
+    $listener.Stop()
+  }
+}
+function Wait-AssetRipperWeb([int]$port) {
+  $baseUrl = "http://127.0.0.1:$port"
+  for ($i = 0; $i -lt 80; $i++) {
+    try {
+      Invoke-WebRequest -Uri "$baseUrl/" -UseBasicParsing -TimeoutSec 2 | Out-Null
+      return $baseUrl
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  Fail "AssetRipper headless nao respondeu em $baseUrl."
+}
+function Invoke-AssetRipperPost([string]$baseUrl, [string]$path, [hashtable]$body, [int]$timeoutSec) {
+  $formBody = ($body.GetEnumerator() | ForEach-Object {
+    $key = [System.Uri]::EscapeDataString("$($_.Key)")
+    $value = "$($_.Value)"
+    if ($value -match '^[A-Za-z]:\\') { $value = $value.Replace('\', '/') }
+    "$key=$([System.Uri]::EscapeDataString($value))"
+  }) -join "&"
+  try {
+    Invoke-WebRequest `
+      -Uri "$baseUrl$path" `
+      -Method Post `
+      -Body $formBody `
+      -ContentType "application/x-www-form-urlencoded" `
+      -UseBasicParsing `
+      -TimeoutSec $timeoutSec | Out-Null
+  } catch {
+    $response = $_.Exception.Response
+    if ($response -and [int]$response.StatusCode -eq 302) { return }
+    throw
+  }
+}
+function Get-AssetRipperExportRoot([object]$settings, [string]$version) {
+  $root = if ($ExportRoot) { $ExportRoot } else { ConfigValue ($settings.assetRipper) "exportRoot" }
+  if ($root) { return (Resolve-FullPath $root $script:AssetRipperConfigDir) }
+
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  return (Join-Path $AssetRipperWorkDir "AssetRipper-$(ConvertTo-SafeName $version)-$stamp")
+}
+function Resolve-AssetRipperExe([object]$settings) {
+  $exe = if ($AssetRipperExe) { $AssetRipperExe } else { ConfigValue ($settings.assetRipper) "exe" }
+  if ($exe) { return (Resolve-FullPath $exe $script:AssetRipperConfigDir) }
+
+  foreach ($name in @("AssetRipper.GUI.Free.exe", "AssetRipper.CLI.exe", "AssetRipper.exe")) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+  }
+  return $null
+}
+function Invoke-AssetRipperWebExport([string]$resolvedExe, [string]$resolvedGameDir, [string]$version, [object]$settings) {
+  $resolvedRoot = Get-AssetRipperExportRoot $settings $version
+  if (Test-Path -LiteralPath $resolvedRoot) {
+    $hasFiles = @(Get-ChildItem -LiteralPath $resolvedRoot -Force -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0
+    if ($hasFiles -and -not $ForceAssetExport) {
+      Fail "ExportRoot nao esta vazio: $resolvedRoot. Use -ForceAssetExport ou escolha outro -ExportRoot."
+    }
+  } else {
+    New-Item -ItemType Directory -Path $resolvedRoot -Force | Out-Null
+  }
+  New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+  $logPath = Join-Path $DistDir "assetripper-web-$(ConvertTo-SafeName $version)-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+  $port = Get-AvailablePort $settings
+
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = $resolvedExe
+  $psi.Arguments = Join-ProcessArguments @("--headless", "--port", "$port", "--log", "--log-path", $logPath)
+  $psi.WorkingDirectory = Split-Path -Parent $resolvedExe
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  Step "Rodando AssetRipper Web headless"
+  Write-Host "    exe:   $resolvedExe"
+  Write-Host "    porta: $port"
+  Write-Host "    out:   $resolvedRoot"
+  Write-Host "    log:   $logPath"
+
+  $process = [System.Diagnostics.Process]::Start($psi)
+  try {
+    $baseUrl = Wait-AssetRipperWeb $port
+    Step "Carregando pasta do jogo no AssetRipper"
+    Invoke-AssetRipperPost $baseUrl "/LoadFolder" @{ path = $resolvedGameDir } 300
+    Step "Exportando Unity Project pelo AssetRipper"
+    Invoke-AssetRipperPost $baseUrl "/Export/UnityProject" @{ path = $resolvedRoot } 1800
+
+    $project = Find-ExportedProject $resolvedRoot
+    if (-not $project) {
+      Fail "AssetRipper terminou, mas nao encontrei ExportedProject/Assets dentro de $resolvedRoot. Veja $logPath."
+    }
+    return $project
+  } finally {
+    if ($process -and -not $process.HasExited) {
+      try { $process.Kill($true) } catch { $process.Kill() }
+      [void]$process.WaitForExit(5000)
+    }
+  }
+}
+function Invoke-AssetRipperCliExport([string]$resolvedExe, [string]$resolvedGameDir, [string]$version, [object]$settings) {
+  if ($AssetRipperArgs -and $AssetRipperArgs.Count) {
+    $args = $AssetRipperArgs
+  } elseif ($settings.assetRipper -and $settings.assetRipper.args) {
+    $args = @($settings.assetRipper.args)
+  } else {
+    $args = @("{GameDir}", "-o", "{ExportRoot}")
+  }
+
+  $resolvedRoot = Get-AssetRipperExportRoot $settings $version
+  New-Item -ItemType Directory -Path $resolvedRoot -Force | Out-Null
+  New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+  $logPath = Join-Path $DistDir "assetripper-cli-$(ConvertTo-SafeName $version)-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+  $expandedArgs = Expand-AssetRipperArgs $args $resolvedGameDir $resolvedRoot $version
+
+  Step "Rodando AssetRipper CLI"
+  Write-Host "    exe:  $resolvedExe"
+  Write-Host "    args: $($expandedArgs -join ' ')"
+  Exec { & $resolvedExe @expandedArgs 2>&1 | Tee-Object -FilePath $logPath }
+  if ($LASTEXITCODE -ne 0) { Fail "AssetRipper CLI falhou. Veja $logPath" }
+
+  $project = Find-ExportedProject $resolvedRoot
+  if (-not $project) {
+    Fail "AssetRipper terminou, mas nao encontrei ExportedProject/Assets dentro de $resolvedRoot. Ajuste -AssetRipperArgs."
+  }
+  return $project
+}
+function Invoke-AssetRipperExport([string]$resolvedGameDir, [string]$version, [object]$settings) {
+  if ($ExportedProject) { return (Resolve-FullPath $ExportedProject) }
+
+  $configuredProject = ConfigValue ($settings.assetRipper) "exportedProject"
+  if ($configuredProject) { return (Resolve-FullPath $configuredProject $script:AssetRipperConfigDir) }
+
+  $resolvedExe = Resolve-AssetRipperExe $settings
+  if (-not $resolvedExe) {
+    Fail "AssetRipper nao configurado. Passe -AssetRipperExe ou configure assetRipper.exe em $DefaultAssetRipperConfig."
+  }
+  if (-not (Test-Path -LiteralPath $resolvedExe)) {
+    Fail "AssetRipperExe nao encontrado: $resolvedExe"
+  }
+
+  $mode = if ($AssetRipperMode) { $AssetRipperMode } else { ConfigValue ($settings.assetRipper) "mode" "" }
+  if (-not $mode) {
+    $leaf = [System.IO.Path]::GetFileName($resolvedExe).ToLowerInvariant()
+    $mode = if ($leaf -like "*gui*") { "web" } else { "cli" }
+  }
+  $mode = "$mode".ToLowerInvariant()
+  if ($mode -eq "web" -or $mode -eq "gui" -or $mode -eq "headless") {
+    return Invoke-AssetRipperWebExport $resolvedExe $resolvedGameDir $version $settings
+  }
+  if ($mode -eq "cli") {
+    return Invoke-AssetRipperCliExport $resolvedExe $resolvedGameDir $version $settings
+  }
+  Fail "AssetRipperMode invalido: $mode. Use 'web' para AssetRipper.GUI.Free.exe ou 'cli' para um CLI real."
 }
 function StopCompanion() {
   Exec { & powershell -NoProfile -ExecutionPolicy Bypass -File $ProcessScript -ExePath $ExePath -Stop }
@@ -131,14 +417,16 @@ function Test-FrontendPack([object]$pack) {
     (Test-Path (Join-Path $pack.Data "raw-csv"))
   )
 }
-function Ensure-FrontendPack([object]$pack, [string]$resolvedExportedProject, [string]$resolvedGameDir) {
+function Ensure-FrontendPack([object]$pack, [string]$resolvedExportedProject, [string]$resolvedGameDir, [string]$version) {
   if ((Test-FrontendPack $pack) -and -not $ForceAssetExport) {
     Write-Host "    frontend-pack existente: $($pack.Pack)"
-    return
+    return $resolvedExportedProject
   }
 
   if (-not $resolvedExportedProject) {
-    Fail "Nao existe frontend-pack valido em $($pack.Pack). Passe -ExportedProject `"C:\caminho\ExportedProject`" para gerar assets antes do release, ou use -SkipFrontend conscientemente."
+    Step "frontend-pack da versao atual nao existe; exportando assets do jogo..."
+    $settings = Get-AssetRipperSettings
+    $resolvedExportedProject = Invoke-AssetRipperExport $resolvedGameDir $version $settings
   }
   if (-not (Test-Path (Join-Path $resolvedExportedProject "Assets"))) {
     Fail "ExportedProject invalido: nao encontrei Assets em $resolvedExportedProject"
@@ -154,11 +442,12 @@ function Ensure-FrontendPack([object]$pack, [string]$resolvedExportedProject, [s
   if ($ForceAssetExport) { $exportArgs += "-Force" }
   if ($NoContactSheets) { $exportArgs += "-NoContactSheets" }
 
-  Exec { & powershell @exportArgs }
+  Exec { & powershell @exportArgs | Out-Host }
   if ($LASTEXITCODE -ne 0) { Fail "export_unity_assets.ps1 falhou." }
   if (-not (Test-FrontendPack $pack)) {
     Fail "export_unity_assets.ps1 concluiu, mas nao gerou frontend-pack valido em $($pack.Pack)"
   }
+  return $resolvedExportedProject
 }
 function Invoke-FrontendRelease([object]$pack, [string]$resolvedFrontendDir, [string]$resolvedExportedProject, [string]$resolvedGameDir, [string]$version) {
   if (-not (Test-Path (Join-Path $resolvedFrontendDir "scripts\rebuild-from-agent-pack.ps1"))) {
@@ -224,9 +513,8 @@ try {
   if ($LASTEXITCODE -ne 0) { Fail "gh nao autenticado. Rode: gh auth login" }
 
   $gameArg = @()
-  $resolvedGameDir = $null
-  if ($GameDir) {
-    $resolvedGameDir = Resolve-FullPath $GameDir
+  $resolvedGameDir = Find-GameDir $GameDir
+  if ($resolvedGameDir) {
     $gameArg = @("--game-dir", $resolvedGameDir)
   }
 
@@ -264,7 +552,7 @@ try {
     }
 
     $pack = Get-FrontendPackInfo $version
-    Ensure-FrontendPack $pack $resolvedExportedProject $resolvedGameDir
+    $resolvedExportedProject = Ensure-FrontendPack $pack $resolvedExportedProject $resolvedGameDir $version
     Invoke-FrontendRelease $pack $resolvedFrontendDir $resolvedExportedProject $resolvedGameDir $version
     $frontendReleaseCompleted = $true
   }

@@ -413,7 +413,7 @@ Etapas:
 
 1. Recalcula mapa IL2CPP para a versao atual do jogo.
 2. Detecta a versao do jogo.
-3. Se `-SkipFrontend` nao foi usado, garante `exported-assets\TaskBarHero-<versao>\frontend-pack\`; quando o pack ainda nao existe, exige `-ExportedProject` e chama `scripts\export_unity_assets.ps1 -OrganizeExportedProject`.
+3. Se `-SkipFrontend` nao foi usado, garante `exported-assets\TaskBarHero-<versao>\frontend-pack\`; quando o pack ainda nao existe, usa `-ExportedProject` ou exporta automaticamente pelo AssetRipper configurado e depois chama `scripts\export_unity_assets.ps1 -OrganizeExportedProject`.
 4. Chama `../tbh-farm-local-frontend/scripts/rebuild-from-agent-pack.ps1` com o pack da versao atual; em release real, passa `-Commit -Push` para publicar o frontend antes do GitHub Release do agente.
 5. Compila `build\TBH_Companion.exe` via `build.bat --no-restart --release`, desligando `TBH_DEVELOPMENT_MODE`.
 6. Escolhe tag.
@@ -428,9 +428,14 @@ Flags:
 - `-DryRun`: nao commita, nao envia e nao publica.
 - `-GameDir`: caminho do TaskBarHero.
 - `-FrontendDir`: caminho do repo `tbh-farm-local-frontend`; padrao e repo irmao.
-- `-ExportedProject`: caminho do `ExportedProject` do AssetRipper; obrigatorio quando o `frontend-pack` da versao atual ainda nao existe.
+- `-ExportedProject`: caminho do `ExportedProject` do AssetRipper; quando omitido e o `frontend-pack` da versao atual nao existe, o release tenta gerar esse export automaticamente.
+- `-AssetRipperExe`: caminho do `AssetRipper.GUI.Free.exe` ou de um CLI real; se omitido, o release tenta ler `..\tbh-compiler\config.local.json` e depois procurar no PATH.
+- `-AssetRipperMode`: `web`/`gui`/`headless` para `AssetRipper.GUI.Free.exe`, ou `cli` para um CLI real.
+- `-AssetRipperArgs`: argumentos do modo CLI, com placeholders `{GameDir}`, `{ExportRoot}`, `{Version}` e `{AgentDir}`.
+- `-AssetRipperConfig`: JSON local com `assetRipper.exe`, `mode`, `port`, `exportRoot`, `args` e/ou `exportedProject`; padrao e `..\tbh-compiler\config.local.json` se existir.
+- `-ExportRoot`: pasta onde o AssetRipper automatico deve gravar o `ExportedProject`; se omitida, usa `scripts\exported-assets\assetripper-auto\AssetRipper-<versao>-<timestamp>`.
 - `-SkipFrontend`: pula export/rebuild/push do frontend; use apenas para release sem mudanca de jogo/frontend.
-- `-ForceAssetExport`: recria o `frontend-pack` da versao atual a partir de `-ExportedProject`.
+- `-ForceAssetExport`: recria o `frontend-pack` da versao atual e permite reutilizar um `ExportRoot` existente.
 - `-NoContactSheets`: pula contact sheets quando o release precisar gerar `frontend-pack`.
 - `-LogPath`: caminho opcional do transcript; por padrao o script grava `dist\release-<timestamp>.log`.
 
@@ -438,7 +443,7 @@ Regras:
 
 - `scripts\release.ps1` deve iniciar transcript antes dos pre-requisitos e imprimir o caminho do log em sucesso ou falha.
 - Use `imgidedin/tbh-companion` para comandos `gh --repo`; a URL `.git` fica reservada ao remote Git.
-- Release normal deve ser total: agente e frontend ficam sincronizados com a mesma versao de assets/dados do jogo. Se o pack da versao nao existe e nenhum `-ExportedProject` foi informado, o script deve falhar antes de build/commit/publish.
+- Release normal deve ser total: agente e frontend ficam sincronizados com a mesma versao de assets/dados do jogo. Se o pack da versao nao existe, o script deve tentar gerar o export via `-ExportedProject` ou AssetRipper configurado; so deve falhar antes de build/commit/publish quando nao conseguir gerar um `frontend-pack` valido.
 - `-DryRun` pode rodar rebuild/export local, mas nao deve passar `-Commit -Push` ao frontend nem publicar o GitHub Release do agente.
 
 Pre-requisitos:
@@ -448,6 +453,7 @@ Pre-requisitos:
 - GitHub CLI `gh` autenticado.
 - `py` no PATH.
 - Node/npm no PATH para o rebuild do frontend.
+- AssetRipper configurado quando o `frontend-pack` da versao atual ainda nao existir. O modo testado localmente usa `AssetRipper.GUI.Free.exe --headless --port <porta>` e API web local (`/LoadFolder`, `/Export/UnityProject`).
 - Repo `tbh-farm-local-frontend` disponivel como irmao do agente ou via `-FrontendDir`.
 - Jogo instalado; para verificacao viva, jogo aberto.
 
@@ -658,7 +664,9 @@ O script:
 7. Patcha:
    - `src/main.cpp`
    - `../tbh-farm-local-frontend/server.js`
-   - `../tbh-farm-local-frontend/public/calculator.js`
+   - `../tbh-farm-local-frontend/public/app/history-domain.js`
+
+Regra de manutencao: campos runtime do `StageManager` nao devem depender apenas de um nome obfuscado fixo. O refresh tenta nomes conhecidos, mas deve cair para heuristicas estruturais quando updates renomearem esses campos: float antes de `CancellationTokenSource`, int depois de `OpeningDirection` e o par `List<bn>`. Isso evita bloquear release por rename como ocorreu no `TaskBarHero 1.00.17`.
 
 Regra critica:
 
@@ -802,7 +810,7 @@ Validar:
 - Saida do script mostra `Runtime currency` com TypeInfo de `vb.tp`, offset da lista de currencies e offset do `ObscuredLong` usado por `vb.tq`.
 - Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offsets de level, ability, allocatedAbility e EXP em `vd`.
 - `src/main.cpp` foi patchado dentro dos marcadores.
-- Frontend `server.js` e `public/calculator.js` recebem mapa de raridade se mudou.
+- Frontend `server.js` e `public/app/history-domain.js` recebem mapa de raridade se mudou.
 
 ### Harness de sync remoto
 
@@ -910,7 +918,7 @@ Validar:
 ### Skill: alterar export de assets
 
 1. Leia `export_unity_assets.ps1` e `extract_unity_localization.py`.
-2. Use AssetRipper GUI + `-OrganizeExportedProject` como fluxo principal.
+2. Use `release.ps1` como orquestrador principal quando a versao do jogo mudou; ele deve chamar AssetRipper automaticamente se o `frontend-pack` ainda nao existir. Para diagnostico isolado, use AssetRipper GUI + `-OrganizeExportedProject`.
 3. Mantenha `frontend-pack` estavel para o frontend.
 4. Se criar nova categoria, atualizar `Ensure-PortableTree` e manifest.
 5. Gerar contact sheets quando possivel.
@@ -922,7 +930,7 @@ Validar:
 2. Rode `scripts\release.ps1 -DryRun`.
 3. Rode release real apenas quando build/mapa estiverem validados.
 4. Nao esconder falhas de `gh`, `git`, `build.bat` ou map refresh.
-5. Se o pack da versao ainda nao existe, passe `-ExportedProject`; nao use `-SkipFrontend` para update normal de versao do jogo.
+5. Se o pack da versao ainda nao existe, deixe o release gerar via AssetRipper configurado ou passe `-ExportedProject`; nao use `-SkipFrontend` para update normal de versao do jogo.
 6. Depois do release, validar download do GitHub Release e conferir que o frontend tambem recebeu push.
 
 ## Seguranca e governanca

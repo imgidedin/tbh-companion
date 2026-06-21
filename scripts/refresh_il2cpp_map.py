@@ -19,7 +19,7 @@ List<LogData> do LogManager mudam. Este script:
   5. Atualiza, entre marcadores:
        - src/main.cpp                       (bloco IL2CPP MAP + kGradeNames)
        - ../tbh-farm-local-frontend/server.js          (gradePt)
-       - ../tbh-farm-local-frontend/public/calculator.js (HISTORY_GRADE_PT)
+       - ../tbh-farm-local-frontend/public/app/history-domain.js (HISTORY_GRADE_PT)
 
 Uso:
   py scripts/refresh_il2cpp_map.py [--game-dir DIR] [--no-live] [--dry-run]
@@ -47,7 +47,7 @@ AGENT_DIR = SCRIPT_DIR.parent
 REPO_ROOT = AGENT_DIR.parent
 MAIN_CPP = AGENT_DIR / "src" / "main.cpp"
 SERVER_JS = REPO_ROOT / "tbh-farm-local-frontend" / "server.js"
-CALCULATOR_JS = REPO_ROOT / "tbh-farm-local-frontend" / "public" / "calculator.js"
+HISTORY_DOMAIN_JS = REPO_ROOT / "tbh-farm-local-frontend" / "public" / "app" / "history-domain.js"
 CACHE_DIR = SCRIPT_DIR / ".cache"
 
 PROCESS_NAME = "TaskBarHero.exe"
@@ -262,6 +262,13 @@ def field_offset(body: str, name: str, class_name: str) -> int:
     raise SystemExit(f"campo {class_name}.{name} nao encontrado no dump.")
 
 
+def field_offset_any_name(body: str, names: list[str], class_name: str) -> int | None:
+    for typ, fname, off in fields_of(body):
+        if fname in names:
+            return off
+    return None
+
+
 def field_offset_by_type(body: str, type_name: str, class_name: str) -> int:
     matches = [(fname, off) for typ, fname, off in fields_of(body) if typ == type_name]
     if not matches:
@@ -281,6 +288,47 @@ def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: 
         return field_offset(body, name, class_name)
     except SystemExit:
         return field_offset_by_type(body, type_name, class_name)
+
+
+def stage_manager_runtime_offsets(body: str) -> dict[str, int]:
+    fields = fields_of(body)
+
+    runtime_float = field_offset_any_name(body, ["bdha", "bdhx"], "StageManager")
+    if runtime_float is None:
+        cts_offsets = [off for typ, _fname, off in fields if typ == "CancellationTokenSource"]
+        if not cts_offsets:
+            raise SystemExit("campo StageManager CancellationTokenSource nao encontrado para inferir runtime float.")
+        cts_offset = min(cts_offsets)
+        candidates = [(fname, off) for typ, fname, off in fields if typ == "float" and off < cts_offset]
+        if not candidates:
+            raise SystemExit("campo StageManager runtime float nao encontrado por heuristica.")
+        runtime_float = max(candidates, key=lambda item: item[1])[1]
+
+    runtime_int = field_offset_any_name(body, ["bdhc", "bdhz"], "StageManager")
+    if runtime_int is None:
+        opening_offsets = [off for typ, _fname, off in fields if typ == "OpeningDirection"]
+        if not opening_offsets:
+            raise SystemExit("campo StageManager OpeningDirection nao encontrado para inferir runtime int.")
+        opening_offset = max(opening_offsets)
+        candidates = [(fname, off) for typ, fname, off in fields if typ == "int" and off > opening_offset]
+        if not candidates:
+            raise SystemExit("campo StageManager runtime int nao encontrado por heuristica.")
+        runtime_int = min(candidates, key=lambda item: item[1])[1]
+
+    list_a = field_offset_any_name(body, ["bdgx", "bdhu"], "StageManager")
+    list_b = field_offset_any_name(body, ["bdgy", "bdhv"], "StageManager")
+    if list_a is None or list_b is None:
+        list_offsets = [off for typ, _fname, off in fields if typ == "List<bn>"]
+        if len(list_offsets) < 2:
+            raise SystemExit("campos StageManager List<bn> insuficientes para inferir listas runtime.")
+        list_a, list_b = sorted(list_offsets)[:2]
+
+    return {
+        "float": runtime_float,
+        "int": runtime_int,
+        "list_a": list_a,
+        "list_b": list_b,
+    }
 
 
 def monster_runtime_offsets(body: str) -> dict[str, int]:
@@ -419,10 +467,11 @@ def extract_map(dump_dir: Path) -> dict:
     )
     info["stage_manager_stage_state_offset"] = field_offset(stage_manager, "stageState", "StageManager")
     info["stage_manager_stage_started_offset"] = field_offset(stage_manager, "b_StageStart", "StageManager")
-    info["stage_manager_runtime_float_offset"] = field_offset(stage_manager, "bdha", "StageManager")
-    info["stage_manager_runtime_int_offset"] = field_offset(stage_manager, "bdhc", "StageManager")
-    info["stage_manager_runtime_list_a_offset"] = field_offset(stage_manager, "bdgx", "StageManager")
-    info["stage_manager_runtime_list_b_offset"] = field_offset(stage_manager, "bdgy", "StageManager")
+    stage_runtime = stage_manager_runtime_offsets(stage_manager)
+    info["stage_manager_runtime_float_offset"] = stage_runtime["float"]
+    info["stage_manager_runtime_int_offset"] = stage_runtime["int"]
+    info["stage_manager_runtime_list_a_offset"] = stage_runtime["list_a"]
+    info["stage_manager_runtime_list_b_offset"] = stage_runtime["list_b"]
     info["monster_spawn_manager_monster_list_offset"] = field_offset(monster_spawn_manager, "MonsterList", "MonsterSpawnManager")
     info["monster_spawn_manager_dead_monster_list_offset"] = field_offset(monster_spawn_manager, "DeadMonsterUnit", "MonsterSpawnManager")
     info["monster_spawn_manager_summoned_monster_list_offset"] = field_offset(monster_spawn_manager, "SummonedMonsterList", "MonsterSpawnManager")
@@ -798,13 +847,15 @@ def patch_grade_map_js(path: Path, var_decl: str, info: dict, dry: bool) -> bool
         return False
     begin = "// ===== BEGIN GRADE MAP"
     end = "// ===== END GRADE MAP ====="
-    m = re.search(re.escape(begin) + r"[^\n]*\n", text)
+    m = re.search(r"(?m)^([ \t]*)" + re.escape(begin) + r"[^\n]*\n", text)
     if not m or end not in text:
         raise SystemExit(f"Marcadores GRADE MAP nao encontrados em {path}.")
+    prefix = m.group(1)
     begin_line = m.group(0)  # linha BEGIN completa (com sufixo) + \n
-    lines = ",\n".join(f'  {g}: "{GRADE_PT[g]}"' for g in info["grade_names"])
-    block = begin_line + f"{var_decl} = {{\n{lines},\n}};\n" + end
-    new = re.sub(re.escape(begin) + r".*?" + re.escape(end), lambda _m: block, text, flags=re.S)
+    lines = ",\n".join(f'{prefix}  {g}: "{GRADE_PT[g]}"' for g in info["grade_names"])
+    block = begin_line + f"{prefix}{var_decl} = {{\n{lines},\n{prefix}}};\n{prefix}{end}"
+    pattern = r"(?ms)^[ \t]*" + re.escape(begin) + r".*?^[ \t]*" + re.escape(end)
+    new = re.sub(pattern, lambda _m: block, text, count=1)
     return _write_if_changed(path, new, dry)
 
 
@@ -884,7 +935,7 @@ def main() -> int:
     changed = False
     changed |= patch_main_cpp(info, version, args.dry_run)
     changed |= patch_grade_map_js(SERVER_JS, "const gradePt", info, args.dry_run)
-    changed |= patch_grade_map_js(CALCULATOR_JS, "const HISTORY_GRADE_PT", info, args.dry_run)
+    changed |= patch_grade_map_js(HISTORY_DOMAIN_JS, "const HISTORY_GRADE_PT", info, args.dry_run)
 
     print()
     if args.dry_run:
@@ -893,7 +944,7 @@ def main() -> int:
         print("Pronto! Agora:")
         print("   1) cd tbh-companion-agent && build.bat")
         print("   2) reinicie o agente (apague %LOCALAPPDATA%\\TBH Companion\\sync-state.json p/ reenvio total)")
-        print("   3) suba o frontend (server.js + public/calculator.js)")
+        print("   3) suba o frontend (server.js + public/app/history-domain.js)")
     else:
         print("Nada mudou — o mapa ja estava atualizado para esta versao.")
     return 0

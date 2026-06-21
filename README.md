@@ -33,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 O `release.ps1`:
 
 1. Recalcula o mapa IL2CPP (`refresh_il2cpp_map.py`) para a versao atual do jogo.
-2. Garante que existe `exported-assets\TaskBarHero-<versao>\frontend-pack\`; se faltar, exige `-ExportedProject` para organizar o export do AssetRipper antes de continuar.
+2. Garante que existe `exported-assets\TaskBarHero-<versao>\frontend-pack\`; se faltar, tenta exportar automaticamente pelo AssetRipper configurado e organiza o `ExportedProject` antes de continuar.
 3. Roda o rebuild do repo `tbh-farm-local-frontend`, commita e faz push das mudancas de dados/assets do jogo.
 4. Fecha uma instancia de dev rodando em `build\`, compila o `TBH_Companion.exe` e relanca o executavel novo ao final.
 5. Descobre a versao do jogo e monta a tag: `<versao>`; se ja existir um release dessa versao, usa `<versao>-1`, `<versao>-2`, ...
@@ -43,7 +43,9 @@ O `release.ps1`:
 Flags: `-SkipMap` (so build+release), `-NoLive` (nao le a memoria do jogo),
 `-Draft` (release como rascunho), `-DryRun` (faz tudo local sem commitar/enviar/publicar),
 `-GameDir "caminho\TaskbarHero"`, `-FrontendDir "caminho\tbh-farm-local-frontend"`,
-`-ExportedProject "caminho\ExportedProject"` quando o pack da versao ainda nao existe,
+`-ExportedProject "caminho\ExportedProject"` para usar export ja existente,
+`-AssetRipperExe "caminho\AssetRipper.GUI.Free.exe"`, `-AssetRipperMode web|cli`,
+`-AssetRipperConfig "caminho\config.local.json"`, `-ExportRoot "caminho\saida"`,
 `-ForceAssetExport` para recriar o pack, `-NoContactSheets`, `-SkipFrontend` para
 release apenas do agente, e `-LogPath "caminho\release.log"`.
 Sem `-LogPath`, o script grava um transcript em `dist\release-<timestamp>.log`.
@@ -68,7 +70,7 @@ amostra dos ultimos eventos) e atualiza automaticamente, entre marcadores:
 
 - `src/main.cpp` (bloco `IL2CPP MAP` + `kGradeNames`)
 - `../tbh-farm-local-frontend/server.js` (`gradePt`)
-- `../tbh-farm-local-frontend/public/calculator.js` (`HISTORY_GRADE_PT`)
+- `../tbh-farm-local-frontend/public/app/history-domain.js` (`HISTORY_GRADE_PT`)
 
 > Dica: o `release.ps1` ja roda este passo. Use o comando acima sozinho quando
 > quiser so atualizar o mapa sem gerar um release.
@@ -151,9 +153,11 @@ por enquanto. Quando quiser validar esse comportamento, adicione
 tambem `-Force`.
 
 Durante `scripts\release.ps1`, este fluxo e chamado automaticamente quando o
-`frontend-pack` da versao atual ainda nao existe e `-ExportedProject` foi
-informado. Sem pack existente e sem `-ExportedProject`, o release falha antes de
-publicar para evitar agente e frontend fora de sincronia.
+`frontend-pack` da versao atual ainda nao existe. O release usa `-ExportedProject`
+quando informado; caso contrario, tenta rodar o AssetRipper configurado (por
+padrao, tambem le `..\tbh-compiler\config.local.json` quando existir). Se nao
+houver pack, `ExportedProject` nem AssetRipper configurado, o release falha antes
+de publicar para evitar agente e frontend fora de sincronia.
 
 Tambem existe um modo CLI experimental (`-Enable -ExporterExe ...`), mas o fluxo
 principal hoje e AssetRipper GUI + `-OrganizeExportedProject`.
