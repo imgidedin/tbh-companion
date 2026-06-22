@@ -203,7 +203,7 @@ Fluxo:
 
 Comportamento do save oficial do jogo, confirmado no dump IL2CPP 1.00.12:
 
-- O gerenciador de save do jogo e a classe obfuscada `bal`.
+- O gerenciador de save do jogo e uma classe obfuscada singleton `np<T>` que contem exatamente um `AccountSaveData` e um `PlayerSaveData`. Em 1.00.12 era `bal`; em 1.00.19 passou a ser `ban`. Nao trate o nome obfuscado como estavel.
 - `bal.<AutoSaveAsync>d__57.MoveNext` chama `SaveAsync` e depois agenda `UniTask.Delay(TimeSpan.FromSeconds(180), ..., PlayerLoopTiming.Update, cancellationToken, ...)`.
 - O autosave periodico so chama `SaveAsync` quando `UnityEngine.Time.timeScale > 0`; se o jogo estiver pausado/timeScale zero, o loop segue para o delay.
 - `OnApplicationPause(true)` dispara `SaveAsync` fire-and-forget.
@@ -222,10 +222,10 @@ Comportamento do save oficial do jogo, confirmado no dump IL2CPP 1.00.12:
 
 ## Leitura viva do save pela memoria
 
-O agente prefere ler o save vivo do singleton obfuscado `bal : np<bal>`:
+O agente prefere ler o save vivo do singleton obfuscado de save, resolvido estruturalmente pelo refresh como `np<T>` com campos `AccountSaveData` e `PlayerSaveData`:
 
-- `bal.bgaw` -> `AccountSaveData`
-- `bal.bgax` -> `PlayerSaveData`
+- campo do tipo `AccountSaveData` -> `AccountSaveData`
+- campo do tipo `PlayerSaveData` -> `PlayerSaveData`
 - `PlayerSaveData.commonSaveData` e listas de currency, herois, atributos, pets, runas, inventario, storage, trade stash, itens e aggregates
 
 `ReadLiveSaveSummary` monta um `JsonValue` com a mesma forma que `LoadSaveRoot` produz para o ES3 e chama o mesmo `BuildSaveSummaryJson`. Isso evita regras paralelas para equipamentos, inventario, enchants, bonuses, runas e kills.
@@ -668,7 +668,7 @@ O script:
 2. Detecta versao.
 3. Baixa/usa Il2CppDumper.
 4. Gera `dump.cs` e `script.json`.
-5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog`, save vivo (`bal`), `StageManager`, `MonsterSpawnManager`, runtime currency/herois e enum `EGradeType`.
+5. Extrai RVA/offsets de `LogManager`, `LogData`, `BoxOpenLog`, save vivo (classe obfuscada resolvida por estrutura), `StageManager`, `MonsterSpawnManager`, runtime currency/herois e enum `EGradeType`.
 6. Com jogo aberto, valida na memoria viva.
 7. Patcha:
    - `src/main.cpp`
@@ -683,7 +683,7 @@ Regra critica:
 - Se o enum `EGradeType` ganhar grade novo, atualizar `GRADE_PT` no script.
 - Nao aceitar offset novo sem harness quando o jogo esta aberto e a verificacao viva e possivel.
 - Se usar `--no-live`, registre o risco: offsets dependentes de memoria podem ter sido preservados da versao anterior.
-- Para classes obfuscadas, prefira resolver campos por tipo estavel (`AccountSaveData`, `PlayerSaveData`, `MonsterInfoData`, `CurrencyInfoData`, `ObscuredLong`, `ObscuredFloat`, `Dictionary<int, vd>`) antes de depender de nomes como `bgaw`, `bepe` ou `beuv`, porque esses nomes podem mudar entre versoes.
+- Para classes obfuscadas, prefira resolver classes e campos por estrutura/tipo estavel (`AccountSaveData`, `PlayerSaveData`, `MonsterInfoData`, `CurrencyInfoData`, `ObscuredLong`, `ObscuredFloat`, `Dictionary<int, vd>`) antes de depender de nomes como `bal`, `bgaw`, `bepe` ou `beuv`, porque esses nomes podem mudar entre versoes.
 - Em `Monster`, os campos runtime logo apos `MonsterType` devem ser resolvidos pela sequencia de tipos `int, int, float, EStageType, int`, nao por nomes obfuscados (`bcq*`), porque os nomes mudam entre builds mesmo quando o layout permanece.
 - Se a verificacao viva do `LogManager` tiver menos de 3 eventos, o refresh deve preservar `kLogDataTextOffset`/`kLogDataClockOffset` atuais e avisar, nao abortar o release por falta de amostra.
 
@@ -813,11 +813,11 @@ Validar:
 - Script detecta versao correta.
 - Dump gera offsets.
 - Verificacao viva mostra amostras de eventos; se houver menos de 3 eventos, aceita o aviso de poucos eventos apenas quando os offsets atuais de texto/relogio forem preservados.
-- Saida do script mostra `Save manager: TypeInfo np<bal>_TypeInfo`.
+- Saida do script mostra `Save manager: <classe obfuscada> TypeInfo np<<classe>>_TypeInfo`.
 - Saida do script mostra `Runtime stage` com TypeInfos de `StageManager` e `MonsterSpawnManager`.
 - Saida do script mostra `Runtime rewards` com offsets de `Monster.cache`, `MonsterInfoData.RewardGold` e `MonsterInfoData.RewardExp`.
-- Saida do script mostra `Runtime currency` com TypeInfo de `vb.tp`, offset da lista de currencies e offset do `ObscuredLong` usado por `vb.tq`.
-- Saida do script mostra `Runtime heroes` com TypeInfo de `vb.tz`, offset do dicionario de herois e offsets de level, ability, allocatedAbility e EXP em `vd`.
+- Saida do script mostra `Runtime currency` com TypeInfo da classe manager descoberta, offset da lista de currencies e offset do `ObscuredLong` usado pela classe runtime de currency.
+- Saida do script mostra `Runtime heroes` com TypeInfo da classe manager descoberta, offset do dicionario de herois e offsets de level, ability, allocatedAbility e EXP na classe runtime de heroi.
 - `src/main.cpp` foi patchado dentro dos marcadores.
 - Frontend `server.js` e `public/app/history-domain.js` recebem mapa de raridade se mudou.
 

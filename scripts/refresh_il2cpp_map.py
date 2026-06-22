@@ -166,6 +166,18 @@ def class_body(src: str, name: str) -> str | None:
     return m.group(0) if m else None
 
 
+def iter_class_bodies(src: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"// Namespace:[^\n]*\n(?:\[[^\n]*\]\n)*(?:public|private) "
+        r"(?:(?:abstract|sealed|static)\s+)*class\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\b.*?\n\}",
+        re.S,
+    )
+    for match in pattern.finditer(src):
+        out.append((match.group(1), match.group(0)))
+    return out
+
+
 def fields_of(body: str, include_static: bool = False) -> list[tuple[str, str, int]]:
     """Retorna [(tipo, nome, offset)] dos campos de instancia (com // 0xNN)."""
     out = []
@@ -290,6 +302,83 @@ def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: 
         return field_offset_by_type(body, type_name, class_name)
 
 
+def is_singleton_class(body: str, class_name: str) -> bool:
+    header = body.split("{", 1)[0]
+    return bool(re.search(r"\bclass\s+" + re.escape(class_name) + r"\s*:\s*[A-Za-z_]\w*<" + re.escape(class_name) + r">", header))
+
+
+def find_save_manager_class(src: str) -> tuple[str, str]:
+    candidates: list[tuple[str, str]] = []
+    for class_name, body in iter_class_bodies(src):
+        fields = fields_of(body)
+        account_offsets = [off for typ, _fname, off in fields if typ == "AccountSaveData"]
+        player_offsets = [off for typ, _fname, off in fields if typ == "PlayerSaveData"]
+        if len(account_offsets) == 1 and len(player_offsets) == 1:
+            candidates.append((class_name, body))
+
+    singleton_candidates = [(name, body) for name, body in candidates if is_singleton_class(body, name)]
+    if len(singleton_candidates) == 1:
+        return singleton_candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    details = ", ".join(name for name, _body in (singleton_candidates or candidates))
+    if details:
+        raise SystemExit(f"classe save manager ambigua no dump: {details}")
+    raise SystemExit("classe save manager com AccountSaveData + PlayerSaveData nao encontrada no dump.")
+
+
+def find_class_by_predicate(src: str, description: str, predicate) -> tuple[str, str]:
+    matches = [(name, body) for name, body in iter_class_bodies(src) if predicate(name, body, fields_of(body))]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"classe {description} nao encontrada no dump.")
+    details = ", ".join(name for name, _body in matches)
+    raise SystemExit(f"classe {description} ambigua no dump: {details}")
+
+
+def find_static_owner_by_field_type(src: str, field_type: str, description: str) -> tuple[str, str]:
+    return find_class_by_predicate(
+        src,
+        description,
+        lambda _name, body, _fields: any(typ == field_type for typ, _fname, _off in fields_of(body, include_static=True)),
+    )
+
+
+def find_monster_cache_class(src: str) -> tuple[str, str]:
+    return find_class_by_predicate(
+        src,
+        "cache runtime de MonsterInfoData",
+        lambda _name, _body, fields: any(typ == "MonsterInfoData" for typ, _fname, _off in fields)
+        and sum(1 for typ, _fname, _off in fields if typ == "ObscuredFloat") >= 3,
+    )
+
+
+def find_runtime_currency_classes(src: str) -> tuple[str, str, str, str]:
+    runtime_name, runtime_body = find_class_by_predicate(
+        src,
+        "runtime currency",
+        lambda _name, _body, fields: any(typ == "CurrencyInfoData" for typ, _fname, _off in fields)
+        and any(typ == "ObscuredLong" for typ, _fname, _off in fields)
+        and any(typ == "ObscuredInt" for typ, _fname, _off in fields),
+    )
+    manager_name, manager_body = find_static_owner_by_field_type(src, f"List<{runtime_name}>", "manager runtime currency")
+    return manager_name, manager_body, runtime_name, runtime_body
+
+
+def find_runtime_hero_classes(src: str) -> tuple[str, str, str, str]:
+    runtime_name, runtime_body = find_class_by_predicate(
+        src,
+        "runtime hero",
+        lambda _name, _body, fields: any(typ == "HeroInfoData" for typ, _fname, _off in fields)
+        and sum(1 for typ, _fname, _off in fields if typ == "ObscuredInt") >= 4
+        and any(typ == "ObscuredFloat" for typ, _fname, _off in fields),
+    )
+    manager_name, manager_body = find_static_owner_by_field_type(src, f"Dictionary<int, {runtime_name}>", "manager runtime hero")
+    return manager_name, manager_body, runtime_name, runtime_body
+
+
 def stage_manager_runtime_offsets(body: str) -> dict[str, int]:
     fields = fields_of(body)
 
@@ -408,14 +497,15 @@ def extract_map(dump_dir: Path) -> dict:
     grades = parse_enum(src, "EGradeType")
     info["grade_names"] = [g for g in grades if g != "NONE"]
 
-    bal = require_class(src, "bal")
+    save_manager_name, save_manager = find_save_manager_class(src)
+    info["save_manager_class_name"] = save_manager_name
     info["save_typeinfo_rva"], info["save_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
-        singleton_typeinfo_candidates(bal, "bal", ["bal_TypeInfo"]),
-        "bal",
+        singleton_typeinfo_candidates(save_manager, save_manager_name, [f"{save_manager_name}_TypeInfo", "bal_TypeInfo"]),
+        save_manager_name,
     )
-    info["save_manager_account_offset"] = field_offset_name_or_type(bal, "bgaw", "AccountSaveData", "bal")
-    info["save_manager_player_offset"] = field_offset_name_or_type(bal, "bgax", "PlayerSaveData", "bal")
+    info["save_manager_account_offset"] = field_offset_name_or_type(save_manager, "bgaw", "AccountSaveData", save_manager_name)
+    info["save_manager_player_offset"] = field_offset_name_or_type(save_manager, "bgax", "PlayerSaveData", save_manager_name)
 
     account = require_class(src, "AccountSaveData")
     common = require_class(src, "CommonSaveData")
@@ -445,17 +535,13 @@ def extract_map(dump_dir: Path) -> dict:
     stage_manager = require_class(src, "StageManager")
     monster_spawn_manager = require_class(src, "MonsterSpawnManager")
     monster = require_class(src, "Monster")
-    monster_cache = require_class(src, "vb.ul")
+    monster_cache_name, monster_cache = find_monster_cache_class(src)
     monster_info = require_class(src, "MonsterInfoData")
-    runtime_currency_manager_name = "vb.tp" if class_body(src, "vb.tp") else "ue.su"
-    runtime_currency_name = "vb.tq" if class_body(src, "vb.tq") else "ue.sv"
-    runtime_currency_manager = require_class(src, runtime_currency_manager_name)
-    runtime_currency = require_class(src, runtime_currency_name)
+    runtime_currency_manager_name, runtime_currency_manager, runtime_currency_name, runtime_currency = find_runtime_currency_classes(src)
     currency_info = require_class(src, "CurrencyInfoData")
-    runtime_hero_manager = require_class(src, "vb.tz")
-    runtime_hero = require_class(src, "vd")
+    runtime_hero_manager_name, runtime_hero_manager, runtime_hero_name, runtime_hero = find_runtime_hero_classes(src)
     hero_info = require_class(src, "HeroInfoData")
-    runtime_backend_inventory = require_class(src, "wk")
+    runtime_backend_inventory_name, runtime_backend_inventory = find_static_owner_by_field_type(src, "List<InventoryItemData>", "backend inventory runtime")
     backend_inventory_item = require_class(src, "InventoryItemData")
     info["stage_manager_typeinfo_rva"], info["stage_manager_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
@@ -486,7 +572,8 @@ def extract_map(dump_dir: Path) -> dict:
     info["monster_runtime_float_offset"] = runtime_monster["runtime_float"]
     info["monster_stage_type_offset"] = runtime_monster["stage_type"]
     info["monster_runtime_int_c_offset"] = runtime_monster["runtime_int_c"]
-    info["monster_cache_info_data_offset"] = field_offset_by_type(monster_cache, "MonsterInfoData", "vb.ul")
+    info["monster_cache_class_name"] = monster_cache_name
+    info["monster_cache_info_data_offset"] = field_offset_by_type(monster_cache, "MonsterInfoData", monster_cache_name)
     info["monster_info_monster_key_offset"] = field_offset(monster_info, "MonsterKey", "MonsterInfoData")
     info["monster_info_monster_type_offset"] = field_offset(monster_info, "MONSTERTYPE", "MonsterInfoData")
     info["monster_info_reward_gold_offset"] = field_offset(monster_info, "RewardGold", "MonsterInfoData")
@@ -519,28 +606,30 @@ def extract_map(dump_dir: Path) -> dict:
     info["currency_info_key_offset"] = field_offset(currency_info, "CurrencyKey", "CurrencyInfoData")
     info["runtime_hero_manager_typeinfo_rva"], info["runtime_hero_manager_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
-        ["vb.tz_TypeInfo"],
-        "vb.tz",
+        [f"{runtime_hero_manager_name}_TypeInfo"],
+        runtime_hero_manager_name,
     )
-    info["runtime_hero_dictionary_offset"] = static_field_offset_by_type(runtime_hero_manager, "Dictionary<int, vd>", "vb.tz")
-    info["runtime_hero_info_offset"] = field_offset_by_type(runtime_hero, "HeroInfoData", "vd")
+    info["runtime_hero_class_name"] = runtime_hero_name
+    info["runtime_hero_dictionary_offset"] = static_field_offset_by_type(runtime_hero_manager, f"Dictionary<int, {runtime_hero_name}>", runtime_hero_manager_name)
+    info["runtime_hero_info_offset"] = field_offset_by_type(runtime_hero, "HeroInfoData", runtime_hero_name)
     runtime_hero_int_offsets = field_offsets_by_type(runtime_hero, "ObscuredInt")
     if len(runtime_hero_int_offsets) < 4:
-        raise SystemExit("classe vd sem os quatro ObscuredInt esperados para level/ability points.")
+        raise SystemExit(f"classe {runtime_hero_name} sem os quatro ObscuredInt esperados para level/ability points.")
     info["runtime_hero_level_offset"] = runtime_hero_int_offsets[0]
     info["runtime_hero_ability_point_offset"] = runtime_hero_int_offsets[2]
     info["runtime_hero_allocated_ability_point_offset"] = runtime_hero_int_offsets[3]
-    info["runtime_hero_exp_offset"] = field_offset_by_type(runtime_hero, "ObscuredFloat", "vd")
+    info["runtime_hero_exp_offset"] = field_offset_by_type(runtime_hero, "ObscuredFloat", runtime_hero_name)
     info["hero_info_hero_key_offset"] = field_offset(hero_info, "HeroKey", "HeroInfoData")
     info["runtime_backend_inventory_typeinfo_rva"], info["runtime_backend_inventory_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
-        ["wk_TypeInfo"],
-        "wk",
+        [f"{runtime_backend_inventory_name}_TypeInfo"],
+        runtime_backend_inventory_name,
     )
+    info["runtime_backend_inventory_class_name"] = runtime_backend_inventory_name
     info["runtime_backend_inventory_items_offset"] = static_field_offset_by_type(
         runtime_backend_inventory,
         "List<InventoryItemData>",
-        "wk",
+        runtime_backend_inventory_name,
     )
     info["backend_inventory_item_unique_key_offset"] = field_offset(backend_inventory_item, "itemKey", "InventoryItemData")
     info["backend_inventory_item_id_offset"] = field_offset(backend_inventory_item, "itemId", "InventoryItemData")
@@ -919,7 +1008,8 @@ def main() -> int:
           f"strings={[hex(x) for x in info['string_offsets']]} "
           f"datetime=0x{info['datetime_offset']:X} "
           f"box(item=0x{info['box_item_key_offset']:X},grade=0x{info['box_grade_offset']:X})")
-    print(f"[*] Save manager: TypeInfo {info.get('save_typeinfo_name', '?')} "
+    print(f"[*] Save manager: {info.get('save_manager_class_name', '?')} "
+          f"TypeInfo {info.get('save_typeinfo_name', '?')} "
           f"RVA=0x{info['save_typeinfo_rva']:X} "
           f"account=0x{info['save_manager_account_offset']:X} "
           f"player=0x{info['save_manager_player_offset']:X}")

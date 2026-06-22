@@ -1244,9 +1244,9 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.17) =====
-constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.17";
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E172D0;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.19) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.19";
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E0BA50;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
@@ -1254,12 +1254,12 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
-constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E18158;
-constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E17A90;
-constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E174C0;
-constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DA04A0;
-constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DA0688;
-constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DF7AD0;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0C8D8;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E0C210;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E0BC40;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D94D08;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D94EF8;
+constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DEC440;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1273,16 +1273,16 @@ constexpr uintptr_t kCommonSaveMaxCompletedStageOffset = 0x54;
 constexpr uintptr_t kCommonSaveCurrentStageKeyOffset = 0x58;
 constexpr uintptr_t kCommonSaveCurrentStageWaveOffset = 0x5C;
 constexpr uintptr_t kPlayerSaveCommonOffset = 0x10;
-constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x38;
-constexpr uintptr_t kPlayerSaveHeroesOffset = 0x40;
-constexpr uintptr_t kPlayerSaveAttributesOffset = 0x50;
-constexpr uintptr_t kPlayerSavePetsOffset = 0x58;
-constexpr uintptr_t kPlayerSaveRunesOffset = 0x60;
-constexpr uintptr_t kPlayerSaveInventoryOffset = 0x68;
-constexpr uintptr_t kPlayerSaveStashOffset = 0x70;
-constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x78;
-constexpr uintptr_t kPlayerSaveItemsOffset = 0x90;
-constexpr uintptr_t kPlayerSaveAggregatesOffset = 0x98;
+constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x48;
+constexpr uintptr_t kPlayerSaveHeroesOffset = 0x50;
+constexpr uintptr_t kPlayerSaveAttributesOffset = 0x60;
+constexpr uintptr_t kPlayerSavePetsOffset = 0x68;
+constexpr uintptr_t kPlayerSaveRunesOffset = 0x70;
+constexpr uintptr_t kPlayerSaveInventoryOffset = 0x78;
+constexpr uintptr_t kPlayerSaveStashOffset = 0x80;
+constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x88;
+constexpr uintptr_t kPlayerSaveItemsOffset = 0xA0;
+constexpr uintptr_t kPlayerSaveAggregatesOffset = 0xA8;
 constexpr uintptr_t kStageManagerStageStateOffset = 0x78;
 constexpr uintptr_t kStageManagerStageStartedOffset = 0x98;
 constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x110;
