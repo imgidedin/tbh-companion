@@ -71,6 +71,7 @@ constexpr DWORD kGameVersionCheckMs = 30000;
 constexpr int kLiveSaveInventoryResolveAttempts = 2;
 constexpr DWORD kLiveSaveInventoryResolveDelayMs = 10;
 constexpr DWORD kAutoOpenChestClickThrottleMs = 700;
+constexpr int kAutoOpenChestMaxAttempts = 6;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -170,6 +171,11 @@ struct MemoryRegion {
   SIZE_T size = 0;
 };
 
+struct AutoOpenChestRequest {
+  std::string id;
+  int attempts = 0;
+};
+
 struct WorkerState {
   SaveSummary save;
   bool has_save = false;
@@ -201,7 +207,7 @@ struct WorkerState {
   long long synced_index = -1;     // maior index de evento confirmado pelo servidor
   std::string synced_first_id;     // detecta reset/reordenacao do historico local
   size_t auto_open_chest_scan_index = 0;
-  int auto_open_chest_pending_clicks = 0;
+  std::deque<AutoOpenChestRequest> auto_open_chests_pending;
   DWORD last_auto_open_chest_click = 0;
 };
 
@@ -308,6 +314,10 @@ bool PostChestPopupClick() {
 
 bool IsAutoOpenChestTrigger(const MemoryEvent& event) {
   return event.type == "drop" && event.category == "chest" && event.item_key <= 0;
+}
+
+bool IsAutoOpenChestResult(const MemoryEvent& event) {
+  return event.type == "drop" && event.item_key > 0;
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -5251,7 +5261,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   if (process_changed) {
     state.memory_pid = pid;
     state.memory_seen.clear();
-    state.auto_open_chest_pending_clicks = 0;
+    state.auto_open_chests_pending.clear();
     std::string cache_difficulty = state.has_save ? MaxSaveDifficulty(state.save) : difficulty;
     long long max_completed_stage = state.has_save ? SaveMaxCompletedStage(state.save) : 0;
     if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, cache_difficulty, max_completed_stage)) {
@@ -5306,7 +5316,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
 void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
   if (!config.auto_open_chests) {
     state.auto_open_chest_scan_index = state.memory.events.size();
-    state.auto_open_chest_pending_clicks = 0;
+    state.auto_open_chests_pending.clear();
     return;
   }
 
@@ -5314,20 +5324,32 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
     state.auto_open_chest_scan_index = state.memory.events.size();
   }
   for (size_t i = state.auto_open_chest_scan_index; i < state.memory.events.size(); ++i) {
-    if (IsAutoOpenChestTrigger(state.memory.events[i])) ++state.auto_open_chest_pending_clicks;
+    const MemoryEvent& event = state.memory.events[i];
+    if (IsAutoOpenChestTrigger(event)) {
+      state.auto_open_chests_pending.push_back({event.id, 0});
+    } else if (IsAutoOpenChestResult(event) && !state.auto_open_chests_pending.empty()) {
+      state.auto_open_chests_pending.pop_front();
+    }
   }
   state.auto_open_chest_scan_index = state.memory.events.size();
 
-  if (state.auto_open_chest_pending_clicks <= 0) return;
+  while (!state.auto_open_chests_pending.empty() &&
+         state.auto_open_chests_pending.front().attempts >= kAutoOpenChestMaxAttempts) {
+    state.auto_open_chests_pending.pop_front();
+  }
+  if (state.auto_open_chests_pending.empty()) return;
+
   DWORD now = GetTickCount();
   if (state.last_auto_open_chest_click != 0 &&
       now - state.last_auto_open_chest_click < kAutoOpenChestClickThrottleMs) {
     return;
   }
   if (!PostChestPopupClick()) return;
-  --state.auto_open_chest_pending_clicks;
+  ++state.auto_open_chests_pending.front().attempts;
   state.last_auto_open_chest_click = now;
-  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú.");
+  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú (" +
+             std::to_wstring(state.auto_open_chests_pending.front().attempts) + L"/" +
+             std::to_wstring(kAutoOpenChestMaxAttempts) + L").");
 }
 
 std::wstring DevRuntimeDir() {
