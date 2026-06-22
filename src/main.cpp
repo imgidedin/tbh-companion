@@ -56,6 +56,7 @@ constexpr int IDM_TRAY_MINIMIZE_TO_TASKBAR = 2005;
 constexpr int IDM_TRAY_EXPORT_DEV_RUNTIME = 2006;
 constexpr int IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME = 2007;
 constexpr int IDM_TRAY_AUTO_OPEN_CHESTS = 2008;
+constexpr int IDM_TRAY_AUTO_OPEN_BLOCK_FULL_INVENTORY = 2009;
 constexpr bool kDevelopmentMode = TBH_DEVELOPMENT_MODE != 0;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
@@ -106,6 +107,7 @@ struct Config {
   bool auto_export_dev_runtime = true;
   bool allow_game_version_mismatch = false;
   bool auto_open_chests = false;
+  bool auto_open_chests_block_full_inventory = true;
 };
 
 Config LoadConfig();
@@ -129,6 +131,7 @@ struct SaveSummary {
 
 bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason);
 bool SaveHasOpenAllChestsSpaceUpgrade(const SaveSummary& summary);
+bool SaveInventoryIsFull(const SaveSummary& summary);
 bool AutoOpenChestsAvailable(std::wstring* reason);
 
 struct MemoryEvent {
@@ -215,6 +218,7 @@ struct WorkerState {
   size_t auto_open_chest_scan_index = 0;
   std::deque<AutoOpenChestRequest> auto_open_chests_pending;
   DWORD last_auto_open_chest_space = 0;
+  bool auto_open_chest_inventory_full_reported = false;
 };
 
 std::wstring Trim(std::wstring value) {
@@ -351,6 +355,9 @@ void ShowTrayMenu(HWND hwnd) {
                     (auto_open_available ? 0 : MF_GRAYED) |
                     (config.auto_open_chests && auto_open_available ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_AUTO_OPEN_CHESTS, L"Auto-open Chests");
+  AppendMenuW(menu, MF_STRING |
+                    (config.auto_open_chests_block_full_inventory ? MF_CHECKED : MF_UNCHECKED),
+              IDM_TRAY_AUTO_OPEN_BLOCK_FULL_INVENTORY, L"Bloquear se inventário cheio");
   if (kDevelopmentMode) {
     AppendMenuW(menu, MF_STRING | (config.auto_export_dev_runtime ? MF_CHECKED : MF_UNCHECKED),
                 IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME, L"Atualizar dev automaticamente");
@@ -563,6 +570,8 @@ Config LoadConfig() {
   config.auto_export_dev_runtime = GetPrivateProfileIntW(L"app", L"auto_export_dev_runtime", 1, path.c_str()) != 0;
   config.allow_game_version_mismatch = GetPrivateProfileIntW(L"app", L"allow_game_version_mismatch", 0, path.c_str()) != 0;
   config.auto_open_chests = GetPrivateProfileIntW(L"app", L"auto_open_chests", 0, path.c_str()) != 0;
+  config.auto_open_chests_block_full_inventory =
+      GetPrivateProfileIntW(L"app", L"auto_open_chests_block_full_inventory", 1, path.c_str()) != 0;
 
   return config;
 }
@@ -579,6 +588,8 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"app", L"allow_game_version_mismatch",
                              config.allow_game_version_mismatch ? L"1" : L"0", path.c_str());
   WritePrivateProfileStringW(L"app", L"auto_open_chests", config.auto_open_chests ? L"1" : L"0", path.c_str());
+  WritePrivateProfileStringW(L"app", L"auto_open_chests_block_full_inventory",
+                             config.auto_open_chests_block_full_inventory ? L"1" : L"0", path.c_str());
   SetAutoStart(config.auto_start);
 }
 
@@ -602,6 +613,7 @@ Config ReadConfigFromUi() {
   config.auto_open_chests =
       g_auto_open_chests ? SendMessageW(g_auto_open_chests, BM_GETCHECK, 0, 0) == BST_CHECKED
                          : saved.auto_open_chests;
+  config.auto_open_chests_block_full_inventory = saved.auto_open_chests_block_full_inventory;
   return config;
 }
 
@@ -4991,6 +5003,22 @@ bool SaveHasOpenAllChestsSpaceUpgrade(const SaveSummary& summary) {
   return false;
 }
 
+bool SaveInventoryIsFull(const SaveSummary& summary) {
+  JsonValue root;
+  if (!ParseJson(summary.summary_json, root)) return false;
+  const JsonValue* inventory = ObjectGet(root, "inventory");
+  const JsonValue* tabs = inventory ? ObjectGet(*inventory, "tabs") : nullptr;
+  if (!tabs || tabs->type != JsonValue::Type::Array) return false;
+
+  for (const JsonValue& tab : tabs->array) {
+    if (JsonStringValue(ObjectGet(tab, "id")) != "inventory") continue;
+    long long unlocked_slots = static_cast<long long>(JsonNumberDouble(ObjectGet(tab, "unlockedSlots")));
+    long long empty_slots = static_cast<long long>(JsonNumberDouble(ObjectGet(tab, "emptySlots")));
+    return unlocked_slots > 0 && empty_slots <= 0;
+  }
+  return false;
+}
+
 bool AutoOpenChestsAvailable(std::wstring* reason) {
   SaveSummary summary;
   std::string fallback_reason;
@@ -5318,6 +5346,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
     state.memory_pid = pid;
     state.memory_seen.clear();
     state.auto_open_chests_pending.clear();
+    state.auto_open_chest_inventory_full_reported = false;
     std::string cache_difficulty = state.has_save ? MaxSaveDifficulty(state.save) : difficulty;
     long long max_completed_stage = state.has_save ? SaveMaxCompletedStage(state.save) : 0;
     if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, cache_difficulty, max_completed_stage)) {
@@ -5373,6 +5402,7 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
   if (!config.auto_open_chests) {
     state.auto_open_chest_scan_index = state.memory.events.size();
     state.auto_open_chests_pending.clear();
+    state.auto_open_chest_inventory_full_reported = false;
     return;
   }
   if (!state.has_save || !SaveHasOpenAllChestsSpaceUpgrade(state.save)) {
@@ -5388,6 +5418,7 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
     }
     state.auto_open_chest_scan_index = state.memory.events.size();
     state.auto_open_chests_pending.clear();
+    state.auto_open_chest_inventory_full_reported = false;
     return;
   }
 
@@ -5409,6 +5440,15 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
     state.auto_open_chests_pending.pop_front();
   }
   if (state.auto_open_chests_pending.empty()) return;
+
+  if (config.auto_open_chests_block_full_inventory && SaveInventoryIsFull(state.save)) {
+    if (!state.auto_open_chest_inventory_full_reported) {
+      PostStatus(L"Auto-open Chests pausado: inventário cheio.");
+      state.auto_open_chest_inventory_full_reported = true;
+    }
+    return;
+  }
+  state.auto_open_chest_inventory_full_reported = false;
 
   DWORD now = GetTickCount();
   if (state.last_auto_open_chest_space != 0 &&
@@ -5919,6 +5959,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
           EnableWindow(g_auto_open_chests, TRUE);
         }
         SetStatus(config.auto_open_chests ? L"Auto-open Chests ativado." : L"Auto-open Chests desativado.");
+      } else if (id == IDM_TRAY_AUTO_OPEN_BLOCK_FULL_INVENTORY) {
+        Config config = LoadConfig();
+        config.auto_open_chests_block_full_inventory = !config.auto_open_chests_block_full_inventory;
+        SaveConfig(config);
+        SetStatus(config.auto_open_chests_block_full_inventory
+                      ? L"Auto-open Chests não abre baús com inventário cheio."
+                      : L"Auto-open Chests pode abrir baús mesmo com inventário cheio.");
       } else if (id == IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
         Config config = LoadConfig();
         config.auto_export_dev_runtime = !config.auto_export_dev_runtime;
