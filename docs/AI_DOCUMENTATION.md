@@ -58,7 +58,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | `SaveSummary` | Resumo do save e campos usados pelo sync. |
 | `MemoryEvent` / `MemorySnapshot` | Eventos vivos e agregados derivados do LogManager. |
 | Config/tray/UI | `LoadConfig`, `SaveConfig`, `WindowProc`, `StartWorker`, `StopWorker`. |
-| Auto-open Chests | `ProcessAutoOpenChests`, `PostChestPopupClick` | Feature opt-in que usa `GetBoxLog` vivo como gatilho, repete clique ate `BoxOpenLog` ou limite curto de tentativas e envia `WM_LBUTTONDOWN/UP` para a janela do jogo sem mover o cursor real. |
+| Auto-open Chests | `ProcessAutoOpenChests`, `PostChestPopupClick` | Feature opt-in que usa `GetBoxLog` vivo como gatilho, repete clique ate `BoxOpenLog` ou limite curto de tentativas e usa `SendInput` nos slots de bau do HUD, restaurando cursor e foco em seguida. |
 | JSON | Parser/serializer minimo proprio para evitar dependencias externas. |
 | Save ES3 | AES-CBC/PBKDF2, parsing do JSON e construcao de resumo. |
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
@@ -77,7 +77,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 7. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda; mudancas estruturais do save ativo enviam imediatamente, e mudancas metricas pendentes sao enviadas no tick de ~10s para alimentar snapshots.
 8. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
 9. Eventos novos sao adicionados com `index` monotonicamente crescente.
-10. Se `app.auto_open_chests=1`, `ProcessAutoOpenChests` examina apenas eventos novos desde o ultimo scan; `GetBoxLog` (`category=chest` sem `itemKey`) enfileira abertura pendente e `BoxOpenLog` (`itemKey>0`) confirma que um bau foi aberto. Enquanto pendente, o agente tenta clicar no centro do client rect da janela do `TaskBarHero.exe` via `PostMessageW`, com throttle e limite curto de tentativas, sem coordenada absoluta de monitor e sem mover o mouse real.
+10. Se `app.auto_open_chests=1`, `ProcessAutoOpenChests` examina apenas eventos novos desde o ultimo scan; `GetBoxLog` (`category=chest` sem `itemKey`) enfileira abertura pendente e `BoxOpenLog` (`itemKey>0`) confirma que um bau foi aberto. Enquanto pendente, o agente alterna cliques nos alvos `hud-chest-*` ancorados no HUD inferior esquerdo da janela do `TaskBarHero.exe` via `SendInput`, com throttle e limite curto de tentativas; o cursor e a janela em foco sao restaurados logo apos cada clique.
 11. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
 12. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend quando `app.auto_export_dev_runtime=1`.
 13. O loop para quando a janela/tray manda encerrar.
@@ -100,7 +100,7 @@ Campos importantes:
 - `app.minimize_to_taskbar`: opcional; `0` por padrao minimiza o agent para a bandeja, `1` mantem minimizacao normal na taskbar.
 - `app.auto_export_dev_runtime`: opcional; em build de desenvolvimento, `1` por padrao atualiza o runtime local do frontend automaticamente, `0` deixa apenas a atualizacao manual.
 - `app.allow_game_version_mismatch`: opcional; `0` por padrao bloqueia abertura/sync quando a versao instalada do jogo diverge do mapa IL2CPP compilado, `1` libera manualmente para diagnostico.
-- `app.auto_open_chests`: opcional; `0` por padrao. Quando `1`, o agente detecta `GetBoxLog` novo no `LogManager` vivo, mantem a abertura pendente ate chegar `BoxOpenLog` ou acabar o limite de tentativas, e posta cliques no popup de bau da janela do jogo.
+- `app.auto_open_chests`: opcional; `0` por padrao. Quando `1`, o agente detecta `GetBoxLog` novo no `LogManager` vivo, mantem a abertura pendente ate chegar `BoxOpenLog` ou acabar o limite de tentativas, e clica nos slots de bau do HUD da janela do jogo.
 
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
 
@@ -114,7 +114,7 @@ Regras:
 - nao editar save oficial;
 - nao mover itens, equipar, comprar, vender ou executar qualquer acao no jogo;
 - pode ler o save oficial, ler eventos vivos de memoria, exportar snapshots de desenvolvimento e esconder/mostrar a janela do jogo com `ShowWindow(SW_HIDE/SW_SHOW)` pelo menu da bandeja;
-- `Auto-open Chests` nao injeta codigo, nao escreve memoria, nao chama IL2CPP e nao usa `SendInput`; ele envia mensagens `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` para o client rect da janela do jogo quando o `LogManager` vivo registra um `GetBoxLog` novo, repetindo com throttle ate `BoxOpenLog` confirmar abertura ou o limite de tentativas encerrar o pedido;
+- `Auto-open Chests` nao injeta codigo, nao escreve memoria e nao chama IL2CPP; quando o `LogManager` vivo registra um `GetBoxLog` novo, ele usa `SendInput` nos slots de bau do HUD dentro do client rect da janela do jogo, repetindo com throttle ate `BoxOpenLog` confirmar abertura ou o limite de tentativas encerrar o pedido. O cursor e o foco anteriores sao restaurados apos cada clique;
 - qualquer feature nova que exija interacao ativa com o jogo deve ser recusada ou documentada como nova excecao opt-in antes de implementacao.
 
 ### UI/tray

@@ -70,8 +70,8 @@ constexpr DWORD kMetricSaveSyncMs = 10000;
 constexpr DWORD kGameVersionCheckMs = 30000;
 constexpr int kLiveSaveInventoryResolveAttempts = 2;
 constexpr DWORD kLiveSaveInventoryResolveDelayMs = 10;
-constexpr DWORD kAutoOpenChestClickThrottleMs = 700;
-constexpr int kAutoOpenChestMaxAttempts = 6;
+constexpr DWORD kAutoOpenChestClickThrottleMs = 500;
+constexpr int kAutoOpenChestMaxAttempts = 10;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -174,6 +174,7 @@ struct MemoryRegion {
 struct AutoOpenChestRequest {
   std::string id;
   int attempts = 0;
+  int next_target = 0;
 };
 
 struct WorkerState {
@@ -301,7 +302,57 @@ bool PostClientClick(HWND window, int x, int y) {
   return true;
 }
 
-bool PostChestPopupClick() {
+bool SendPhysicalClientClick(HWND window, int x, int y) {
+  if (!window || !IsWindow(window)) return false;
+  POINT target{x, y};
+  if (!ClientToScreen(window, &target)) return false;
+
+  POINT original{};
+  GetCursorPos(&original);
+  HWND previous = GetForegroundWindow();
+
+  SetForegroundWindow(window);
+  Sleep(80);
+  SetCursorPos(target.x, target.y);
+
+  INPUT inputs[2]{};
+  inputs[0].type = INPUT_MOUSE;
+  inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+  inputs[1].type = INPUT_MOUSE;
+  inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+  UINT sent = SendInput(2, inputs, sizeof(INPUT));
+
+  Sleep(40);
+  SetCursorPos(original.x, original.y);
+  if (previous && previous != window && IsWindow(previous)) SetForegroundWindow(previous);
+  return sent == 2;
+}
+
+struct ClientClickTarget {
+  int x = 0;
+  int y = 0;
+  const wchar_t* name = L"";
+};
+
+std::vector<ClientClickTarget> AutoOpenChestTargets(int width, int height) {
+  std::vector<ClientClickTarget> targets;
+  if (width <= 0 || height <= 0) return targets;
+
+  auto clamp_x = [&](int x) { return (std::min)((std::max)(0, x), width - 1); };
+  auto clamp_y = [&](int y) { return (std::min)((std::max)(0, y), height - 1); };
+
+  // Os popups de bau ficam ancorados no HUD inferior esquerdo, nao no centro
+  // do client rect transparente do jogo.
+  int chest_y = clamp_y(height - 148);
+  targets.push_back({clamp_x(198), chest_y, L"hud-chest-1"});
+  targets.push_back({clamp_x(230), chest_y, L"hud-chest-single"});
+  targets.push_back({clamp_x(262), chest_y, L"hud-chest-2"});
+  targets.push_back({clamp_x(294), chest_y, L"hud-chest-2-right"});
+  targets.push_back({clamp_x(326), chest_y, L"hud-chest-3"});
+  return targets;
+}
+
+bool PostChestPopupClick(int target_index, std::wstring* target_name = nullptr, POINT* clicked = nullptr) {
   HWND game_window = FindGameWindow();
   if (!game_window || !IsWindowVisible(game_window)) return false;
   RECT client{};
@@ -309,7 +360,15 @@ bool PostChestPopupClick() {
   int width = client.right - client.left;
   int height = client.bottom - client.top;
   if (width <= 0 || height <= 0) return false;
-  return PostClientClick(game_window, width / 2, height / 2);
+  std::vector<ClientClickTarget> targets = AutoOpenChestTargets(width, height);
+  if (targets.empty()) return false;
+  const ClientClickTarget& target = targets[static_cast<size_t>(target_index) % targets.size()];
+  if (target_name) *target_name = target.name;
+  if (clicked) {
+    clicked->x = target.x;
+    clicked->y = target.y;
+  }
+  return SendPhysicalClientClick(game_window, target.x, target.y);
 }
 
 bool IsAutoOpenChestTrigger(const MemoryEvent& event) {
@@ -5344,12 +5403,16 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
       now - state.last_auto_open_chest_click < kAutoOpenChestClickThrottleMs) {
     return;
   }
-  if (!PostChestPopupClick()) return;
-  ++state.auto_open_chests_pending.front().attempts;
+  AutoOpenChestRequest& pending = state.auto_open_chests_pending.front();
+  std::wstring target_name;
+  POINT clicked{};
+  if (!PostChestPopupClick(pending.next_target, &target_name, &clicked)) return;
+  ++pending.attempts;
+  ++pending.next_target;
   state.last_auto_open_chest_click = now;
-  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú (" +
-             std::to_wstring(state.auto_open_chests_pending.front().attempts) + L"/" +
-             std::to_wstring(kAutoOpenChestMaxAttempts) + L").");
+  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú em " + target_name + L" (" +
+             std::to_wstring(clicked.x) + L"," + std::to_wstring(clicked.y) + L"; " +
+             std::to_wstring(pending.attempts) + L"/" + std::to_wstring(kAutoOpenChestMaxAttempts) + L").");
 }
 
 std::wstring DevRuntimeDir() {
