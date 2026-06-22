@@ -70,8 +70,9 @@ constexpr DWORD kMetricSaveSyncMs = 10000;
 constexpr DWORD kGameVersionCheckMs = 30000;
 constexpr int kLiveSaveInventoryResolveAttempts = 2;
 constexpr DWORD kLiveSaveInventoryResolveDelayMs = 10;
-constexpr DWORD kAutoOpenChestClickThrottleMs = 500;
+constexpr DWORD kAutoOpenChestSpaceThrottleMs = 500;
 constexpr int kAutoOpenChestMaxAttempts = 10;
+constexpr int kOpenAllTypeChestAllAtOnceRuneKey = 1055;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -108,6 +109,7 @@ struct Config {
 };
 
 Config LoadConfig();
+void SaveConfig(const Config& config);
 
 struct SaveSummary {
   std::string source = "save";
@@ -124,6 +126,10 @@ struct SaveSummary {
   std::string runes_json = "[]";
   std::string summary_json;
 };
+
+bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason);
+bool SaveHasOpenAllChestsSpaceUpgrade(const SaveSummary& summary);
+bool AutoOpenChestsAvailable(std::wstring* reason);
 
 struct MemoryEvent {
   std::string type;
@@ -174,7 +180,6 @@ struct MemoryRegion {
 struct AutoOpenChestRequest {
   std::string id;
   int attempts = 0;
-  int next_target = 0;
 };
 
 struct WorkerState {
@@ -209,7 +214,7 @@ struct WorkerState {
   std::string synced_first_id;     // detecta reset/reordenacao do historico local
   size_t auto_open_chest_scan_index = 0;
   std::deque<AutoOpenChestRequest> auto_open_chests_pending;
-  DWORD last_auto_open_chest_click = 0;
+  DWORD last_auto_open_chest_space = 0;
 };
 
 std::wstring Trim(std::wstring value) {
@@ -293,82 +298,24 @@ HWND FindGameWindow() {
   return search.visible ? search.visible : search.hidden;
 }
 
-bool PostClientClick(HWND window, int x, int y) {
+bool SendSpaceBarToGameWindow() {
+  HWND window = FindGameWindow();
   if (!window || !IsWindow(window)) return false;
-  LPARAM point = MAKELPARAM(x, y);
-  PostMessageW(window, WM_MOUSEMOVE, 0, point);
-  PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, point);
-  PostMessageW(window, WM_LBUTTONUP, 0, point);
-  return true;
-}
-
-bool SendPhysicalClientClick(HWND window, int x, int y) {
-  if (!window || !IsWindow(window)) return false;
-  POINT target{x, y};
-  if (!ClientToScreen(window, &target)) return false;
-
-  POINT original{};
-  GetCursorPos(&original);
   HWND previous = GetForegroundWindow();
 
   SetForegroundWindow(window);
-  Sleep(80);
-  SetCursorPos(target.x, target.y);
+  Sleep(40);
 
   INPUT inputs[2]{};
-  inputs[0].type = INPUT_MOUSE;
-  inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-  inputs[1].type = INPUT_MOUSE;
-  inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+  inputs[0].type = INPUT_KEYBOARD;
+  inputs[0].ki.wVk = VK_SPACE;
+  inputs[1] = inputs[0];
+  inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
   UINT sent = SendInput(2, inputs, sizeof(INPUT));
 
-  Sleep(40);
-  SetCursorPos(original.x, original.y);
+  Sleep(20);
   if (previous && previous != window && IsWindow(previous)) SetForegroundWindow(previous);
   return sent == 2;
-}
-
-struct ClientClickTarget {
-  int x = 0;
-  int y = 0;
-  const wchar_t* name = L"";
-};
-
-std::vector<ClientClickTarget> AutoOpenChestTargets(int width, int height) {
-  std::vector<ClientClickTarget> targets;
-  if (width <= 0 || height <= 0) return targets;
-
-  auto clamp_x = [&](int x) { return (std::min)((std::max)(0, x), width - 1); };
-  auto clamp_y = [&](int y) { return (std::min)((std::max)(0, y), height - 1); };
-
-  // Os popups de bau ficam ancorados no HUD inferior esquerdo, nao no centro
-  // do client rect transparente do jogo.
-  int chest_y = clamp_y(height - 148);
-  targets.push_back({clamp_x(198), chest_y, L"hud-chest-1"});
-  targets.push_back({clamp_x(230), chest_y, L"hud-chest-single"});
-  targets.push_back({clamp_x(262), chest_y, L"hud-chest-2"});
-  targets.push_back({clamp_x(294), chest_y, L"hud-chest-2-right"});
-  targets.push_back({clamp_x(326), chest_y, L"hud-chest-3"});
-  return targets;
-}
-
-bool PostChestPopupClick(int target_index, std::wstring* target_name = nullptr, POINT* clicked = nullptr) {
-  HWND game_window = FindGameWindow();
-  if (!game_window || !IsWindowVisible(game_window)) return false;
-  RECT client{};
-  if (!GetClientRect(game_window, &client)) return false;
-  int width = client.right - client.left;
-  int height = client.bottom - client.top;
-  if (width <= 0 || height <= 0) return false;
-  std::vector<ClientClickTarget> targets = AutoOpenChestTargets(width, height);
-  if (targets.empty()) return false;
-  const ClientClickTarget& target = targets[static_cast<size_t>(target_index) % targets.size()];
-  if (target_name) *target_name = target.name;
-  if (clicked) {
-    clicked->x = target.x;
-    clicked->y = target.y;
-  }
-  return SendPhysicalClientClick(game_window, target.x, target.y);
 }
 
 bool IsAutoOpenChestTrigger(const MemoryEvent& event) {
@@ -383,6 +330,15 @@ void ShowTrayMenu(HWND hwnd) {
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
   Config config = LoadConfig();
+  std::wstring auto_open_reason;
+  bool auto_open_available = AutoOpenChestsAvailable(&auto_open_reason);
+  if (config.auto_open_chests && !auto_open_available) {
+    config.auto_open_chests = false;
+    if (g_auto_open_chests) {
+      SendMessageW(g_auto_open_chests, BM_SETCHECK, BST_UNCHECKED, 0);
+      EnableWindow(g_auto_open_chests, FALSE);
+    }
+  }
   HWND game_window = FindGameWindow();
   bool game_visible = game_window && IsWindowVisible(game_window);
   AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Configurações");
@@ -391,7 +347,9 @@ void ShowTrayMenu(HWND hwnd) {
               game_visible ? L"Esconder TBH" : L"Mostrar TBH");
   AppendMenuW(menu, MF_STRING | (config.minimize_to_taskbar ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar");
-  AppendMenuW(menu, MF_STRING | (config.auto_open_chests ? MF_CHECKED : MF_UNCHECKED),
+  AppendMenuW(menu, MF_STRING |
+                    (auto_open_available ? 0 : MF_GRAYED) |
+                    (config.auto_open_chests && auto_open_available ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_AUTO_OPEN_CHESTS, L"Auto-open Chests");
   if (kDevelopmentMode) {
     AppendMenuW(menu, MF_STRING | (config.auto_export_dev_runtime ? MF_CHECKED : MF_UNCHECKED),
@@ -5013,6 +4971,45 @@ bool ReadPreferredSaveSummary(SaveSummary& summary, std::string* fallback_reason
   return ReadSaveSummary(summary);
 }
 
+bool SaveHasOpenAllChestsSpaceUpgrade(const SaveSummary& summary) {
+  JsonValue root;
+  if (!ParseJson(summary.summary_json, root)) return false;
+  std::string rune_key = std::to_string(kOpenAllTypeChestAllAtOnceRuneKey);
+
+  const JsonValue* rune_levels = ObjectGet(root, "runeLevels");
+  if (JsonNumberDouble(rune_levels ? ObjectGet(*rune_levels, rune_key) : nullptr) > 0) return true;
+
+  const JsonValue* runes = ObjectGet(root, "runes");
+  if (runes && runes->type == JsonValue::Type::Array) {
+    for (const JsonValue& rune : runes->array) {
+      if (JsonNumberKey(ObjectGet(rune, "runeKey")) == rune_key &&
+          JsonNumberDouble(ObjectGet(rune, "level")) > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool AutoOpenChestsAvailable(std::wstring* reason) {
+  SaveSummary summary;
+  std::string fallback_reason;
+  if (!ReadPreferredSaveSummary(summary, &fallback_reason)) {
+    if (reason) {
+      *reason = L"Auto-open Chests indisponível: não foi possível confirmar o upgrade no save vivo.";
+    }
+    return false;
+  }
+  if (!SaveHasOpenAllChestsSpaceUpgrade(summary)) {
+    if (reason) {
+      *reason = L"Auto-open Chests indisponível: compre o upgrade que abre todos os baús com Espaço.";
+    }
+    return false;
+  }
+  if (reason) reason->clear();
+  return true;
+}
+
 void StripHeroMetricFields(JsonValue& root, const std::string& key) {
   JsonValue* heroes = ObjectGet(root, key);
   if (!heroes || heroes->type != JsonValue::Type::Array) return;
@@ -5378,6 +5375,21 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
     state.auto_open_chests_pending.clear();
     return;
   }
+  if (!state.has_save || !SaveHasOpenAllChestsSpaceUpgrade(state.save)) {
+    Config updated = LoadConfig();
+    if (updated.auto_open_chests) {
+      updated.auto_open_chests = false;
+      SaveConfig(updated);
+      if (g_auto_open_chests) {
+        SendMessageW(g_auto_open_chests, BM_SETCHECK, BST_UNCHECKED, 0);
+        EnableWindow(g_auto_open_chests, FALSE);
+      }
+      PostStatus(L"Auto-open Chests desativado: upgrade de Espaço para abrir todos os baús não detectado.");
+    }
+    state.auto_open_chest_scan_index = state.memory.events.size();
+    state.auto_open_chests_pending.clear();
+    return;
+  }
 
   if (state.auto_open_chest_scan_index > state.memory.events.size()) {
     state.auto_open_chest_scan_index = state.memory.events.size();
@@ -5399,19 +5411,15 @@ void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
   if (state.auto_open_chests_pending.empty()) return;
 
   DWORD now = GetTickCount();
-  if (state.last_auto_open_chest_click != 0 &&
-      now - state.last_auto_open_chest_click < kAutoOpenChestClickThrottleMs) {
+  if (state.last_auto_open_chest_space != 0 &&
+      now - state.last_auto_open_chest_space < kAutoOpenChestSpaceThrottleMs) {
     return;
   }
   AutoOpenChestRequest& pending = state.auto_open_chests_pending.front();
-  std::wstring target_name;
-  POINT clicked{};
-  if (!PostChestPopupClick(pending.next_target, &target_name, &clicked)) return;
+  if (!SendSpaceBarToGameWindow()) return;
   ++pending.attempts;
-  ++pending.next_target;
-  state.last_auto_open_chest_click = now;
-  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú em " + target_name + L" (" +
-             std::to_wstring(clicked.x) + L"," + std::to_wstring(clicked.y) + L"; " +
+  state.last_auto_open_chest_space = now;
+  PostStatus(L"Auto-open Chests: SPACE enviado ao jogo (" +
              std::to_wstring(pending.attempts) + L"/" + std::to_wstring(kAutoOpenChestMaxAttempts) + L").");
 }
 
@@ -5774,6 +5782,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       font = CreateUiFont(18);
       title_font = CreateUiFont(26, FW_BOLD);
       Config config = LoadConfig();
+      std::wstring auto_open_reason;
+      bool auto_open_available = AutoOpenChestsAvailable(&auto_open_reason);
+      if (config.auto_open_chests && !auto_open_available) {
+        config.auto_open_chests = false;
+      }
 
       AddLabel(hwnd, L"TBH Companion", 20, 18, 420, 34, title_font);
       AddLabel(hwnd, L"Configuração do worker local", 20, 52, 420, 22, font);
@@ -5796,7 +5809,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       g_minimize_to_taskbar = AddCheckbox(hwnd, IDC_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar",
                                           config.minimize_to_taskbar, 144, 280, 220, 24, font);
       g_auto_open_chests = AddCheckbox(hwnd, IDC_AUTO_OPEN_CHESTS, L"Auto-open Chests",
-                                       config.auto_open_chests, 344, 280, 220, 24, font);
+                                       config.auto_open_chests && auto_open_available, 344, 280, 220, 24, font);
+      EnableWindow(g_auto_open_chests, auto_open_available ? TRUE : FALSE);
       if (kDevelopmentMode) {
         g_auto_export_dev_runtime = AddCheckbox(hwnd, IDC_AUTO_EXPORT_DEV_RUNTIME, L"Atualizar dev automaticamente",
                                                 config.auto_export_dev_runtime, 144, 310, 300, 24, font);
@@ -5852,6 +5866,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
       } else if (id == IDC_AUTO_OPEN_CHESTS) {
         Config config = ReadConfigFromUi();
+        std::wstring reason;
+        if (config.auto_open_chests && !AutoOpenChestsAvailable(&reason)) {
+          config.auto_open_chests = false;
+          if (g_auto_open_chests) {
+            SendMessageW(g_auto_open_chests, BM_SETCHECK, BST_UNCHECKED, 0);
+            EnableWindow(g_auto_open_chests, FALSE);
+          }
+          SaveConfig(config);
+          SetStatus(reason);
+          return 0;
+        }
         SaveConfig(config);
         SetStatus(config.auto_open_chests ? L"Auto-open Chests ativado." : L"Auto-open Chests desativado.");
       } else if (id == IDC_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
@@ -5874,10 +5899,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
       } else if (id == IDM_TRAY_AUTO_OPEN_CHESTS) {
         Config config = LoadConfig();
-        config.auto_open_chests = !config.auto_open_chests;
+        bool next = !config.auto_open_chests;
+        std::wstring reason;
+        if (next && !AutoOpenChestsAvailable(&reason)) {
+          config.auto_open_chests = false;
+          SaveConfig(config);
+          if (g_auto_open_chests) {
+            SendMessageW(g_auto_open_chests, BM_SETCHECK, BST_UNCHECKED, 0);
+            EnableWindow(g_auto_open_chests, FALSE);
+          }
+          SetStatus(reason);
+          return 0;
+        }
+        config.auto_open_chests = next;
         SaveConfig(config);
-        if (g_auto_open_chests) SendMessageW(g_auto_open_chests, BM_SETCHECK,
-                                             config.auto_open_chests ? BST_CHECKED : BST_UNCHECKED, 0);
+        if (g_auto_open_chests) {
+          SendMessageW(g_auto_open_chests, BM_SETCHECK,
+                       config.auto_open_chests ? BST_CHECKED : BST_UNCHECKED, 0);
+          EnableWindow(g_auto_open_chests, TRUE);
+        }
         SetStatus(config.auto_open_chests ? L"Auto-open Chests ativado." : L"Auto-open Chests desativado.");
       } else if (id == IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
         Config config = LoadConfig();
