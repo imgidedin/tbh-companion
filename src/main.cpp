@@ -43,6 +43,9 @@ constexpr int IDC_STATUS = 1007;
 constexpr int IDC_AUTOSTART = 1009;
 constexpr int IDC_EXPORT_DEV_RUNTIME = 1010;
 constexpr int IDC_ALLOW_VERSION_MISMATCH = 1011;
+constexpr int IDC_MINIMIZE_TO_TASKBAR = 1012;
+constexpr int IDC_AUTO_OPEN_CHESTS = 1013;
+constexpr int IDC_AUTO_EXPORT_DEV_RUNTIME = 1014;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr int IDM_TRAY_OPEN = 2001;
@@ -52,6 +55,7 @@ constexpr int IDM_TRAY_TOGGLE_TBH = 2004;
 constexpr int IDM_TRAY_MINIMIZE_TO_TASKBAR = 2005;
 constexpr int IDM_TRAY_EXPORT_DEV_RUNTIME = 2006;
 constexpr int IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME = 2007;
+constexpr int IDM_TRAY_AUTO_OPEN_CHESTS = 2008;
 constexpr bool kDevelopmentMode = TBH_DEVELOPMENT_MODE != 0;
 
 constexpr wchar_t DEFAULT_SAVE_RELATIVE[] = L"\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero\\SaveFile_Live.es3";
@@ -66,6 +70,7 @@ constexpr DWORD kMetricSaveSyncMs = 10000;
 constexpr DWORD kGameVersionCheckMs = 30000;
 constexpr int kLiveSaveInventoryResolveAttempts = 2;
 constexpr DWORD kLiveSaveInventoryResolveDelayMs = 10;
+constexpr DWORD kAutoOpenChestClickThrottleMs = 700;
 
 HINSTANCE g_instance = nullptr;
 HWND g_server = nullptr;
@@ -74,6 +79,9 @@ HWND g_steam = nullptr;
 HWND g_pairing_secret = nullptr;
 HWND g_autostart = nullptr;
 HWND g_allow_version_mismatch = nullptr;
+HWND g_minimize_to_taskbar = nullptr;
+HWND g_auto_open_chests = nullptr;
+HWND g_auto_export_dev_runtime = nullptr;
 HWND g_status = nullptr;
 HWND g_main_window = nullptr;
 HANDLE g_worker_stop = nullptr;
@@ -95,6 +103,7 @@ struct Config {
   bool minimize_to_taskbar = false;
   bool auto_export_dev_runtime = true;
   bool allow_game_version_mismatch = false;
+  bool auto_open_chests = false;
 };
 
 Config LoadConfig();
@@ -191,6 +200,9 @@ struct WorkerState {
   bool memory_baseline_ready = false;    // primeira leitura vira baseline e e ignorada
   long long synced_index = -1;     // maior index de evento confirmado pelo servidor
   std::string synced_first_id;     // detecta reset/reordenacao do historico local
+  size_t auto_open_chest_scan_index = 0;
+  int auto_open_chest_pending_clicks = 0;
+  DWORD last_auto_open_chest_click = 0;
 };
 
 std::wstring Trim(std::wstring value) {
@@ -274,6 +286,30 @@ HWND FindGameWindow() {
   return search.visible ? search.visible : search.hidden;
 }
 
+bool PostClientClick(HWND window, int x, int y) {
+  if (!window || !IsWindow(window)) return false;
+  LPARAM point = MAKELPARAM(x, y);
+  PostMessageW(window, WM_MOUSEMOVE, 0, point);
+  PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, point);
+  PostMessageW(window, WM_LBUTTONUP, 0, point);
+  return true;
+}
+
+bool PostChestPopupClick() {
+  HWND game_window = FindGameWindow();
+  if (!game_window || !IsWindowVisible(game_window)) return false;
+  RECT client{};
+  if (!GetClientRect(game_window, &client)) return false;
+  int width = client.right - client.left;
+  int height = client.bottom - client.top;
+  if (width <= 0 || height <= 0) return false;
+  return PostClientClick(game_window, width / 2, height / 2);
+}
+
+bool IsAutoOpenChestTrigger(const MemoryEvent& event) {
+  return event.type == "drop" && event.category == "chest" && event.item_key <= 0;
+}
+
 void ShowTrayMenu(HWND hwnd) {
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
@@ -286,6 +322,8 @@ void ShowTrayMenu(HWND hwnd) {
               game_visible ? L"Esconder TBH" : L"Mostrar TBH");
   AppendMenuW(menu, MF_STRING | (config.minimize_to_taskbar ? MF_CHECKED : MF_UNCHECKED),
               IDM_TRAY_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar");
+  AppendMenuW(menu, MF_STRING | (config.auto_open_chests ? MF_CHECKED : MF_UNCHECKED),
+              IDM_TRAY_AUTO_OPEN_CHESTS, L"Auto-open Chests");
   if (kDevelopmentMode) {
     AppendMenuW(menu, MF_STRING | (config.auto_export_dev_runtime ? MF_CHECKED : MF_UNCHECKED),
                 IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME, L"Atualizar dev automaticamente");
@@ -497,6 +535,7 @@ Config LoadConfig() {
   config.minimize_to_taskbar = GetPrivateProfileIntW(L"app", L"minimize_to_taskbar", 0, path.c_str()) != 0;
   config.auto_export_dev_runtime = GetPrivateProfileIntW(L"app", L"auto_export_dev_runtime", 1, path.c_str()) != 0;
   config.allow_game_version_mismatch = GetPrivateProfileIntW(L"app", L"allow_game_version_mismatch", 0, path.c_str()) != 0;
+  config.auto_open_chests = GetPrivateProfileIntW(L"app", L"auto_open_chests", 0, path.c_str()) != 0;
 
   return config;
 }
@@ -512,6 +551,7 @@ void SaveConfig(const Config& config) {
   WritePrivateProfileStringW(L"app", L"auto_export_dev_runtime", config.auto_export_dev_runtime ? L"1" : L"0", path.c_str());
   WritePrivateProfileStringW(L"app", L"allow_game_version_mismatch",
                              config.allow_game_version_mismatch ? L"1" : L"0", path.c_str());
+  WritePrivateProfileStringW(L"app", L"auto_open_chests", config.auto_open_chests ? L"1" : L"0", path.c_str());
   SetAutoStart(config.auto_start);
 }
 
@@ -523,16 +563,24 @@ Config ReadConfigFromUi() {
   config.pairing_secret = GetWindowTextString(g_pairing_secret);
   config.auto_start = g_autostart && SendMessageW(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED;
   Config saved = LoadConfig();
-  config.minimize_to_taskbar = saved.minimize_to_taskbar;
-  config.auto_export_dev_runtime = saved.auto_export_dev_runtime;
+  config.minimize_to_taskbar =
+      g_minimize_to_taskbar ? SendMessageW(g_minimize_to_taskbar, BM_GETCHECK, 0, 0) == BST_CHECKED
+                            : saved.minimize_to_taskbar;
+  config.auto_export_dev_runtime =
+      g_auto_export_dev_runtime ? SendMessageW(g_auto_export_dev_runtime, BM_GETCHECK, 0, 0) == BST_CHECKED
+                                : saved.auto_export_dev_runtime;
   config.allow_game_version_mismatch =
       g_allow_version_mismatch ? SendMessageW(g_allow_version_mismatch, BM_GETCHECK, 0, 0) == BST_CHECKED
                                : saved.allow_game_version_mismatch;
+  config.auto_open_chests =
+      g_auto_open_chests ? SendMessageW(g_auto_open_chests, BM_GETCHECK, 0, 0) == BST_CHECKED
+                         : saved.auto_open_chests;
   return config;
 }
 
 bool UiConfigReady() {
-  return g_server && g_token && g_steam && g_pairing_secret && g_autostart && g_allow_version_mismatch;
+  return g_server && g_token && g_steam && g_pairing_secret && g_autostart && g_allow_version_mismatch &&
+         g_minimize_to_taskbar && g_auto_open_chests && (!kDevelopmentMode || g_auto_export_dev_runtime);
 }
 
 void SaveConfigFromUi() {
@@ -5203,6 +5251,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
   if (process_changed) {
     state.memory_pid = pid;
     state.memory_seen.clear();
+    state.auto_open_chest_pending_clicks = 0;
     std::string cache_difficulty = state.has_save ? MaxSaveDifficulty(state.save) : difficulty;
     long long max_completed_stage = state.has_save ? SaveMaxCompletedStage(state.save) : 0;
     if (pid && state.memory.events.empty() && LoadMemoryHistoryCache(state.memory, cache_difficulty, max_completed_stage)) {
@@ -5210,6 +5259,7 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
       PostStatus(L"Historico local carregado (" + std::to_wstring(state.memory.events.size()) + L" eventos).");
     }
     for (const auto& event : state.memory.events) state.memory_seen.insert(event.id);
+    state.auto_open_chest_scan_index = state.memory.events.size();
   }
 
   if (!pid) return false;
@@ -5251,6 +5301,33 @@ bool RefreshMemoryCache(WorkerState& state, bool force_discover = false) {
                std::to_wstring(state.memory.events.size()) + L" no historico).");
   }
   return changed;
+}
+
+void ProcessAutoOpenChests(const Config& config, WorkerState& state) {
+  if (!config.auto_open_chests) {
+    state.auto_open_chest_scan_index = state.memory.events.size();
+    state.auto_open_chest_pending_clicks = 0;
+    return;
+  }
+
+  if (state.auto_open_chest_scan_index > state.memory.events.size()) {
+    state.auto_open_chest_scan_index = state.memory.events.size();
+  }
+  for (size_t i = state.auto_open_chest_scan_index; i < state.memory.events.size(); ++i) {
+    if (IsAutoOpenChestTrigger(state.memory.events[i])) ++state.auto_open_chest_pending_clicks;
+  }
+  state.auto_open_chest_scan_index = state.memory.events.size();
+
+  if (state.auto_open_chest_pending_clicks <= 0) return;
+  DWORD now = GetTickCount();
+  if (state.last_auto_open_chest_click != 0 &&
+      now - state.last_auto_open_chest_click < kAutoOpenChestClickThrottleMs) {
+    return;
+  }
+  if (!PostChestPopupClick()) return;
+  --state.auto_open_chest_pending_clicks;
+  state.last_auto_open_chest_click = now;
+  PostStatus(L"Auto-open Chests: clique enviado ao popup do baú.");
 }
 
 std::wstring DevRuntimeDir() {
@@ -5524,6 +5601,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
     bool memory_changed = RefreshMemoryCache(state);
     changed = memory_changed || changed;
+    ProcessAutoOpenChests(config, state);
     AutoExportDevRuntimeSnapshot(state, save_changed || live_save_changed || memory_changed,
                                  config.auto_export_dev_runtime);
     if (memory_changed) {
@@ -5627,17 +5705,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       AddLabel(hwnd, L"Chave", 24, 216, 120, 22, font);
       g_pairing_secret = AddEdit(hwnd, IDC_PAIRING_SECRET, config.pairing_secret, 144, 212, 430, 28, font, true);
 
-      g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 220, 24, font);
+      g_autostart = AddCheckbox(hwnd, IDC_AUTOSTART, L"Iniciar com Windows", config.auto_start, 144, 250, 190, 24, font);
       g_allow_version_mismatch = AddCheckbox(hwnd, IDC_ALLOW_VERSION_MISMATCH, L"Permitir versão divergente",
                                              config.allow_game_version_mismatch, 344, 250, 250, 24, font);
-
-      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 290, 120, 34, font);
+      g_minimize_to_taskbar = AddCheckbox(hwnd, IDC_MINIMIZE_TO_TASKBAR, L"Minimizar para taskbar",
+                                          config.minimize_to_taskbar, 144, 280, 220, 24, font);
+      g_auto_open_chests = AddCheckbox(hwnd, IDC_AUTO_OPEN_CHESTS, L"Auto-open Chests",
+                                       config.auto_open_chests, 344, 280, 220, 24, font);
       if (kDevelopmentMode) {
-        AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 290, 150, 34, font);
+        g_auto_export_dev_runtime = AddCheckbox(hwnd, IDC_AUTO_EXPORT_DEV_RUNTIME, L"Atualizar dev automaticamente",
+                                                config.auto_export_dev_runtime, 144, 310, 300, 24, font);
+      }
+
+      AddButton(hwnd, IDC_OPEN, L"Abrir UI", 144, 350, 120, 34, font);
+      if (kDevelopmentMode) {
+        AddButton(hwnd, IDC_EXPORT_DEV_RUNTIME, L"Atualizar dev", 276, 350, 150, 34, font);
       }
 
       g_status = CreateWindowW(L"STATIC", L"Pronto.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               24, 350, 550, 70, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
+                               24, 410, 550, 80, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS)), g_instance, nullptr);
       SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
       if (config.steam_id.empty()) {
@@ -5675,6 +5761,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         SaveConfig(config);
         SetStatus(config.allow_game_version_mismatch ? L"Versão divergente permitida. Use só para diagnóstico."
                                                      : L"Bloqueio de versão divergente ativado.");
+      } else if (id == IDC_MINIMIZE_TO_TASKBAR) {
+        Config config = ReadConfigFromUi();
+        SaveConfig(config);
+        SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
+      } else if (id == IDC_AUTO_OPEN_CHESTS) {
+        Config config = ReadConfigFromUi();
+        SaveConfig(config);
+        SetStatus(config.auto_open_chests ? L"Auto-open Chests ativado." : L"Auto-open Chests desativado.");
+      } else if (id == IDC_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
+        Config config = ReadConfigFromUi();
+        SaveConfig(config);
+        SetStatus(config.auto_export_dev_runtime ? L"Atualização dev automática ativada." : L"Atualização dev automática desativada.");
       } else if (id == IDM_TRAY_OPEN) {
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
@@ -5686,11 +5784,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         Config config = LoadConfig();
         config.minimize_to_taskbar = !config.minimize_to_taskbar;
         SaveConfig(config);
+        if (g_minimize_to_taskbar) SendMessageW(g_minimize_to_taskbar, BM_SETCHECK,
+                                                config.minimize_to_taskbar ? BST_CHECKED : BST_UNCHECKED, 0);
         SetStatus(config.minimize_to_taskbar ? L"Minimizar para taskbar ativado." : L"Minimizar para tray ativado.");
+      } else if (id == IDM_TRAY_AUTO_OPEN_CHESTS) {
+        Config config = LoadConfig();
+        config.auto_open_chests = !config.auto_open_chests;
+        SaveConfig(config);
+        if (g_auto_open_chests) SendMessageW(g_auto_open_chests, BM_SETCHECK,
+                                             config.auto_open_chests ? BST_CHECKED : BST_UNCHECKED, 0);
+        SetStatus(config.auto_open_chests ? L"Auto-open Chests ativado." : L"Auto-open Chests desativado.");
       } else if (id == IDM_TRAY_AUTO_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
         Config config = LoadConfig();
         config.auto_export_dev_runtime = !config.auto_export_dev_runtime;
         SaveConfig(config);
+        if (g_auto_export_dev_runtime) SendMessageW(g_auto_export_dev_runtime, BM_SETCHECK,
+                                                    config.auto_export_dev_runtime ? BST_CHECKED : BST_UNCHECKED, 0);
         SetStatus(config.auto_export_dev_runtime ? L"Atualização dev automática ativada." : L"Atualização dev automática desativada.");
       } else if (id == IDM_TRAY_EXPORT_DEV_RUNTIME && kDevelopmentMode) {
         SaveConfig(ReadConfigFromUi());
@@ -5981,7 +6090,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
   HWND hwnd = CreateWindowExW(0, APP_WINDOW_CLASS, L"TBH Companion",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 470,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 620, 540,
                               nullptr, nullptr, instance, nullptr);
   if (!hwnd) {
     CloseHandle(instance_mutex);

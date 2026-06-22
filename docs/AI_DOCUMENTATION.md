@@ -24,6 +24,7 @@ O repo `tbh-companion-agent` contem um worker Win32 C++ puro que roda no PC do j
 - extrai resumo de save com gold, stage atual, herois, itens equipados, inventario/storage, runas, pets e monster kills;
 - le eventos vivos diretamente da memoria do jogo via `LogManager`/IL2CPP;
 - classifica eventos de clear, falha, morte, baus e drops;
+- opcionalmente envia clique Win32 para abrir popup de bau quando um `GetBoxLog` novo aparece na memoria;
 - envia payload incremental para o frontend remoto em `POST /api/ingest`;
 - embute `res/items.zip` no executavel para resolver dados de item;
 - possui scripts para recalcular offsets IL2CPP por versao do jogo;
@@ -57,6 +58,7 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 | `SaveSummary` | Resumo do save e campos usados pelo sync. |
 | `MemoryEvent` / `MemorySnapshot` | Eventos vivos e agregados derivados do LogManager. |
 | Config/tray/UI | `LoadConfig`, `SaveConfig`, `WindowProc`, `StartWorker`, `StopWorker`. |
+| Auto-open Chests | `ProcessAutoOpenChests`, `PostChestPopupClick` | Feature opt-in que usa `GetBoxLog` vivo como gatilho e envia `WM_LBUTTONDOWN/UP` para a janela do jogo sem mover o cursor real. |
 | JSON | Parser/serializer minimo proprio para evitar dependencias externas. |
 | Save ES3 | AES-CBC/PBKDF2, parsing do JSON e construcao de resumo. |
 | IL2CPP memory reader | `ReadLogManagerEvents`, offsets do mapa, classificacao de log. |
@@ -75,9 +77,10 @@ O agente C++ e a fonte runtime atual. O Python antigo nao deve ser usado como im
 7. `SyncCachedPayload` envia primeiro sync ou sync forcado quando config muda; mudancas estruturais do save ativo enviam imediatamente, e mudancas metricas pendentes sao enviadas no tick de ~10s para alimentar snapshots.
 8. `RefreshMemoryCache` tenta ler eventos do `LogManager` a cada ~2s.
 9. Eventos novos sao adicionados com `index` monotonicamente crescente.
-10. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
-11. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend quando `app.auto_export_dev_runtime=1`.
-12. O loop para quando a janela/tray manda encerrar.
+10. Se `app.auto_open_chests=1`, `ProcessAutoOpenChests` examina apenas eventos novos desde o ultimo scan; `GetBoxLog` (`category=chest` sem `itemKey`) enfileira um clique no centro do client rect da janela do `TaskBarHero.exe` via `PostMessageW`, sem coordenada absoluta de monitor e sem mover o mouse real.
+11. Se houve mudanca, `SyncCachedPayload` envia apenas eventos novos quando possivel.
+12. Em build de desenvolvimento (`TBH_DEVELOPMENT_MODE=1`), mudancas de save ativo ou historico tambem atualizam automaticamente o runtime local do frontend quando `app.auto_export_dev_runtime=1`.
+13. O loop para quando a janela/tray manda encerrar.
 
 ### Configuracao local
 
@@ -97,26 +100,30 @@ Campos importantes:
 - `app.minimize_to_taskbar`: opcional; `0` por padrao minimiza o agent para a bandeja, `1` mantem minimizacao normal na taskbar.
 - `app.auto_export_dev_runtime`: opcional; em build de desenvolvimento, `1` por padrao atualiza o runtime local do frontend automaticamente, `0` deixa apenas a atualizacao manual.
 - `app.allow_game_version_mismatch`: opcional; `0` por padrao bloqueia abertura/sync quando a versao instalada do jogo diverge do mapa IL2CPP compilado, `1` libera manualmente para diagnostico.
+- `app.auto_open_chests`: opcional; `0` por padrao. Quando `1`, o agente detecta `GetBoxLog` novo no `LogManager` vivo e posta um clique no popup de bau da janela do jogo.
 
 Regra sensivel: `pairing_secret` fica em claro no PC do usuario por escolha de produto, mas nunca deve ser enviado ao servidor. O agente envia apenas `sha256(pairing_secret)`.
 
-### Postura read-only
+### Postura observacional e automacoes opt-in
 
-O companion e somente visual/observacional em relacao ao jogo.
+O companion continua visual/observacional por padrao em relacao ao jogo. A unica excecao ativa permitida hoje e `Auto-open Chests`, que precisa estar explicitamente ligada pelo usuario.
 
 Regras:
 
-- nao simular mouse, teclado ou comandos de UI do jogo;
+- nao simular mouse, teclado ou comandos de UI do jogo fora das excecoes opt-in documentadas;
 - nao editar save oficial;
 - nao mover itens, equipar, comprar, vender ou executar qualquer acao no jogo;
 - pode ler o save oficial, ler eventos vivos de memoria, exportar snapshots de desenvolvimento e esconder/mostrar a janela do jogo com `ShowWindow(SW_HIDE/SW_SHOW)` pelo menu da bandeja;
-- qualquer feature nova que exija interacao ativa com o jogo deve ser recusada ou redefinida como visual/read-only antes de implementacao.
+- `Auto-open Chests` nao injeta codigo, nao escreve memoria, nao chama IL2CPP e nao usa `SendInput`; ele envia mensagens `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` para o client rect da janela do jogo quando o `LogManager` vivo registra um `GetBoxLog` novo;
+- qualquer feature nova que exija interacao ativa com o jogo deve ser recusada ou documentada como nova excecao opt-in antes de implementacao.
 
 ### UI/tray
 
 - O agente cria icone na bandeja e continua rodando quando a janela e fechada.
 - Minimizar esconde o agente na bandeja por padrao; o menu de contexto da bandeja tem `Minimizar para taskbar` para alternar o comportamento e persistir em `config.ini`.
 - O menu da bandeja inclui `Esconder TBH`/`Mostrar TBH`, que alterna a visibilidade da janela principal de `TaskBarHero.exe`; o processo do jogo continua rodando e o worker segue lendo save/memoria normalmente.
+- A janela mostra checkboxes para os toggles persistentes do agente: `Iniciar com Windows`, `Permitir versao divergente`, `Minimizar para taskbar`, `Auto-open Chests` e, em desenvolvimento, `Atualizar dev automaticamente`.
+- O menu da bandeja tambem mostra `Auto-open Chests` como toggle persistido em `app.auto_open_chests`.
 - Em build de desenvolvimento, a janela mostra `Atualizar dev` e o menu da bandeja mostra `Atualizar save local`; ambos exportam `save-summary.json`, `clears.json`, `log-history.json` e `watcher-status.json` para o runtime local. O menu da bandeja tambem mostra `Atualizar dev automaticamente` como toggle persistido em `app.auto_export_dev_runtime`. Esses controles nao existem em release.
 - O label de status e um controle `STATIC` com fundo solido; ao atualizar texto menor que o anterior, force repaint para evitar sobra visual.
 
