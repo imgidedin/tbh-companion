@@ -1244,9 +1244,9 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.19) =====
-constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.19";
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E0BA50;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.20) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.20";
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E19928;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
@@ -1254,12 +1254,12 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
-constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E0C8D8;
-constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E0C210;
-constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E0BC40;
-constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5D94D08;
-constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5D94EF8;
-constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DEC440;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E1A7B0;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E1A0E8;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E19B18;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DA2CE0;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DA2EC8;
+constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DFA410;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
