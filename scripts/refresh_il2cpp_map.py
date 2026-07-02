@@ -302,6 +302,20 @@ def field_offset_name_or_type(body: str, name: str, type_name: str, class_name: 
         return field_offset_by_type(body, type_name, class_name)
 
 
+def field_offset_any_name_or_type(body: str, names: list[str], type_names: list[str], class_name: str, logical_name: str) -> int:
+    for typ, fname, off in fields_of(body):
+        if fname in names:
+            return off
+    matches = [(typ, fname, off) for typ, fname, off in fields_of(body) if typ in type_names]
+    if len(matches) == 1:
+        return matches[0][2]
+    if matches:
+        details = ", ".join(f"{fname}:{typ}@0x{off:X}" for typ, fname, off in matches)
+        raise SystemExit(f"campo {class_name}.{logical_name} ambiguo no dump: {details}")
+    accepted = ", ".join(names + type_names)
+    raise SystemExit(f"campo {class_name}.{logical_name} nao encontrado no dump (esperado: {accepted}).")
+
+
 def is_singleton_class(body: str, class_name: str) -> bool:
     header = body.split("{", 1)[0]
     return bool(re.search(r"\bclass\s+" + re.escape(class_name) + r"\s*:\s*[A-Za-z_]\w*<" + re.escape(class_name) + r">", header))
@@ -343,6 +357,15 @@ def find_static_owner_by_field_type(src: str, field_type: str, description: str)
         src,
         description,
         lambda _name, body, _fields: any(typ == field_type for typ, _fname, _off in fields_of(body, include_static=True)),
+    )
+
+
+def find_static_owner_by_any_field_type(src: str, field_types: list[str], description: str) -> tuple[str, str]:
+    accepted = set(field_types)
+    return find_class_by_predicate(
+        src,
+        description,
+        lambda _name, body, _fields: any(typ in accepted for typ, _fname, _off in fields_of(body, include_static=True)),
     )
 
 
@@ -452,6 +475,18 @@ def static_field_offset_by_type(body: str, type_name: str, class_name: str) -> i
     return matches[0][1]
 
 
+def static_field_offset_by_any_type(body: str, type_names: list[str], class_name: str, logical_name: str) -> int:
+    accepted = set(type_names)
+    matches = [(typ, fname, off) for typ, fname, off in fields_of(body, include_static=True) if typ in accepted]
+    if len(matches) == 1:
+        return matches[0][2]
+    if matches:
+        details = ", ".join(f"{fname}:{typ}@0x{off:X}" for typ, fname, off in matches)
+        raise SystemExit(f"campo static {class_name}.{logical_name} ambiguo no dump: {details}")
+    accepted_text = ", ".join(type_names)
+    raise SystemExit(f"campo static {class_name}.{logical_name} nao encontrado no dump (esperado: {accepted_text}).")
+
+
 def extract_map(dump_dir: Path) -> dict:
     src = (dump_dir / "dump.cs").read_text(encoding="utf-8", errors="ignore")
     info: dict = {}
@@ -521,16 +556,22 @@ def extract_map(dump_dir: Path) -> dict:
     info["common_current_stage_key_offset"] = field_offset(common, "currentStageKey", "CommonSaveData")
     info["common_current_stage_wave_offset"] = field_offset(common, "currentStageWave", "CommonSaveData")
     info["player_common_offset"] = field_offset(player, "commonSaveData", "PlayerSaveData")
-    info["player_currencies_offset"] = field_offset(player, "currenySaveDatas", "PlayerSaveData")
-    info["player_heroes_offset"] = field_offset(player, "heroSaveDatas", "PlayerSaveData")
-    info["player_attributes_offset"] = field_offset(player, "attributeSaveDatas", "PlayerSaveData")
-    info["player_pets_offset"] = field_offset(player, "PetSaveData", "PlayerSaveData")
-    info["player_runes_offset"] = field_offset(player, "RuneSaveData", "PlayerSaveData")
-    info["player_inventory_offset"] = field_offset(player, "inventorySaveDatas", "PlayerSaveData")
-    info["player_stash_offset"] = field_offset(player, "stashSaveDatas", "PlayerSaveData")
-    info["player_trade_stash_offset"] = field_offset(player, "tradingStashSaveDatas", "PlayerSaveData")
-    info["player_items_offset"] = field_offset(player, "itemSaveDatas", "PlayerSaveData")
-    info["player_aggregates_offset"] = field_offset(player, "aggregateSaveDatas", "PlayerSaveData")
+    info["player_currencies_offset"] = field_offset_any_name_or_type(player, ["currenySaveDatas"], ["List<CurrencySaveData>"], "PlayerSaveData", "currenySaveDatas")
+    info["player_heroes_offset"] = field_offset_any_name_or_type(player, ["heroSaveDatas"], ["List<HeroSaveData>"], "PlayerSaveData", "heroSaveDatas")
+    info["player_attributes_offset"] = field_offset_any_name_or_type(player, ["attributeSaveDatas"], ["List<AttributeSaveData>"], "PlayerSaveData", "attributeSaveDatas")
+    info["player_pets_offset"] = field_offset_any_name_or_type(player, ["PetSaveData"], ["List<PetSaveData>"], "PlayerSaveData", "PetSaveData")
+    info["player_runes_offset"] = field_offset_any_name_or_type(player, ["RuneSaveData"], ["List<RuneSaveData>"], "PlayerSaveData", "RuneSaveData")
+    info["player_inventory_offset"] = field_offset_any_name_or_type(player, ["inventorySaveDatas"], ["List<InventorySaveData>"], "PlayerSaveData", "inventorySaveDatas")
+    info["player_stash_offset"] = field_offset_any_name_or_type(player, ["stashSaveDatas"], ["List<StashSaveData>"], "PlayerSaveData", "stashSaveDatas")
+    info["player_trade_stash_offset"] = field_offset_any_name_or_type(
+        player,
+        ["tradingStashSaveDatas", "remakeTradingStashSaveDatas"],
+        ["List<TradingStashSaveData>", "List<RemakeTradingStashSaveData>"],
+        "PlayerSaveData",
+        "tradingStashSaveDatas",
+    )
+    info["player_items_offset"] = field_offset_any_name_or_type(player, ["itemSaveDatas"], ["List<ItemSaveData>"], "PlayerSaveData", "itemSaveDatas")
+    info["player_aggregates_offset"] = field_offset_any_name_or_type(player, ["aggregateSaveDatas"], ["List<AggregateSaveData>"], "PlayerSaveData", "aggregateSaveDatas")
 
     stage_manager = require_class(src, "StageManager")
     monster_spawn_manager = require_class(src, "MonsterSpawnManager")
@@ -541,7 +582,12 @@ def extract_map(dump_dir: Path) -> dict:
     currency_info = require_class(src, "CurrencyInfoData")
     runtime_hero_manager_name, runtime_hero_manager, runtime_hero_name, runtime_hero = find_runtime_hero_classes(src)
     hero_info = require_class(src, "HeroInfoData")
-    runtime_backend_inventory_name, runtime_backend_inventory = find_static_owner_by_field_type(src, "List<InventoryItemData>", "backend inventory runtime")
+    runtime_backend_inventory_types = ["List<InventoryItemData>", "Dictionary<string, InventoryItemData>"]
+    runtime_backend_inventory_name, runtime_backend_inventory = find_static_owner_by_any_field_type(
+        src,
+        runtime_backend_inventory_types,
+        "backend inventory runtime",
+    )
     backend_inventory_item = require_class(src, "InventoryItemData")
     info["stage_manager_typeinfo_rva"], info["stage_manager_typeinfo_name"] = find_typeinfo_rva(
         dump_dir / "script.json",
@@ -626,10 +672,11 @@ def extract_map(dump_dir: Path) -> dict:
         runtime_backend_inventory_name,
     )
     info["runtime_backend_inventory_class_name"] = runtime_backend_inventory_name
-    info["runtime_backend_inventory_items_offset"] = static_field_offset_by_type(
+    info["runtime_backend_inventory_items_offset"] = static_field_offset_by_any_type(
         runtime_backend_inventory,
-        "List<InventoryItemData>",
+        runtime_backend_inventory_types,
         runtime_backend_inventory_name,
+        "InventoryItemData cache",
     )
     info["backend_inventory_item_unique_key_offset"] = field_offset(backend_inventory_item, "itemKey", "InventoryItemData")
     info["backend_inventory_item_id_offset"] = field_offset(backend_inventory_item, "itemId", "InventoryItemData")

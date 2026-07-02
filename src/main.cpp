@@ -1244,9 +1244,9 @@ std::vector<unsigned char> ReadProcessBytes(HANDLE process, const unsigned char*
 //   BoxOpenGradeOffset      : BoxOpenLog.<EGradeType> (raridade real do drop)
 //   kGradeNames             : EGradeType -> nome canonico (frontend mapeia p/ PT)
 //
-// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.20) =====
-constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.20";
-constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E19928;
+// ===== BEGIN IL2CPP MAP (TaskBarHero 1.00.23) =====
+constexpr wchar_t kIl2CppMapGameVersion[] = L"1.00.23";
+constexpr uintptr_t kLogManagerTypeInfoRva = 0x5E2FB58;
 constexpr uintptr_t kKlassStaticFieldsOffset = 0xB8;
 constexpr uintptr_t kLogManagerListOffset = 0x20;
 constexpr uintptr_t kLogDataTextOffset = 0x20;
@@ -1254,12 +1254,12 @@ constexpr uintptr_t kLogDataClockOffset = 0x28;
 constexpr uintptr_t kLogDataDateTimeOffset = 0x30;
 constexpr uintptr_t kBoxOpenItemKeyOffset = 0x40;
 constexpr uintptr_t kBoxOpenGradeOffset = 0x48;
-constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E1A7B0;
-constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E1A0E8;
-constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E19B18;
-constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DA2CE0;
-constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DA2EC8;
-constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5DFA410;
+constexpr uintptr_t kSaveManagerTypeInfoRva = 0x5E309E0;
+constexpr uintptr_t kStageManagerTypeInfoRva = 0x5E30318;
+constexpr uintptr_t kMonsterSpawnManagerTypeInfoRva = 0x5E2FD48;
+constexpr uintptr_t kRuntimeCurrencyManagerTypeInfoRva = 0x5DB9758;
+constexpr uintptr_t kRuntimeHeroManagerTypeInfoRva = 0x5DB9948;
+constexpr uintptr_t kRuntimeBackendInventoryTypeInfoRva = 0x5E10FB8;
 constexpr uintptr_t kSaveManagerAccountSaveOffset = 0x20;
 constexpr uintptr_t kSaveManagerPlayerSaveOffset = 0x28;
 constexpr uintptr_t kAccountSavePlayerIdOffset = 0x10;
@@ -1273,16 +1273,16 @@ constexpr uintptr_t kCommonSaveMaxCompletedStageOffset = 0x54;
 constexpr uintptr_t kCommonSaveCurrentStageKeyOffset = 0x58;
 constexpr uintptr_t kCommonSaveCurrentStageWaveOffset = 0x5C;
 constexpr uintptr_t kPlayerSaveCommonOffset = 0x10;
-constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x48;
-constexpr uintptr_t kPlayerSaveHeroesOffset = 0x50;
-constexpr uintptr_t kPlayerSaveAttributesOffset = 0x60;
-constexpr uintptr_t kPlayerSavePetsOffset = 0x68;
-constexpr uintptr_t kPlayerSaveRunesOffset = 0x70;
-constexpr uintptr_t kPlayerSaveInventoryOffset = 0x78;
-constexpr uintptr_t kPlayerSaveStashOffset = 0x80;
-constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x88;
-constexpr uintptr_t kPlayerSaveItemsOffset = 0xA0;
-constexpr uintptr_t kPlayerSaveAggregatesOffset = 0xA8;
+constexpr uintptr_t kPlayerSaveCurrenciesOffset = 0x50;
+constexpr uintptr_t kPlayerSaveHeroesOffset = 0x58;
+constexpr uintptr_t kPlayerSaveAttributesOffset = 0x68;
+constexpr uintptr_t kPlayerSavePetsOffset = 0x70;
+constexpr uintptr_t kPlayerSaveRunesOffset = 0x78;
+constexpr uintptr_t kPlayerSaveInventoryOffset = 0x80;
+constexpr uintptr_t kPlayerSaveStashOffset = 0x88;
+constexpr uintptr_t kPlayerSaveTradeStashOffset = 0x90;
+constexpr uintptr_t kPlayerSaveItemsOffset = 0xA8;
+constexpr uintptr_t kPlayerSaveAggregatesOffset = 0xB0;
 constexpr uintptr_t kStageManagerStageStateOffset = 0x78;
 constexpr uintptr_t kStageManagerStageStartedOffset = 0x98;
 constexpr uintptr_t kStageManagerRuntimeFloatOffset = 0x110;
@@ -1643,6 +1643,27 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
         continue;
       }
 
+      // GetBoxLog e o gatilho do auto-open. Nao use regex textual como gate:
+      // mudancas de localizacao/formato no log nao podem impedir a deteccao.
+      if (klass_name == "GetBoxLog") {
+        std::wstring full = text + clock_suffix;
+        MemoryEvent event;
+        event.type = "drop";
+        event.category = "chest";
+        event.color = ExtractColorTag(full);
+        event.raw = CleanEventRaw(full);
+        event.clock = ExtractClockSuffix(clock_suffix);
+        event.ts = stamp;
+        event.item = FirstColoredText(text);
+        if (event.item.empty()) event.item = DropItemNameFromRaw(event.raw);
+        if (event.item.empty()) event.item = "Chest";
+        event.item_key = 0;
+        event.id = EventId(event) + (event.ts > 0 ? "|" + std::to_string(event.ts) : "");
+        event.index = static_cast<int>(out.size());
+        out.push_back(std::move(event));
+        continue;
+      }
+
       std::vector<MemoryEvent> parsed;
       AppendRegexEvents(parsed, text + clock_suffix);
       if (parsed.empty()) continue;  // tipo de log que nao acompanhamos (level up, etc.)
@@ -1650,9 +1671,7 @@ bool ReadLogManagerEvents(DWORD pid, std::vector<MemoryEvent>& out, std::string*
       event.ts = stamp;
 
       // Enriquecimento autoritativo a partir da classe IL2CPP do log.
-      if (klass_name == "GetBoxLog") {
-        event.category = "chest";
-      } else if (event.type == "clear" || event.type == "failure") {
+      if (event.type == "clear" || event.type == "failure") {
         event.category = "stage";
       } else if (event.type == "death") {
         event.category = "death";
@@ -3027,13 +3046,19 @@ std::string SaveOwnerKey(const JsonValue* account) {
   return JsonStringValue(account ? ObjectGet(*account, "playerId") : nullptr);
 }
 
+const JsonValue* TradeStashSaveDatas(const JsonValue* player) {
+  if (!player) return nullptr;
+  const JsonValue* slots = ObjectGet(*player, "tradingStashSaveDatas");
+  return slots ? slots : ObjectGet(*player, "remakeTradingStashSaveDatas");
+}
+
 std::set<std::string> ReferencedItemIds(const JsonValue* player) {
   std::set<std::string> ids;
   if (!player) return ids;
   CollectArrayNumberIds(ObjectGet(*player, "itemSaveDatas"), "UniqueId", ids);
   CollectSlotItemIds(ObjectGet(*player, "inventorySaveDatas"), ids);
   CollectSlotItemIds(ObjectGet(*player, "stashSaveDatas"), ids);
-  CollectSlotItemIds(ObjectGet(*player, "tradingStashSaveDatas"), ids);
+  CollectSlotItemIds(TradeStashSaveDatas(player), ids);
   CollectHeroEquippedItemIds(ObjectGet(*player, "heroSaveDatas"), ids);
   return ids;
 }
@@ -3094,7 +3119,7 @@ InventoryItemResolutionReport CheckInventoryItemResolution(const JsonValue& save
   if (player) {
     count_missing("inventory", ObjectGet(*player, "inventorySaveDatas"));
     count_missing("storage", ObjectGet(*player, "stashSaveDatas"));
-    count_missing("trade", ObjectGet(*player, "tradingStashSaveDatas"));
+    count_missing("trade", TradeStashSaveDatas(player));
   }
   return report;
 }
@@ -3810,7 +3835,7 @@ JsonValue BuildInventorySummary(const JsonValue* player,
                                                 player ? ObjectGet(*player, "stashSaveDatas") : nullptr,
                                                 item_by_uid));
   tabs.array.push_back(BuildInventoryTabSummary("trade", "Troca",
-                                                player ? ObjectGet(*player, "tradingStashSaveDatas") : nullptr,
+                                                TradeStashSaveDatas(player),
                                                 item_by_uid));
   ObjectSet(out, "tabs", std::move(tabs));
   return out;
@@ -4109,10 +4134,67 @@ bool ReadIl2CppDictionaryIntPtr(HANDLE process, uintptr_t dictionary, int max_co
   return true;
 }
 
+bool ReadIl2CppDictionaryPtrValues(HANDLE process, uintptr_t dictionary, int max_count,
+                                   std::vector<uintptr_t>& values,
+                                   std::string* error = nullptr, const char* label = "dictionary") {
+  values.clear();
+  if (!dictionary) {
+    if (error) *error = std::string("dicionario nulo: ") + label;
+    return false;
+  }
+  uintptr_t entries = ReadPtr(process, dictionary + 0x18);
+  int count = 0;
+  int free_count = 0;
+  if (!entries || !ReadInt32(process, dictionary + 0x20, count) || count < 0 || count > max_count ||
+      !ReadInt32(process, dictionary + 0x2C, free_count) || free_count < 0 || free_count > count) {
+    if (error) *error = std::string("dicionario invalido: ") + label;
+    return false;
+  }
+
+  int array_length = 0;
+  if (!ReadInt32(process, entries + 0x18, array_length) || array_length < count || array_length > max_count) {
+    if (error) *error = std::string("array de entries invalido: ") + label;
+    return false;
+  }
+
+  constexpr uintptr_t kEntryStart = 0x20;
+  constexpr uintptr_t kEntrySize = 0x18;
+  constexpr uintptr_t kEntryHashOffset = 0x0;
+  constexpr uintptr_t kEntryValueOffset = 0x10;
+  values.reserve(static_cast<size_t>(count - free_count));
+  for (int i = 0; i < count; ++i) {
+    uintptr_t entry = entries + kEntryStart + static_cast<uintptr_t>(i) * kEntrySize;
+    int hash = -1;
+    uintptr_t value = 0;
+    if (!ReadScalar(process, entry + kEntryHashOffset, hash) || hash < 0) continue;
+    value = ReadPtr(process, entry + kEntryValueOffset);
+    if (!value) continue;
+    values.push_back(value);
+  }
+  return true;
+}
+
 JsonValue JsonAddress(uintptr_t address) {
   std::ostringstream out;
   out << "0x" << std::hex << std::uppercase << address;
   return JsonValue::String(out.str());
+}
+
+int DecodeActkObscuredIntValue(int hidden, int key) {
+  unsigned int uhidden = static_cast<unsigned int>(hidden);
+  unsigned int ukey = static_cast<unsigned int>(key);
+  return static_cast<int>((uhidden - ukey) ^ ukey);
+}
+
+long long DecodeActkObscuredLongValue(long long hidden, long long key) {
+  unsigned long long uhidden = static_cast<unsigned long long>(hidden);
+  unsigned long long ukey = static_cast<unsigned long long>(key);
+  return static_cast<long long>((uhidden - ukey) ^ ukey);
+}
+
+unsigned int DecodeActkByte4Yro(unsigned int value) {
+  return (value & 0xFF000000U) | ((value & 0x00FF0000U) >> 8) | ((value & 0x0000FF00U) << 8) |
+         (value & 0x000000FFU);
 }
 
 long long DecodeObscuredLong(HANDLE process, uintptr_t address, JsonValue* raw = nullptr) {
@@ -4124,15 +4206,16 @@ long long DecodeObscuredLong(HANDLE process, uintptr_t address, JsonValue* raw =
   ReadScalar(process, address + 0x8, hidden);
   ReadScalar(process, address + 0x10, key);
   ReadScalar(process, address + 0x18, fake);
-  long long xor_decoded = hidden ^ key;
-  long long value = fake != 0 ? fake : xor_decoded;
+  long long legacy_xor_decoded = hidden ^ key;
+  long long value = DecodeActkObscuredLongValue(hidden, key);
   if (raw) {
     *raw = JsonValue::Object();
     ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
     ObjectSet(*raw, "hiddenValue", JsonValue::Number(hidden));
     ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(key));
     ObjectSet(*raw, "fakeValue", JsonValue::Number(fake));
-    ObjectSet(*raw, "xorDecoded", JsonValue::Number(xor_decoded));
+    ObjectSet(*raw, "legacyXorDecoded", JsonValue::Number(legacy_xor_decoded));
+    ObjectSet(*raw, "decoded", JsonValue::Number(value));
     ObjectSet(*raw, "value", JsonValue::Number(value));
   }
   return value;
@@ -4147,13 +4230,15 @@ int DecodeObscuredInt(HANDLE process, uintptr_t address, JsonValue* raw = nullpt
   ReadScalar(process, address + 0x4, hidden);
   ReadScalar(process, address + 0x8, key);
   ReadScalar(process, address + 0xC, fake);
-  int value = hidden ^ key;
+  int legacy_xor_decoded = hidden ^ key;
+  int value = DecodeActkObscuredIntValue(hidden, key);
   if (raw) {
     *raw = JsonValue::Object();
     ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
     ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
     ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
     ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<long long>(fake)));
+    ObjectSet(*raw, "legacyXorDecoded", JsonValue::Number(static_cast<long long>(legacy_xor_decoded)));
     ObjectSet(*raw, "decoded", JsonValue::Number(static_cast<long long>(value)));
   }
   return value;
@@ -4164,19 +4249,20 @@ int DecodeRuntimeHeroObscuredInt(HANDLE process, uintptr_t address, JsonValue* r
   int hidden = 0;
   int key = 0;
   int fake = 0;
-  bool has_fake = ReadScalar(process, address + 0xC, fake);
   ReadScalar(process, address + 0x0, hash);
   ReadScalar(process, address + 0x4, hidden);
   ReadScalar(process, address + 0x8, key);
-  int xor_decoded = hidden ^ key;
-  int value = has_fake ? fake : xor_decoded;
+  ReadScalar(process, address + 0xC, fake);
+  int legacy_xor_decoded = hidden ^ key;
+  int value = DecodeActkObscuredIntValue(hidden, key);
   if (raw) {
     *raw = JsonValue::Object();
     ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
     ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
     ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
     ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<long long>(fake)));
-    ObjectSet(*raw, "xorDecoded", JsonValue::Number(static_cast<long long>(xor_decoded)));
+    ObjectSet(*raw, "legacyXorDecoded", JsonValue::Number(static_cast<long long>(legacy_xor_decoded)));
+    ObjectSet(*raw, "decoded", JsonValue::Number(static_cast<long long>(value)));
     ObjectSet(*raw, "value", JsonValue::Number(static_cast<long long>(value)));
   }
   return value;
@@ -4197,15 +4283,19 @@ float DecodeObscuredFloat(HANDLE process, uintptr_t address, JsonValue* raw = nu
   ReadScalar(process, address + 0x4, hidden);
   ReadScalar(process, address + 0x8, key);
   ReadScalar(process, address + 0xC, fake);
-  float xor_decoded = FloatFromBits(hidden ^ key);
-  float value = std::isfinite(fake) ? fake : xor_decoded;
+  unsigned int transformed_hidden = DecodeActkByte4Yro(static_cast<unsigned int>(hidden));
+  int decoded_bits = static_cast<int>(transformed_hidden ^ static_cast<unsigned int>(key));
+  float legacy_xor_decoded = FloatFromBits(hidden ^ key);
+  float value = FloatFromBits(decoded_bits);
   if (raw) {
     *raw = JsonValue::Object();
     ObjectSet(*raw, "hash", JsonValue::Number(static_cast<long long>(hash)));
     ObjectSet(*raw, "hiddenValue", JsonValue::Number(static_cast<long long>(hidden)));
     ObjectSet(*raw, "currentCryptoKey", JsonValue::Number(static_cast<long long>(key)));
     ObjectSet(*raw, "fakeValue", JsonValue::Number(static_cast<double>(fake)));
-    ObjectSet(*raw, "xorDecoded", JsonValue::Number(static_cast<double>(xor_decoded)));
+    ObjectSet(*raw, "transformedHiddenValue", JsonValue::Number(static_cast<long long>(transformed_hidden)));
+    ObjectSet(*raw, "legacyXorDecoded", JsonValue::Number(static_cast<double>(legacy_xor_decoded)));
+    ObjectSet(*raw, "decodedBits", JsonValue::Number(static_cast<long long>(decoded_bits)));
     ObjectSet(*raw, "value", JsonValue::Number(static_cast<double>(value)));
   }
   return value;
@@ -4323,19 +4413,31 @@ bool ReadRuntimeBackendInventoryItems(HANDLE process, uintptr_t module_base, Jso
     return false;
   }
 
-  uintptr_t list = ReadPtr(process, statics + kRuntimeBackendInventoryItemsOffset);
-  return ReadLiveObjectList(process, list, 16384, "RuntimeBackendInventoryItem",
-      [&](uintptr_t obj, JsonValue& row, std::string*) {
-        std::string unique_key = ReadBackendInventoryUniqueKey(process, obj);
-        int item_id = 0;
-        ReadScalar(process, obj + kBackendInventoryItemIdOffset, item_id);
-        if (item_id <= 0) item_id = DecodeRuntimeHeroObscuredInt(process, obj + 0x18);
+  uintptr_t collection = ReadPtr(process, statics + kRuntimeBackendInventoryItemsOffset);
+  if (!collection) return true;
 
-        row = JsonValue::Object();
-        ObjectSet(row, "UniqueId", IsDecimalDigits(unique_key) ? JsonValue::Number(unique_key) : JsonValue::String(unique_key));
-        ObjectSet(row, "ItemKey", JsonValue::Number(static_cast<long long>(item_id)));
-        return true;
-      }, items, error, false);
+  std::vector<uintptr_t> entries;
+  std::string list_error;
+  std::string dictionary_error;
+  if (!ReadIl2CppListPointers(process, collection, 16384, entries, &list_error, "RuntimeBackendInventoryItem") &&
+      !ReadIl2CppDictionaryPtrValues(process, collection, 16384, entries, &dictionary_error, "RuntimeBackendInventoryItem")) {
+    if (error) *error = list_error + "; " + dictionary_error;
+    return false;
+  }
+
+  for (uintptr_t obj : entries) {
+    if (!obj) continue;
+    std::string unique_key = ReadBackendInventoryUniqueKey(process, obj);
+    int item_id = 0;
+    ReadScalar(process, obj + kBackendInventoryItemIdOffset, item_id);
+    if (item_id <= 0) item_id = DecodeRuntimeHeroObscuredInt(process, obj + 0x18);
+
+    JsonValue row = JsonValue::Object();
+    ObjectSet(row, "UniqueId", IsDecimalDigits(unique_key) ? JsonValue::Number(unique_key) : JsonValue::String(unique_key));
+    ObjectSet(row, "ItemKey", JsonValue::Number(static_cast<long long>(item_id)));
+    items.array.push_back(std::move(row));
+  }
+  return true;
 }
 
 int AppendRuntimeBackendItemsToSaveRoot(HANDLE process, uintptr_t module_base, JsonValue& root,
@@ -4416,9 +4518,26 @@ bool ReadRuntimeStageKey(HANDLE process, uintptr_t module_base, int& stage_key, 
   return false;
 }
 
+bool IsFiniteJsonNumber(const JsonValue* value, double* out = nullptr) {
+  if (!value || value->type != JsonValue::Type::Number) return false;
+  try {
+    double parsed = std::stod(value->number);
+    if (!std::isfinite(parsed)) return false;
+    if (out) *out = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool IsPlausibleRuntimeGold(const JsonValue* value) {
+  double amount = 0;
+  return IsFiniteJsonNumber(value, &amount) && amount >= 0 && amount <= 9007199254740991.0;
+}
+
 bool ApplyRuntimeGoldToSaveRoot(JsonValue& root, const JsonValue& runtime_gold) {
   const JsonValue* amount = ObjectGet(runtime_gold, "amount");
-  if (!amount || amount->type != JsonValue::Type::Number) return false;
+  if (!IsPlausibleRuntimeGold(amount)) return false;
   JsonValue* player = ObjectGet(root, "PlayerSaveData");
   JsonValue* currencies = player ? ObjectGet(*player, "currenySaveDatas") : nullptr;
   JsonValue* gold = currencies ? const_cast<JsonValue*>(FindByNumberKey(currencies, "Key", "100001")) : nullptr;
@@ -4428,10 +4547,46 @@ bool ApplyRuntimeGoldToSaveRoot(JsonValue& root, const JsonValue& runtime_gold) 
   return true;
 }
 
+bool IsPlausibleRuntimeHeroNumber(const JsonValue& hero, const JsonValue& runtime,
+                                  const char* runtime_key, const char* save_key) {
+  const JsonValue* value = ObjectGet(runtime, runtime_key);
+  double number = 0;
+  if (!IsFiniteJsonNumber(value, &number) || number < 0) return false;
+  if (strcmp(save_key, "HeroLevel") == 0) {
+    const JsonValue* current = ObjectGet(hero, save_key);
+    double current_number = 0;
+    if (IsFiniteJsonNumber(current, &current_number) && current_number > 0 && number < current_number) return false;
+    return number >= 1 && number <= 1000;
+  }
+  if (strcmp(save_key, "HeroExp") == 0) {
+    const JsonValue* current = ObjectGet(hero, save_key);
+    double current_number = 0;
+    if (IsFiniteJsonNumber(current, &current_number) && current_number > 0 && number < current_number) {
+      const JsonValue* runtime_level = ObjectGet(runtime, "level");
+      const JsonValue* save_level = ObjectGet(hero, "HeroLevel");
+      double runtime_level_number = 0;
+      double save_level_number = 0;
+      if (!IsFiniteJsonNumber(runtime_level, &runtime_level_number) || !IsFiniteJsonNumber(save_level, &save_level_number) ||
+          runtime_level_number <= save_level_number) {
+        return false;
+      }
+    }
+    return number <= 1000000000000000.0;
+  }
+  if (strcmp(save_key, "AbilityPoint") == 0 || strcmp(save_key, "AllocatedHeroAbilityPoint") == 0) {
+    return number <= 1000000;
+  }
+  return true;
+}
+
+bool IsPlausibleRuntimeHeroRow(const JsonValue& hero, const JsonValue& runtime) {
+  return IsPlausibleRuntimeHeroNumber(hero, runtime, "level", "HeroLevel");
+}
+
 bool ApplyRuntimeHeroNumber(JsonValue& hero, const JsonValue& runtime, const char* runtime_key, const char* save_key) {
   const JsonValue* value = ObjectGet(runtime, runtime_key);
   JsonValue* target = value ? ObjectGet(hero, save_key) : nullptr;
-  if (!target || value->type != JsonValue::Type::Number) return false;
+  if (!target || !IsPlausibleRuntimeHeroNumber(hero, runtime, runtime_key, save_key)) return false;
   *target = CopyOrNull(value);
   return true;
 }
@@ -4448,11 +4603,12 @@ int ApplyRuntimeHeroMetricsToSaveRoot(JsonValue& root, const JsonValue& runtime_
     if (hero_key.empty() || hero_key == "0") continue;
     const JsonValue* runtime = FindByNumberKey(&runtime_heroes, "heroKey", hero_key);
     if (!runtime) continue;
+    if (!IsPlausibleRuntimeHeroRow(hero, *runtime)) continue;
     bool changed = false;
+    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "exp", "HeroExp");
     changed |= ApplyRuntimeHeroNumber(hero, *runtime, "level", "HeroLevel");
     changed |= ApplyRuntimeHeroNumber(hero, *runtime, "abilityPoint", "AbilityPoint");
     changed |= ApplyRuntimeHeroNumber(hero, *runtime, "allocatedAbilityPoint", "AllocatedHeroAbilityPoint");
-    changed |= ApplyRuntimeHeroNumber(hero, *runtime, "exp", "HeroExp");
     if (changed) ++patched;
   }
   return patched;
@@ -4859,7 +5015,6 @@ bool ReadLiveStageMetrics(DWORD pid, JsonValue& out, std::string* error = nullpt
 }
 
 bool FillSaveSummaryFromRoot(const JsonValue& save, const std::string& source, SaveSummary& summary) {
-  if (CheckInventoryItemResolution(save).missing_count > 0) return false;
   JsonValue full_summary = BuildSaveSummaryJson(save);
   summary = SaveSummary();
   summary.source = source;
@@ -4916,10 +5071,6 @@ bool ReadLiveSaveSummary(DWORD pid, SaveSummary& summary, std::string* error = n
       Sleep(kLiveSaveInventoryResolveDelayMs);
     }
     if (!root_read) break;
-    if (inventory_report.missing_count > 0) {
-      if (error) *error = InventoryItemResolutionError(inventory_report);
-      break;
-    }
     if (!FillSaveSummaryFromRoot(root, "memory", summary)) {
       fail("snapshot vivo sem SteamID valido");
       break;
